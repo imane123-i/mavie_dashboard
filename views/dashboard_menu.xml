@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <!-- ACTIONS -->
+        <record id="action_mavie_dashboard_sales_client" model="ir.actions.client">
+            <field name="name">Tableau de bord</field>
+            <field name="tag">mavie_dashboard.action_sales</field>
+        </record>
+
+        <record id="action_mavie_dashboard_stock_client" model="ir.actions.client">
+            <field name="name">Stock &amp; ruptures</field>
+            <field name="tag">mavie_dashboard.action_stock</field>
+        </record>
+
+        <!-- MENUS -->
+        <menuitem id="menu_mavie_dashboard_root_v2"
+                  name="Dashboard"
+                  sequence="5"/>
+
+        <menuitem id="menu_mavie_dashboard_sales_v2"
+                  name="Tableau de bord"
+                  parent="menu_mavie_dashboard_root_v2"
+                  action="action_mavie_dashboard_sales_client"
+                  sequence="10"/>
+
+        <menuitem id="menu_mavie_dashboard_stock_v2"
+                  name="Stock &amp; ruptures"
+                  parent="menu_mavie_dashboard_root_v2"
+                  action="action_mavie_dashboard_stock_client"
+                  sequence="20"/>
+    </data>
+</odoo>

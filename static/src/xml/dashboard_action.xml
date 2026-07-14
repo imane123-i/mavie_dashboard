@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+    <t t-name="mavie_dashboard.IframeView">
+        <div style="width: 100%; height: 100%; overflow: hidden; margin: 0; padding: 0; display: flex; flex-direction: column;">
+            <iframe t-att-src="iframeSrc" style="width: 100%; height: 100%; border: none; min-height: calc(100vh - 46px); flex-grow: 1;"/>
+        </div>
+    </t>
+</templates>

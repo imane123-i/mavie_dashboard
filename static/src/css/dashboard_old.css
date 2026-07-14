@@ -1,0 +1,41 @@
+﻿
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MaVie Analyse â€” Centre d'Analyse</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Syne:wght@700;800&display=swap');
+:root {
+  --brand:#C8965A; --brand-dark:#9A6D3A; --brand-light:#F5E6D3;
+  --ink:#1A1612; --ink-muted:#6B5F55; --ink-faint:#BEB4AA;
+  --bg:#FAF8F5; --surface:#FFFFFF; --surface-alt:#F4F0EB;
+  --red:#D94F4F; --red-bg:#FDF0F0;
+  --orange:#E07A30; --orange-bg:#FEF3E8;
+  --green:#3A9E6A; --green-bg:#EBF7F1;
+  --blue:#3A6ECC; --blue-bg:#EBF1FB;
+  --border:#EAE4DE;
+  --radius:10px; --radius-lg:16px;
+  --shadow:0 1px 3px rgba(0,0,0,.06),0 4px 14px rgba(0,0,0,.04);
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--ink);display:flex;height:100vh;overflow:hidden;font-size:14px;}
+
+/* SIDEBAR */
+.sidebar{width:220px;min-width:220px;background:var(--ink);display:flex;flex-direction:column;overflow-y:auto;z-index:10;}
+.sidebar-logo{padding:24px 20px 20px;border-bottom:1px solid rgba(255,255,255,.08);}
+.sidebar-logo .brand-name{font-family:'Syne',sans-serif;font-size:18px;color:#fff;letter-spacing:-.3px;line-height:1.1;}
+.sidebar-logo .brand-sub{font-size:11px;color:var(--brand);margin-top:3px;letter-spacing:.5px;text-transf
+            <div style="min-width:72px;text-align:center"><div style="font-size:10px;color:var(--ink-muted)">Phase</div><div style="font-size:24px;font-weight:800;color:var(--red)">1</div></div>
+            <div style="flex:1"><div style="font-weight:600;font-size:13px">Rotation Â· Rupture Â· Couverture Â· Sell-Through Â· DisponibilitÃ© Â· Dormant</div><div style="font-size:12px;color:var(--ink-muted);margin-top:3px">Impact trÃ¨s Ã©levÃ© â€” 4 Ã  6 semaines</div></div>
+            <div style="width:140px"><div class="gauge-track"><div class="gauge-fill red" style="width:65%"></div></div><div style="font-size:11px;color:var(--ink-muted);margin-top:4px">65% avancÃ©</div></div>
+            <span class="badge badge-red">En cours</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:16px;padding:16px;background:var(--orange-bg);border-radius:10px;border-left:4px solid var(--orange)">
+            <div style="min-width:72px;text-align:center"><div style="font-size:10px;color:var(--ink-muted)">Phase</div><div style="font-size:24px;font-weight:800;color:var(--orange)">2</div></div>
+            <div style="flex:1"><div style="font-weight:600;font-size:13px">Lead Time Â· OTIF Â· GMROI Â· DÃ©marque Â· PrÃ©cision inventaire Â· ABC</div><div style="font-size:12px;color:var(--ink-muted);margin-top:3px">Impact Ã©levÃ© â€” 6 Ã  8 semaines</div></div>
+            <div style="width:140px"><div class="gauge-track"><div class="gauge-fill orange" style="width:20%"></div></div><div style="font-size:11px;color:var(--ink-muted);margin-top:4px">20% avancÃ©</div></div>
+            <span class="badge badge-gray">PlanifiÃ©</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:16px;padding:16px;background:var(--

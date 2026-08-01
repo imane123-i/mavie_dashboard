@@ -719,11 +719,11 @@
                 .ruptures-panel {
                     background: var(--surface);
                     width: 100%;
-                    max-width: 600px;
-                    max-height: 80vh;
+                    max-width: 900px;
+                    max-height: 85vh;
                     overflow-y: auto;
                     border-radius: 16px;
-                    padding: 28px;
+                    padding: 24px;
                     box-shadow: 0 24px 80px rgba(0,0,0,0.6);
                     position: relative;
                 }
@@ -740,6 +740,159 @@
                     .kpi-grid { grid-template-columns: 1fr 1fr; }
                     .detail-panel { padding: 20px 16px; }
                     .detail-kpi-grid { grid-template-columns: repeat(2, 1fr); }
+                }
+
+                /* ── Dynamic Stock Dashboard Styles ── */
+                .stock-kpi-card {
+                    padding: 16px 14px !important;
+                    text-align: left !important;
+                    display: flex;
+                    flex-direction: column;
+                    justify-content: space-between;
+                    height: 110px;
+                }
+                .stock-kpi-card::before {
+                    display: none !important;
+                }
+                .stock-kpi-card.border-red { border-top: 4px solid #EF4444 !important; }
+                .stock-kpi-card.border-brown { border-top: 4px solid #78350F !important; }
+                .stock-kpi-card.border-orange { border-top: 4px solid #F59E0B !important; }
+                .stock-kpi-card.border-green { border-top: 4px solid #10B981 !important; }
+
+                .stock-kpi-card .kpi-label {
+                    font-size: 0.68rem !important;
+                    font-weight: 700 !important;
+                    text-transform: uppercase;
+                    color: #64748B !important;
+                    margin-bottom: 2px !important;
+                    letter-spacing: 0.05em;
+                }
+                .stock-kpi-card .kpi-value {
+                    font-size: 2rem !important;
+                    font-weight: 800 !important;
+                    color: #0F172A !important;
+                }
+                .stock-kpi-card .kpi-subtext {
+                    font-size: 0.72rem;
+                    color: #64748B;
+                    margin-top: auto;
+                }
+                .value-red { color: #EF4444 !important; }
+                .value-orange { color: #F59E0B !important; }
+                .value-green { color: #10B981 !important; }
+
+                /* Alert list elements */
+                .alert-card-item {
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    padding: 12px 16px;
+                    border-radius: 12px;
+                    font-size: 0.85rem;
+                    font-weight: 600;
+                    border: 1px solid transparent;
+                    transition: transform var(--transition);
+                }
+                .alert-card-item:hover {
+                    transform: translateX(4px);
+                }
+                .alert-card-item .alert-msg-block {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                }
+                .alert-card-item .alert-dot {
+                    font-size: 0.85rem;
+                }
+                .alert-card-item .alert-location {
+                    font-size: 0.8rem;
+                    opacity: 0.8;
+                    font-weight: 500;
+                }
+                .alert-item-danger {
+                    background: #FFF1F2;
+                    border-color: #FFE4E6;
+                    color: #9F1239;
+                }
+                .alert-item-warning {
+                    background: #FFFBEB;
+                    border-color: #FEF3C7;
+                    color: #92400E;
+                }
+                .alert-item-info {
+                    background: #EFF6FF;
+                    border-color: #DBEAFE;
+                    color: #1E40AF;
+                }
+                .alert-item-success {
+                    background: #F0FDF4;
+                    border-color: #DCFCE7;
+                    color: #166534;
+                }
+
+                /* Collection progress lines */
+                .progress-item-row {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 4px;
+                }
+                .progress-item-meta {
+                    display: flex;
+                    justify-content: space-between;
+                    font-size: 0.85rem;
+                    font-weight: 600;
+                    color: #0F172A;
+                }
+                .progress-item-bar-bg {
+                    width: 100%;
+                    height: 8px;
+                    background: #F1F5F9;
+                    border-radius: 4px;
+                    overflow: hidden;
+                    position: relative;
+                }
+                .progress-item-bar-fill {
+                    height: 100%;
+                    border-radius: 4px;
+                    transition: width 0.5s ease-out;
+                }
+                .fill-brown { background: #A16207; }
+                .fill-red { background: #EF4444; }
+                .fill-green { background: #10B981; }
+
+                .collection-warning-label {
+                    font-size: 0.78rem;
+                    color: #EF4444;
+                    font-weight: 500;
+                    margin-top: 2px;
+                }
+
+                /* Badges for classes */
+                .badge-classe {
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 50%;
+                    font-size: 0.75rem;
+                    font-weight: 700;
+                }
+                .badge-a { background: #FEF3C7; color: #92400E; }
+                .badge-b { background: #E0F2FE; color: #0369A1; }
+                .badge-c { background: #F3F4F6; color: #374151; }
+
+                /* Tables in stock bottom section */
+                .stock-table th, .stock-table td {
+                    padding: 10px 8px;
+                    border-bottom: 1px solid #F1F5F9;
+                    font-size: 0.85rem;
+                }
+                .stock-table tbody tr {
+                    transition: background-color var(--transition);
+                }
+                .stock-table tbody tr:hover {
+                    background-color: #F8FAFC;
                 }
             </style>
         </head>
@@ -793,7 +946,7 @@
                     </div>
                 </div>
 
-                <div class="kpi-grid">
+                <div class="kpi-grid" id="main-kpi-grid">
                     <div class="kpi-card" id="card-ca-total">
                         <span class="kpi-icon">💰</span>
                         <div class="kpi-label">CA Potentiel</div>
@@ -821,7 +974,7 @@
                     </div>
                     <div class="kpi-card kpi-amber" id="card-stock-total">
                         <span class="kpi-icon">📦</span>
-                        <div class="kpi-label">Stock Dispatch</div>
+                        <div class="kpi-label">Stock Réel Odoo</div>
                         <div class="kpi-value" id="kpi-stock-total">—</div>
                     </div>
                     <div class="kpi-card" id="card-sell-through">
@@ -836,11 +989,81 @@
                     </div>
                 </div>
 
+                <!-- ══════════ KPI GRID FOR STOCK PAGE ══════════ -->
+                <div class="kpi-grid" id="stock-kpi-grid" style="display:none;">
+                    <div class="kpi-card stock-kpi-card border-red" id="card-stock-taux-rupture">
+                        <div class="kpi-label">Taux de rupture</div>
+                        <div class="kpi-value value-red" id="kpi-stock-taux-rupture">—</div>
+                        <div class="kpi-subtext">Seuil : 5%</div>
+                    </div>
+                    <div class="kpi-card stock-kpi-card border-red" id="card-stock-skus-rupture">
+                        <div class="kpi-label">SKUs en rupture</div>
+                        <div class="kpi-value value-red" id="kpi-stock-skus-rupture">—</div>
+                        <div class="kpi-subtext" id="kpi-stock-skus-rupture-sub">/ — actifs</div>
+                    </div>
+                    <div class="kpi-card stock-kpi-card border-brown" id="card-stock-couverture">
+                        <div class="kpi-label">Couverture Moy.</div>
+                        <div class="kpi-value" id="kpi-stock-couverture">—</div>
+                        <div class="kpi-subtext">Cible 60-90j</div>
+                    </div>
+                    <div class="kpi-card stock-kpi-card border-orange" id="card-stock-dormant">
+                        <div class="kpi-label">Stock dormant</div>
+                        <div class="kpi-value value-orange" id="kpi-stock-dormant">—</div>
+                        <div class="kpi-subtext">Seuil : 10%</div>
+                    </div>
+                    <div class="kpi-card stock-kpi-card border-green" id="card-stock-precision">
+                        <div class="kpi-label">Précision Inventaire</div>
+                        <div class="kpi-value value-green" id="kpi-stock-precision">—</div>
+                        <div class="kpi-subtext">Cible : 98%</div>
+                    </div>
+                </div>
+
                 <!-- ══════════ BARRE DE RECHERCHE ══════════ -->
                 <div class="search-bar-wrapper">
                     <span class="search-icon">🔍</span>
                     <input type="text" id="product-search-input" class="search-input" placeholder="Rechercher un produit par nom ou référence…" autocomplete="off"/>
                     <div id="product-search-results" class="search-results"></div>
+                </div>
+
+                <!-- ══════════ MIDDLE SECTION FOR STOCK PAGE ══════════ -->
+                <div class="section-card full-width" id="stock-middle-section" style="display:none; padding:24px; margin-bottom:20px;">
+                    <!-- Alertes Stock -->
+                    <div class="section-title" style="font-weight:700; font-size:1rem; color:#0F172A; display:flex; align-items:center; gap:8px;">
+                        <span style="color:#EF4444; font-size:1.2rem;">●</span> Alertes stock
+                    </div>
+                    <div id="stock-alerts-list" class="stock-alerts-container" style="display:flex; flex-direction:column; gap:12px; margin-top:16px;">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+
+                <!-- ══════════ BOTTOM SECTION FOR STOCK PAGE ══════════ -->
+                <div class="section-card full-width" id="stock-bottom-section" style="display:none; padding:24px; margin-bottom:20px;">
+                    <div class="section-header-row" style="display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; flex-wrap:wrap; gap:12px;">
+                        <div class="section-title" style="font-weight:700; font-size:1rem; color:#0F172A; display:flex; align-items:center; gap:8px; margin-bottom:0;">
+                            <span style="color:#F59E0B; font-size:1.2rem;">●</span> Produits proches rupture — Couverture &lt; 15 jours
+                        </div>
+                        <div class="section-actions" style="display:flex; align-items:center; gap:10px; margin-left:auto;">
+                            <span style="font-size:0.85rem; color:#64748B;">Afficher :</span>
+                            <input type="number" id="stock-proches-limit" value="5" min="1" max="100" class="limit-input" style="width:50px; background:#F1F5F9; border:1px solid #CBD5E1; color:#0F172A; font-weight:500; height:32px;"/>
+                            <button id="btn-stock-proches-ok" style="background:#F3E8FF; border:1px solid #C084FC; color:#6B21A8; font-weight:600; padding:6px 12px; border-radius:6px; font-size:0.85rem; cursor:pointer; height:32px;">OK</button>
+                        </div>
+                    </div>
+                    <table class="stock-table" style="width:100%; border-collapse:collapse;">
+                        <thead>
+                            <tr style="border-bottom:1px solid #F1F5F9; text-align:left;">
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">#</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Article</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Collection</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Magasin</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Stock</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Couverture</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Classe</th>
+                            </tr>
+                        </thead>
+                        <tbody id="stock-proches-tbody">
+                            <!-- Populated by JS -->
+                        </tbody>
+                    </table>
                 </div>
 
                 <!-- ══════════ TOP / FLOP ══════════ -->
@@ -946,7 +1169,7 @@
                             <div class="d-value" id="detail-qty-purchased">—</div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label">📦 Stock dispatch</div>
+                            <div class="d-label">📦 Stock Réel Odoo</div>
                             <div class="d-value" id="detail-stock-total">—</div>
                         </div>
                         <div class="detail-kpi-card">
@@ -957,19 +1180,7 @@
                             <div class="d-label">📊 Sell-Through</div>
                             <div class="d-value" id="detail-sell-through">—</div>
                         </div>
-                        <div class="detail-kpi-card">
-                            <div class="d-label">📈 % Marge</div>
-                            <div class="d-value" id="detail-margin">—</div>
                         </div>
-                        <div class="detail-kpi-card">
-                            <div class="d-label">🏷 PV TTC</div>
-                            <div class="d-value" id="detail-pv-ttc">—</div>
-                        </div>
-                        <div class="detail-kpi-card">
-                            <div class="d-label">💵 Coût achat</div>
-                            <div class="d-value" id="detail-cost">—</div>
-                        </div>
-                    </div>
 
                     <div class="detail-section">
                         <h3>🎨 Variantes Couleurs — Meilleure variante en tête</h3>
@@ -1023,21 +1234,33 @@
             <div id="ruptures-overlay">
                 <div class="ruptures-panel">
                     <button class="close-detail-btn" id="close-ruptures-btn" title="Fermer">✕</button>
-                    <h3 style="margin-bottom:16px;color:#0F172A;">⚠️ Produits en rupture de stock</h3>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Produit</th>
-                                <th>Réf</th>
-                                <th>Stock</th>
-                            </tr>
-                        </thead>
-                        <tbody id="ruptures-tbody"></tbody>
-                    </table>
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding-right:30px;">
+                        <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700; display:flex; align-items:center; gap:8px;">
+                            <span>🚨</span> Produits en rupture de stock
+                            <span id="ruptures-count-badge" style="background:#FEE2E2; color:#991B1B; font-weight:700; font-size:0.8rem; padding:3px 10px; border-radius:12px;">0</span>
+                        </h3>
+                    </div>
+                    <div style="margin-bottom:16px;">
+                        <input type="text" id="search-ruptures-input" placeholder="🔍 Rechercher une référence ou un nom..." style="width:100%; padding:10px 14px; border:1px solid #CBD5E1; border-radius:8px; font-size:0.9rem; outline:none; background:#F8FAFC; color:#0F172A; font-weight:500;"/>
+                    </div>
+                    <div style="max-height:55vh; overflow-y:auto;">
+                        <table style="width:100%; border-collapse:collapse;">
+                            <thead>
+                                <tr style="border-bottom:2px solid #E2E8F0; text-align:left; background:#F1F5F9; position:sticky; top:0; z-index:10;">
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Réf</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Désignation / Article</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Qté Vendue</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">CA Réalisé</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Stock</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ruptures-tbody"></tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
 
-            <script src="/mavie_dashboard/static/src/js/dashboard.js?v=20260710"></script>
+            <script src="/mavie_dashboard/static/src/js/dashboard.js?v=20260728c"></script>
         </body>
     </html>
 </template>

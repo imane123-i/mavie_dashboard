@@ -34,6 +34,7 @@ var state = {
     flop_limit: 10,
     filters_loaded: false,
     shops: [],
+    proches_rupture_cache: [],
     detail: {
         article_id: null,
         shop_field: null,
@@ -59,6 +60,11 @@ function formatMAD(n) {
 function formatPct(n) {
     if (!n && n !== 0) return '— %';
     return (Math.round(n * 10) / 10) + ' %';
+}
+
+function formatPctTight(n) {
+    if (!n && n !== 0) return '—%';
+    return (Math.round(n * 10) / 10) + '%';
 }
 
 function rpc(route, params) {
@@ -198,6 +204,18 @@ function getFilterParams() {
 }
 
 function adjustUIForPage() {
+    // ── Bascule entre l'ancien tableau de bord et le nouveau "Stock & Rupture" ──
+    var stockOnlyIds  = ['stock-kpi-grid', 'stock-middle-section', 'stock-bottom-section'];
+    var legacyOnlyIds = ['main-kpi-grid', 'section-top-flop'];
+
+    if (currentPage === 'stock') {
+        stockOnlyIds.forEach(function(id)  { var e = el(id); if (e) e.style.display = ''; });
+        legacyOnlyIds.forEach(function(id) { var e = el(id); if (e) e.style.display = 'none'; });
+    } else {
+        stockOnlyIds.forEach(function(id)  { var e = el(id); if (e) e.style.display = 'none'; });
+        legacyOnlyIds.forEach(function(id) { var e = el(id); if (e) e.style.display = ''; });
+    }
+
     var displayMap = {
         ventes: {
             'card-ca-total': 'block',
@@ -285,40 +303,51 @@ async function loadKPIs() {
     showLoading(false);
 
     if (!data || data.error) {
-        console.error('Erreur KPIs:', data && data.error);
-        return;
+    console.error('Erreur KPIs:', data && data.error);
+    showLoading(false);
+    var errBox = el('main-kpi-grid') || el('stock-kpi-grid');
+    if (errBox) {
+        errBox.innerHTML = '<div style="grid-column:1/-1;color:#EF4444;padding:20px;text-align:center;">Erreur : ' + (data && data.error || 'inconnue') + '</div>';
     }
+    return;
+}
 
-    var kpiMap = {
-        'kpi-ca-total':      formatMAD(data.ca_total),
-        'kpi-tickets':       formatNumber(data.tickets),
-        'kpi-panier-moyen':  formatMAD(data.panier_moyen),
-        'kpi-qty-sold':      formatNumber(data.qty_sold),
-        'kpi-qty-purchased': formatNumber(data.qty_purchased),
-        'kpi-stock-total':   formatNumber(data.stock_total),
-        'kpi-sell-through':  formatPct(data.sell_through),
-        'kpi-ruptures':      formatNumber(data.ruptures_count),
-    };
+    if (currentPage === 'stock') {
+        _renderStockDashboard(data);
+    } else {
+        var kpiMap = {
+            'kpi-ca-total':      formatMAD(data.ca_total),
+            // CORRECTION #2b : On affiche references_count (nb SKUs actifs) et non tickets POS
+            // La carte HTML indique "Références" donc on doit montrer le bon chiffre
+            'kpi-tickets':       formatNumber(data.references_count || data.total_active_skus || data.tickets),
+            'kpi-panier-moyen':  formatMAD(data.panier_moyen),
+            'kpi-qty-sold':      formatNumber(data.qty_sold),
+            'kpi-qty-purchased': formatNumber(data.qty_purchased),
+            'kpi-stock-total':   formatNumber(data.stock_total),
+            'kpi-sell-through':  formatPct(data.sell_through),
+            'kpi-ruptures':      formatNumber(data.ruptures_count),
+        };
 
-    for (var id in kpiMap) {
-        var el_obj = el(id);
-        if (el_obj) el_obj.textContent = kpiMap[id];
-    }
+        for (var id in kpiMap) {
+            var el_obj = el(id);
+            if (el_obj) el_obj.textContent = kpiMap[id];
+        }
 
-    lastRupturesList = data.ruptures_list || [];
+        lastRupturesList = data.ruptures_list || [];
 
-    var stEl = el('kpi-sell-through');
-    if (stEl) {
-        var st = data.sell_through || 0;
-        stEl.style.color = st >= 70 ? '#10B981' : (st >= 40 ? '#F59E0B' : '#EF4444');
-    }
+        var stEl = el('kpi-sell-through');
+        if (stEl) {
+            var st = data.sell_through || 0;
+            stEl.style.color = st >= 70 ? '#10B981' : (st >= 40 ? '#F59E0B' : '#EF4444');
+        }
 
-    _renderProductTable('top-products-tbody', data.top_products, false);
-    _renderProductTable('flop-products-tbody', data.flop_products, true);
+        _renderProductTable('top-products-tbody', data.top_products, false);
+        _renderProductTable('flop-products-tbody', data.flop_products, true);
 
-    if (currentPage === 'ventes') {
-        _renderABC(data.abc_analysis);
-        loadSalesDaily();
+        if (currentPage === 'ventes') {
+            _renderABC(data.abc_analysis);
+            loadSalesDaily();
+        }
     }
 }
 
@@ -536,10 +565,8 @@ async function _fetchAndRenderDetail() {
         'detail-qty-purchased': formatNumber(data.qty_purchased),
         'detail-stock-total':   formatNumber(data.stock_total),
         'detail-ca':            formatMAD(data.ca),
-        'detail-margin':        formatPct(data.margin),
         'detail-sell-through':  formatPct(data.sell_through),
-        'detail-pv-ttc':        formatMAD(data.pv_ttc),
-        'detail-cost':          formatMAD(data.cost),
+    
     };
     for (var id in kpiMap) {
         var e = el(id);
@@ -622,6 +649,19 @@ function _renderRealStock(tbodyId, stores) {
         return;
     }
 
+    // CORRECTION #4c : Affichage du stock réel Odoo avec note explicative si négatif
+    var hasNegative = stores.some(function(s) { return s.stock < 0; });
+    if (hasNegative) {
+        var noteRow = document.createElement('tr');
+        var noteTd = document.createElement('td');
+        noteTd.colSpan = 2;
+        noteTd.innerHTML = '<span style="font-size:0.78rem;color:#92400E;background:#FFFBEB;border:1px solid #FEF3C7;border-radius:6px;padding:4px 10px;display:block;margin-bottom:4px;">'
+            + '⚠️ Stock négatif = plus de sorties enregistrées que d\'entrées dans Odoo (ajustements, retours ou imports manquants)'
+            + '</span>';
+        noteRow.appendChild(noteTd);
+        tbody.appendChild(noteRow);
+    }
+
     stores.forEach(function(s) {
         var tr = document.createElement('tr');
 
@@ -631,7 +671,14 @@ function _renderRealStock(tbodyId, stores) {
 
         var tdStock = document.createElement('td');
         tdStock.textContent = formatNumber(s.stock);
-        tdStock.style.color = s.stock <= 0 ? '#EF4444' : '#10B981';
+        if (s.stock < 0) {
+            tdStock.style.color = '#EF4444';
+            tdStock.title = 'Stock négatif dans Odoo : sorties > entrées. Vérifier les mouvements de stock.';
+        } else if (s.stock === 0) {
+            tdStock.style.color = '#F59E0B';
+        } else {
+            tdStock.style.color = '#10B981';
+        }
         tdStock.style.fontWeight = '600';
         tr.appendChild(tdStock);
 
@@ -682,12 +729,40 @@ function _renderVariants(tbodyId, variants, activeShop) {
         tr.appendChild(tdQty);
 
         var tdTotal = document.createElement('td');
-        tdTotal.textContent = formatNumber(v.total_pieces);
+        // CORRECTION #4a : Si total_pieces est 0 (pas de données dispatch Base Pivot),
+        // afficher le stock réel Odoo à la place
+        var totalDisplay = v.total_pieces > 0 ? v.total_pieces : (v.stock > 0 ? v.stock : 0);
+        tdTotal.textContent = formatNumber(totalDisplay);
+        if (v.total_pieces === 0 && v.stock === 0) {
+            tdTotal.title = 'Aucun dispatch enregistré en Base Pivot';
+            tdTotal.style.color = '#94A3B8';
+        }
         tr.appendChild(tdTotal);
 
         var tdReste = document.createElement('td');
-        tdReste.textContent = formatNumber(v.reste);
-        tdReste.style.color = (v.reste > 0) ? '#F59E0B' : '#10B981';
+        // CORRECTION #4b : Reste = total - vendu.
+        // Si pas de dispatch (total_pieces=0), on utilise stock réel.
+        // On n'affiche JAMAIS de négatif si on n'a pas de données dispatch.
+        var resteVal;
+        if (v.total_pieces > 0) {
+            // Dispatch enregistré : reste = dispatché - vendu (peut être négatif si survendu)
+            resteVal = v.reste;
+        } else if (v.stock > 0) {
+            // Pas de dispatch mais stock Odoo : reste = stock Odoo (on n'a pas dispatché officiellement)
+            resteVal = v.stock;
+        } else {
+            // Aucune donnée : on affiche 0
+            resteVal = 0;
+        }
+        tdReste.textContent = formatNumber(resteVal);
+        if (resteVal < 0) {
+            tdReste.style.color = '#EF4444'; // Rouge si survendu par rapport au dispatch
+            tdReste.title = 'Plus vendu que dispatché — vérifier les données Base Pivot';
+        } else if (resteVal === 0) {
+            tdReste.style.color = '#10B981';
+        } else {
+            tdReste.style.color = '#F59E0B';
+        }
         tr.appendChild(tdReste);
 
         tbody.appendChild(tr);
@@ -762,44 +837,86 @@ async function _doProductSearch(query) {
 // ═══════════════════════════════════════════════════════════
 // RUPTURES DE STOCK
 // ═══════════════════════════════════════════════════════════
-function _renderRupturesList() {
+function _renderRupturesList(searchFilter) {
     var tbody = el('ruptures-tbody');
     if (!tbody) return;
     tbody.innerHTML = '';
 
-    if (!lastRupturesList || lastRupturesList.length === 0) {
+    var badge = el('ruptures-count-badge');
+    if (badge) badge.textContent = formatNumber(lastRupturesList.length) + ' articles';
+
+    var list = lastRupturesList;
+    if (searchFilter) {
+        var q = searchFilter.toLowerCase().trim();
+        list = list.filter(function(p) {
+            return (p.name && p.name.toLowerCase().includes(q)) ||
+                   (p.ref && p.ref.toLowerCase().includes(q));
+        });
+    }
+
+    if (!list || list.length === 0) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 3;
-        td.textContent = 'Aucun produit en rupture';
+        td.colSpan = 5;
+        td.textContent = searchFilter ? 'Aucun produit ne correspond à votre recherche.' : 'Aucun produit en rupture';
         td.style.textAlign = 'center';
-        td.style.color = '#999';
+        td.style.padding = '24px';
+        td.style.color = '#94A3B8';
         tr.appendChild(td);
         tbody.appendChild(tr);
         return;
     }
 
-    lastRupturesList.forEach(function(p) {
+    list.forEach(function(p) {
         var tr = document.createElement('tr');
         tr.style.cursor = 'pointer';
+        tr.style.borderBottom = '1px solid #F1F5F9';
         tr.onclick = function() {
             closeRuptures();
             openDetail(p.id, p.name);
         };
 
-        var tdName = document.createElement('td');
-        tdName.textContent = p.name;
-        tr.appendChild(tdName);
-
         var tdRef = document.createElement('td');
         tdRef.textContent = p.ref || '—';
+        tdRef.style.padding = '10px';
         tdRef.style.color = '#64748B';
+        tdRef.style.fontWeight = '600';
+        tdRef.style.fontSize = '0.85rem';
         tr.appendChild(tdRef);
 
+        var tdName = document.createElement('td');
+        tdName.textContent = p.name || '—';
+        tdName.style.padding = '10px';
+        tdName.style.fontWeight = '600';
+        tdName.style.color = '#0F172A';
+        tdName.style.fontSize = '0.85rem';
+        tr.appendChild(tdName);
+
+        var tdQty = document.createElement('td');
+        tdQty.textContent = formatNumber(p.qty_sold || 0);
+        tdQty.style.padding = '10px';
+        tdQty.style.textAlign = 'center';
+        tdQty.style.color = '#334155';
+        tdQty.style.fontWeight = '500';
+        tdQty.style.fontSize = '0.85rem';
+        tr.appendChild(tdQty);
+
+        var tdCa = document.createElement('td');
+        tdCa.textContent = formatMAD(p.ca || 0);
+        tdCa.style.padding = '10px';
+        tdCa.style.textAlign = 'right';
+        tdCa.style.color = '#059669';
+        tdCa.style.fontWeight = '600';
+        tdCa.style.fontSize = '0.85rem';
+        tr.appendChild(tdCa);
+
         var tdStock = document.createElement('td');
-        tdStock.textContent = formatNumber(p.stock);
-        tdStock.style.color = '#EF4444';
-        tdStock.style.fontWeight = '600';
+        tdStock.textContent = formatNumber(p.stock || 0);
+        tdStock.style.padding = '10px';
+        tdStock.style.textAlign = 'center';
+        tdStock.style.color = '#DC2626';
+        tdStock.style.fontWeight = '700';
+        tdStock.style.fontSize = '0.85rem';
         tr.appendChild(tdStock);
 
         tbody.appendChild(tr);
@@ -818,13 +935,246 @@ function closeRuptures() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// DASHBOARD STOCK & RUPTURE (nouvelle vue)
+// ═══════════════════════════════════════════════════════════
+
+function _renderStockDashboard(data) {
+    var kpiMap = {
+        'kpi-stock-taux-rupture': formatPctTight(data.taux_rupture),
+        'kpi-stock-skus-rupture': formatNumber(data.ruptures_count),
+        'kpi-stock-couverture':   formatNumber(data.couverture_moy) + ' j',
+        'kpi-stock-dormant':      formatPctTight(data.stock_dormant_pct),
+        'kpi-stock-precision':    formatPctTight(data.precision_inventaire),
+    };
+    for (var id in kpiMap) {
+        var e = el(id);
+        if (e) e.textContent = kpiMap[id];
+    }
+
+    var subEl = el('kpi-stock-skus-rupture-sub');
+    if (subEl) subEl.textContent = '/ ' + formatNumber(data.total_active_skus) + ' actifs';
+
+    state.proches_rupture_cache = data.proches_rupture || [];
+    lastRupturesList = data.ruptures_list || [];
+
+    _renderStockAlerts(data.alertes_stock);
+    _renderRotationCollection(data.rotation_collection);
+    _renderGmroiCategorie(data.gmroi_categorie);
+    _renderProchesRupture(state.proches_rupture_cache);
+}
+
+function _renderStockAlerts(alertes) {
+    var container = el('stock-alerts-list');
+    if (!container) return;
+    container.innerHTML = '';
+
+    if (!alertes || alertes.length === 0) {
+        container.innerHTML = '<div style="text-align:center;color:#94A3B8;padding:20px;">Aucune alerte</div>';
+        return;
+    }
+
+    var dotColors = { danger: '#EF4444', warning: '#F59E0B', info: '#3B82F6', success: '#10B981' };
+
+    alertes.forEach(function(a) {
+        var div = document.createElement('div');
+        div.className = 'alert-card-item alert-item-' + a.type;
+
+        var msgBlock = document.createElement('div');
+        msgBlock.className = 'alert-msg-block';
+
+        var dot = document.createElement('span');
+        dot.className = 'alert-dot';
+        dot.style.color = dotColors[a.type] || '#94A3B8';
+        dot.textContent = '●';
+        msgBlock.appendChild(dot);
+
+        var msgSpan = document.createElement('span');
+        msgSpan.textContent = a.message;
+        msgBlock.appendChild(msgSpan);
+
+        div.appendChild(msgBlock);
+
+        var locSpan = document.createElement('span');
+        locSpan.className = 'alert-location';
+        locSpan.textContent = a.magasin || '';
+        div.appendChild(locSpan);
+
+        container.appendChild(div);
+    });
+}
+
+function _renderRotationCollection(rotation) {
+    var container = el('stock-rotation-list');
+    if (!container) return;
+    container.innerHTML = '';
+
+    if (!rotation || rotation.length === 0) {
+        container.innerHTML = '<div style="text-align:center;color:#94A3B8;padding:10px;">Aucune donnée</div>';
+        return;
+    }
+
+    var warnings = [];
+
+    rotation.forEach(function(r) {
+        var color = r.turnover >= 4 ? '#78350F' : (r.turnover >= 2.5 ? '#B45309' : '#EF4444');
+
+        var row = document.createElement('div');
+        row.className = 'progress-item-row';
+
+        var meta = document.createElement('div');
+        meta.className = 'progress-item-meta';
+        meta.innerHTML = '<span>' + r.name + '</span><span>' + r.turnover.toFixed(1) + 'x</span>';
+        row.appendChild(meta);
+
+        var barBg = document.createElement('div');
+        barBg.className = 'progress-item-bar-bg';
+        var barFill = document.createElement('div');
+        barFill.className = 'progress-item-bar-fill';
+        barFill.style.width = (r.pct || 0) + '%';
+        barFill.style.background = color;
+        barBg.appendChild(barFill);
+        row.appendChild(barBg);
+
+        container.appendChild(row);
+
+        if (r.warning) warnings.push(r.warning);
+    });
+
+    var footer = document.createElement('div');
+    footer.style.fontSize = '0.78rem';
+    footer.style.color = '#94A3B8';
+    footer.style.marginTop = '4px';
+    footer.style.paddingTop = '8px';
+    footer.style.borderTop = '1px solid #F1F5F9';
+    footer.innerHTML = 'Cible : 4 à 6 rotations/an'
+        + (warnings.length ? ' · <span style="color:#EF4444">' + warnings.join(', ') + '</span>' : '');
+    container.appendChild(footer);
+}
+
+function _renderGmroiCategorie(gmroi) {
+    var container = el('stock-gmroi-list');
+    if (!container) return;
+    container.innerHTML = '';
+
+    if (!gmroi || gmroi.length === 0) {
+        container.innerHTML = '<div style="text-align:center;color:#94A3B8;padding:10px;">Aucune donnée</div>';
+        return;
+    }
+
+    gmroi.forEach(function(g) {
+        var color = g.gmroi >= 3 ? '#10B981' : (g.gmroi >= 2 ? '#B45309' : '#EF4444');
+
+        var row = document.createElement('div');
+        row.className = 'progress-item-row';
+
+        var meta = document.createElement('div');
+        meta.className = 'progress-item-meta';
+        meta.innerHTML = '<span>' + g.name + '</span><span style="color:' + color + '">' + g.gmroi.toFixed(1) + '</span>';
+        row.appendChild(meta);
+
+        var barBg = document.createElement('div');
+        barBg.className = 'progress-item-bar-bg';
+        var barFill = document.createElement('div');
+        barFill.className = 'progress-item-bar-fill';
+        barFill.style.width = (g.pct || 0) + '%';
+        barFill.style.background = color;
+        barBg.appendChild(barFill);
+        row.appendChild(barBg);
+
+        container.appendChild(row);
+    });
+}
+
+function _renderProchesRupture(list) {
+    var tbody = el('stock-proches-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    var limitEl = el('stock-proches-limit');
+    var limit = (limitEl && parseInt(limitEl.value, 10) > 0) ? parseInt(limitEl.value, 10) : 5;
+    var items = (list || []).slice(0, limit);
+
+    if (items.length === 0) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 7;
+        td.textContent = 'Aucun produit proche de la rupture';
+        td.style.textAlign = 'center';
+        td.style.color = '#999';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    var classeMap = { A: 'badge-a', B: 'badge-b', C: 'badge-c' };
+
+    items.forEach(function(p, idx) {
+        var tr = document.createElement('tr');
+
+        var tdIdx = document.createElement('td');
+        tdIdx.textContent = idx + 1;
+        tr.appendChild(tdIdx);
+
+        var tdName = document.createElement('td');
+        var link = document.createElement('a');
+        link.href = 'javascript:void(0)';
+        link.className = 'td-link';
+        link.textContent = p.name;
+        link.onclick = function() { openDetail(p.id, p.name); };
+        tdName.appendChild(link);
+        tr.appendChild(tdName);
+
+        var tdCol = document.createElement('td');
+        var badge = document.createElement('span');
+        badge.textContent = p.collection || '—';
+        badge.style.background = '#F1F5F9';
+        badge.style.color = '#475569';
+        badge.style.padding = '3px 10px';
+        badge.style.borderRadius = '12px';
+        badge.style.fontSize = '0.78rem';
+        badge.style.fontWeight = '600';
+        badge.style.whiteSpace = 'nowrap';
+        tdCol.appendChild(badge);
+        tr.appendChild(tdCol);
+
+        var tdMagasin = document.createElement('td');
+        tdMagasin.textContent = p.magasin || '—';
+        tr.appendChild(tdMagasin);
+
+        var tdStock = document.createElement('td');
+        tdStock.textContent = formatNumber(p.stock);
+        tr.appendChild(tdStock);
+
+        var tdCouv = document.createElement('td');
+        tdCouv.textContent = p.couverture + ' j';
+        tdCouv.style.color = p.couverture < 10 ? '#EF4444' : '#F59E0B';
+        tdCouv.style.fontWeight = '700';
+        tr.appendChild(tdCouv);
+
+        var tdClasse = document.createElement('td');
+        var classeBadge = document.createElement('span');
+        classeBadge.className = 'badge-classe ' + (classeMap[p.classe] || 'badge-c');
+        classeBadge.textContent = p.classe || '—';
+        tdClasse.appendChild(classeBadge);
+        tr.appendChild(tdClasse);
+
+        tbody.appendChild(tr);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════
 // EVENT LISTENERS
 // ═══════════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', function() {
 
-    loadFilters().then(function() {
-        loadKPIs();
+    // CORRECTION #1 : Chargement en parallèle pour accélérer l'affichage
+    // On lance les filtres et les KPIs en même temps
+    var filtersPromise = loadFilters();
+    filtersPromise.then(function() {
+        // Rien à faire ici, loadKPIs est déjà lancé ci-dessous
     });
+    // KPIs lancés immédiatement sans attendre les filtres
+    loadKPIs();
 
     ['filter-collection', 'filter-magasin', 'filter-category', 'filter-batch', 'filter-date-start', 'filter-date-end'].forEach(function(id) {
         var sel = el(id);
@@ -906,8 +1256,20 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
-    var rupturesCard = el('card-ruptures');
-    if (rupturesCard) rupturesCard.addEventListener('click', openRuptures);
+    ['card-ruptures', 'card-stock-skus-rupture', 'card-stock-taux-rupture'].forEach(function(cardId) {
+        var card = el(cardId);
+        if (card) {
+            card.style.cursor = 'pointer';
+            card.addEventListener('click', openRuptures);
+        }
+    });
+
+    var searchRupturesInput = el('search-ruptures-input');
+    if (searchRupturesInput) {
+        searchRupturesInput.addEventListener('input', function(e) {
+            _renderRupturesList(e.target.value);
+        });
+    }
 
     var closeRupturesBtn = el('close-ruptures-btn');
     if (closeRupturesBtn) closeRupturesBtn.addEventListener('click', closeRuptures);
@@ -916,6 +1278,24 @@ document.addEventListener('DOMContentLoaded', function() {
     if (rupturesOverlay) {
         rupturesOverlay.addEventListener('click', function(e) {
             if (e.target === rupturesOverlay) closeRuptures();
+        });
+    }
+
+    // ── Section "Produits proches rupture" (nouvelle vue Stock) ──
+    var stockProchesOkBtn = el('btn-stock-proches-ok');
+    if (stockProchesOkBtn) {
+        stockProchesOkBtn.addEventListener('click', function() {
+            _renderProchesRupture(state.proches_rupture_cache || []);
+        });
+    }
+
+    var stockProchesLimitEl = el('stock-proches-limit');
+    if (stockProchesLimitEl) {
+        stockProchesLimitEl.addEventListener('click', function(e) { e.stopPropagation(); });
+        stockProchesLimitEl.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                _renderProchesRupture(state.proches_rupture_cache || []);
+            }
         });
     }
 

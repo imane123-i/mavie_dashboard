@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- ── Action rapport ──
+         inter.internal.transfer (module transfert_interne) n'a aucun PDF :
+         on en ajoute un ici, côté mavie_dashboard, sans toucher au module
+         transfert_interne. -->
+    <record id="action_report_transfer" model="ir.actions.report">
+        <field name="name">Bon de transfert inter-magasins</field>
+        <field name="model">inter.internal.transfer</field>
+        <field name="report_type">qweb-pdf</field>
+        <field name="report_name">mavie_dashboard.report_transfer_template</field>
+        <field name="report_file">mavie_dashboard.report_transfer_template</field>
+        <field name="binding_model_id" ref="transfert_interne.model_inter_internal_transfer"/>
+        <field name="binding_type">report</field>
+        <field name="paperformat_id" ref="base.paperformat_euro"/>
+    </record>
+
+    <!-- ── Template QWeb ── -->
+    <template id="report_transfer_template">
+        <t t-call="web.html_container">
+            <t t-foreach="docs" t-as="doc">
+                <!-- Une société peut posséder plusieurs magasins (ex: SALMEDO en a 7) :
+                     on identifie le magasin exact par son emplacement de stock
+                     (lot_stock_id), pas seulement par la société, sinon on affiche
+                     le mauvais nom de magasin sur le bon. -->
+                <t t-set="src_mapping" t-value="env['mv.batch.shop.mapping'].sudo().search([('warehouse_id.lot_stock_id', '=', doc.location_source_id.id)], limit=1) or env['mv.batch.shop.mapping'].sudo().search([('company_id', '=', doc.company_source_id.id)], limit=1)"/>
+                <t t-set="dst_mapping" t-value="env['mv.batch.shop.mapping'].sudo().search([('warehouse_id.lot_stock_id', '=', doc.location_target_id.id)], limit=1) or env['mv.batch.shop.mapping'].sudo().search([('company_id', '=', doc.company_target_id.id)], limit=1)"/>
+                <t t-call="web.external_layout">
+                    <div class="page">
+
+                        <div class="row mb-4">
+                            <div class="col-12 text-center">
+                                <h2 style="color:#1F497D; border-bottom:2px solid #1F497D; padding-bottom:6px;">
+                                    Bon de transfert inter-magasins —
+                                    <span t-esc="doc.name"/>
+                                </h2>
+                            </div>
+                        </div>
+
+                        <div class="row mb-3">
+                            <div class="col-6">
+                                <table class="table table-sm table-borderless" style="font-size:13px;">
+                                    <tbody>
+                                        <tr>
+                                            <td class="fw-bold" style="width:130px;">Magasin source :</td>
+                                            <td>
+                                                <span t-esc="(src_mapping.warehouse_id.name or src_mapping.shop_label or doc.company_source_id.name) or '—'"/>
+                                                <span t-if="src_mapping.city"> (<t t-esc="src_mapping.city"/>)</span>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td class="fw-bold">Emplacement source :</td>
+                                            <td>
+                                                <span t-esc="doc.location_source_id.display_name or '—'"/>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td class="fw-bold">Responsable :</td>
+                                            <td>
+                                                <span t-esc="(src_mapping.responsible_user_id.name) or '—'"/>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div class="col-6">
+                                <table class="table table-sm table-borderless" style="font-size:13px;">
+                                    <tbody>
+                                        <tr>
+                                            <td class="fw-bold" style="width:130px;">Magasin cible :</td>
+                                            <td>
+                                                <span t-esc="(dst_mapping.warehouse_id.name or dst_mapping.shop_label or doc.company_target_id.name) or '—'"/>
+                                                <span t-if="dst_mapping.city"> (<t t-esc="dst_mapping.city"/>)</span>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td class="fw-bold">Emplacement cible :</td>
+                                            <td>
+                                                <span t-esc="doc.location_target_id.display_name or '—'"/>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td class="fw-bold">Statut :</td>
+                                            <td>
+                                                <span t-esc="dict(doc._fields['state'].selection).get(doc.state)"/>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <!-- Tableau des lignes -->
+                        <table class="table table-sm table-bordered" style="font-size:12px;">
+                            <thead style="background-color:#1F497D; color:#FFFFFF;">
+                                <tr>
+                                    <th class="text-center" style="width:18%;">Référence</th>
+                                    <th class="text-center">Produit</th>
+                                    <th class="text-center" style="width:15%;">Couleur</th>
+                                    <th class="text-center" style="width:15%;">Taille</th>
+                                    <th class="text-center" style="width:12%;">Quantité</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <t t-foreach="doc.line_ids" t-as="line">
+                                    <tr>
+                                        <td t-esc="line.reference or ''"/>
+                                        <td t-esc="line.product_id.display_name or ''"/>
+                                        <td t-esc="line.color_name or ''"/>
+                                        <td t-esc="line.size_name or ''"/>
+                                        <td class="text-center">
+                                            <span t-esc="'%.0f' % (line.quantity or 0)"/>
+                                        </td>
+                                    </tr>
+                                </t>
+                            </tbody>
+                            <tfoot>
+                                <tr style="background-color:#F2F2F2; font-weight:bold;">
+                                    <td colspan="4" class="text-end">Total</td>
+                                    <td class="text-center">
+                                        <span t-esc="'%.0f' % sum(doc.line_ids.mapped('quantity'))"/>
+                                    </td>
+                                </tr>
+                            </tfoot>
+                        </table>
+
+                        <!-- Signature -->
+                        <div class="row mt-5">
+                            <div class="col-6 text-center">
+                                <p style="border-top:1px solid #ccc; padding-top:4px; font-size:11px;">
+                                    Signature expéditeur —
+                                    <span t-esc="src_mapping.warehouse_id.name or src_mapping.shop_label or ''"/>
+                                </p>
+                            </div>
+                            <div class="col-6 text-center">
+                                <p style="border-top:1px solid #ccc; padding-top:4px; font-size:11px;">
+                                    Signature récepteur —
+                                    <span t-esc="dst_mapping.warehouse_id.name or dst_mapping.shop_label or ''"/>
+                                </p>
+                            </div>
+                        </div>
+
+                    </div>
+                </t>
+            </t>
+        </t>
+    </template>
+
+</odoo>

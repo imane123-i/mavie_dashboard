@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
 from odoo import http, fields
 from odoo.http import request, Response
+from odoo.exceptions import UserError
 import json
 import re
+import base64
+import os
 from datetime import datetime, timedelta, date
 import logging
 
+from ..models.mv_batch_shop_mapping_ext import CITY_PROXIMITY
+
 _logger = logging.getLogger(__name__)
+
+_STATIC_JS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), 'static', 'src', 'js', 'dashboard.js'
+)
 
 
 class MaVieDashboardController(http.Controller):
@@ -15,7 +24,17 @@ class MaVieDashboardController(http.Controller):
     @http.route('/mavie/dashboard', type='http', auth='user', methods=['GET'])
     def dashboard_page(self, **kwargs):
         try:
-            return request.render('mavie_dashboard.dashboard_page')
+            # Cache-busting automatique basé sur la date de modification réelle
+            # du fichier — évite qu'un navigateur continue de servir une
+            # version JS en cache après une mise à jour du module (bug vécu :
+            # un ancien "?v=" figé en dur faisait que les mises à jour du
+            # dashboard n'apparaissaient jamais tant que le cache n'était pas
+            # vidé manuellement).
+            try:
+                js_version = str(int(os.path.getmtime(_STATIC_JS_PATH)))
+            except OSError:
+                js_version = '0'
+            return request.render('mavie_dashboard.dashboard_page', {'js_version': js_version})
         except Exception as e:
             _logger.error(f"Erreur dashboard_page: {str(e)}")
             return f"<h1>Erreur</h1><p>{str(e)}</p>"
@@ -266,6 +285,65 @@ class MaVieDashboardController(http.Controller):
         field_min = min(stock_by_shop, key=lambda f: stock_by_shop[f][0])
         return stock_by_shop[field_min][1]
 
+    def _resolve_magasin_batch(self, product_tmpl_ids, shop_mappings, shop_field_filter=None):
+        """
+        Version "en masse" de _resolve_exact_magasin : résout le magasin pour
+        une LISTE de templates en (nombre de magasins) requêtes au lieu de
+        (nombre de templates × nombre de magasins) — évite le N+1 catastrophique
+        si on appelait _resolve_exact_magasin dans une boucle Python.
+        """
+        product_tmpl_ids = list(product_tmpl_ids)
+        magasin_by_tid = {}
+        if not product_tmpl_ids:
+            return magasin_by_tid
+
+        if shop_field_filter:
+            filt_mapping = shop_mappings.filtered(lambda m: m.shop_field == shop_field_filter)[:1]
+            default_label = (
+                (filt_mapping.warehouse_id.name if filt_mapping.warehouse_id else (filt_mapping.shop_label or shop_field_filter))
+                if filt_mapping else 'Réseau'
+            )
+            for tid in product_tmpl_ids:
+                magasin_by_tid[tid] = default_label
+            return magasin_by_tid
+
+        variant_rows = request.env['product.product'].sudo().search_read(
+            [('product_tmpl_id', 'in', product_tmpl_ids)],
+            ['id', 'product_tmpl_id']
+        )
+        variant_ids_by_tid = {}
+        for v in variant_rows:
+            variant_ids_by_tid.setdefault(v['product_tmpl_id'][0], []).append(v['id'])
+        all_variant_ids = [vid for vids in variant_ids_by_tid.values() for vid in vids]
+
+        shop_qty_by_tid = {tid: {} for tid in product_tmpl_ids}
+        if all_variant_ids:
+            for sm in shop_mappings:
+                if not sm.warehouse_id or not sm.warehouse_id.lot_stock_id:
+                    continue
+                q_grouped = request.env['stock.quant'].sudo().read_group(
+                    [
+                        ('product_id', 'in', all_variant_ids),
+                        ('location_id', 'child_of', sm.warehouse_id.lot_stock_id.id),
+                    ],
+                    ['quantity:sum', 'product_id'], ['product_id'], lazy=False
+                )
+                qty_by_variant = {g['product_id'][0]: g.get('quantity') or 0.0 for g in q_grouped if g.get('product_id')}
+                label = sm.warehouse_id.name if sm.warehouse_id else (sm.shop_label or sm.shop_field)
+                for tid, vids in variant_ids_by_tid.items():
+                    qty = sum(qty_by_variant.get(vid, 0.0) for vid in vids)
+                    shop_qty_by_tid[tid][sm.shop_field] = (qty, label)
+
+        for tid in product_tmpl_ids:
+            shop_data = shop_qty_by_tid.get(tid) or {}
+            if not shop_data:
+                magasin_by_tid[tid] = 'Réseau'
+            else:
+                field_min = min(shop_data, key=lambda f: shop_data[f][0])
+                magasin_by_tid[tid] = shop_data[field_min][1]
+
+        return magasin_by_tid
+
     # ─────────────────────────────────────────────────────────────
     # FILTERS
     # ─────────────────────────────────────────────────────────────
@@ -319,7 +397,10 @@ class MaVieDashboardController(http.Controller):
                     ORDER BY pc.name
                 """)
                 rows = request.env.cr.fetchall()
-                excluded_names = {'all', 'expenses', 'saleable', 'pos', 'bons & fidélité'}
+                excluded_names = {
+                    'all', 'expenses', 'saleable', 'pos', 'bons & fidélité',
+                    'demi0', 'solde test 2', 'étiquettes solde',
+                }
                 filters['categories'] = [
                     {'id': r[0], 'name': r[1]} for r in rows
                     if r[1] and r[1].lower().strip() not in excluded_names
@@ -358,7 +439,8 @@ class MaVieDashboardController(http.Controller):
                         'taux_rupture': 0, 'couverture_moy': 0,
                         'stock_dormant_pct': 0, 'precision_inventaire': 99.5,
                         'alertes_stock': [], 'rotation_collection': [],
-                        'gmroi_categorie': [], 'proches_rupture': [],
+                        'gmroi_categorie': [], 'proches_rupture_30j': [],
+                        'valeur_stock_ht': 0, 'valeur_stock_cost': 0, 'stock_val_by_store': [],
                     }
                 product_tmpl_ids = products.ids
             else:
@@ -577,7 +659,7 @@ class MaVieDashboardController(http.Controller):
 
                 tmpl_data = request.env['product.template'].sudo().search_read(
                     [('id', 'in', list(relevant_tmpl_ids))],
-                    ['name', 'default_code', 'base_pivot_reference']
+                    ['name', 'default_code', 'base_pivot_reference', 'standard_price', 'categ_id', 'collection_id']
                 )
                 tmpl_by_id = {t['id']: t for t in tmpl_data}
 
@@ -736,7 +818,9 @@ class MaVieDashboardController(http.Controller):
                 alertes_stock.append({
                     'type': 'danger',
                     'message': f"{r['name']} — RUPTURE ({r['qty_sold']} vendus)",
-                    'magasin': _resolve_magasin_name(r['id'])
+                    'magasin': _resolve_magasin_name(r['id']),
+                    'id': r['id'],
+                    'name': r['name'],
                 })
 
             crit_cands = []
@@ -755,7 +839,9 @@ class MaVieDashboardController(http.Controller):
                 alertes_stock.append({
                     'type': 'warning',
                     'message': f"{c['name']} — stock critique ({c['stock']} unités)",
-                    'magasin': _resolve_magasin_name(c['id'])
+                    'magasin': _resolve_magasin_name(c['id']),
+                    'id': c['id'],
+                    'name': c['name'],
                 })
 
             dormant_products.sort(key=lambda x: x['stock'], reverse=True)
@@ -768,13 +854,26 @@ class MaVieDashboardController(http.Controller):
 
             alertes_stock = alertes_stock[:6]
 
+            # ✅ Rotation par collection — 2 requêtes au total (au lieu d'1 recherche
+            # product.template PAR collection en boucle, même anti-pattern N+1 que le
+            # GMROI ci-dessus, corrigé pour la même raison de rapidité de chargement).
             rotation_collection = []
             try:
                 collections = request.env['product.collection'].sudo().search([])
-                for col in collections:
-                    col_tmpl_ids = request.env['product.template'].sudo().search([
-                        ('collection_id', '=', col.id)
-                    ]).ids
+                col_names = {c.id: c.name for c in collections}
+
+                col_tmpl_data = request.env['product.template'].sudo().search_read(
+                    [('collection_id', 'in', list(col_names.keys()))],
+                    ['collection_id']
+                ) if col_names else []
+                tmpl_ids_by_collection = {}
+                for t in col_tmpl_data:
+                    cid = t['collection_id'][0] if t.get('collection_id') else None
+                    if cid:
+                        tmpl_ids_by_collection.setdefault(cid, []).append(t['id'])
+
+                for col_id, col_name in col_names.items():
+                    col_tmpl_ids = tmpl_ids_by_collection.get(col_id, [])
                     col_stock = sum(stock_by_tmpl.get(tid, 0) for tid in col_tmpl_ids)
                     col_sales = sum(sales_by_tmpl.get(tid, {}).get('qty', 0) for tid in col_tmpl_ids)
                     col_sales_annualized = col_sales * (365 / days_in_period) if days_in_period > 0 else 0
@@ -782,10 +881,10 @@ class MaVieDashboardController(http.Controller):
 
                     if col_stock > 0 or col_sales > 0:
                         rotation_collection.append({
-                            'name': col.name,
+                            'name': col_name,
                             'turnover': col_turnover,
                             'pct': min(100, int((col_turnover / 6.0) * 100)) if col_turnover > 0 else 15,
-                            'warning': f"{col.name} sous seuil critique" if col_turnover < 2.0 and col_turnover > 0 else None
+                            'warning': f"{col_name} sous seuil critique" if col_turnover < 2.0 and col_turnover > 0 else None
                         })
             except Exception as e:
                 _logger.warning(f"Error computing collection rotation: {str(e)}")
@@ -793,26 +892,35 @@ class MaVieDashboardController(http.Controller):
             rotation_collection.sort(key=lambda x: (x['turnover'], x['pct']), reverse=True)
             rotation_collection = rotation_collection[:5]
 
+            # ✅ GMROI par catégorie — regroupement 100% en mémoire à partir de
+            # tmpl_by_id/sales_by_tmpl/stock_by_tmpl déjà chargés : AUCUNE requête
+            # SQL supplémentaire (l'ancienne version faisait 1 search(child_of) par
+            # catégorie, jusqu'à 30 requêtes lentes en boucle — anti-pattern N+1).
             gmroi_categorie = []
             try:
-                categories = request.env['product.category'].sudo().search([('parent_id', '!=', False)], limit=30)
-                for cat in categories:
-                    cat_tmpl_ids = request.env['product.template'].sudo().search([
-                        ('categ_id', 'child_of', cat.id)
-                    ]).ids
-                    if not cat_tmpl_ids:
+                cat_groups = {}
+                for tid in relevant_tmpl_ids:
+                    categ = tmpl_by_id.get(tid, {}).get('categ_id')
+                    if not categ:
                         continue
+                    cat_id, cat_name = categ[0], categ[1]
+                    cat_groups.setdefault(cat_id, {'name': cat_name, 'tmpl_ids': []})['tmpl_ids'].append(tid)
+
+                for cat_id, info in cat_groups.items():
+                    cat_tmpl_ids = info['tmpl_ids']
                     cat_stock_cost = sum(stock_by_tmpl.get(tid, 0) * (tmpl_by_id.get(tid, {}).get('standard_price') or 200.0) for tid in cat_tmpl_ids)
                     cat_margin = 0.0
-                    for line in pos_lines:
-                        if line.product_id.product_tmpl_id.id in cat_tmpl_ids:
-                            cost = (line.product_id.standard_price or 0.0) * line.qty
-                            cat_margin += (line.price_subtotal_incl - cost)
+                    for tid in cat_tmpl_ids:
+                        sale = sales_by_tmpl.get(tid)
+                        if not sale:
+                            continue
+                        cost = (tmpl_by_id.get(tid, {}).get('standard_price') or 0.0) * sale.get('qty', 0)
+                        cat_margin += (sale.get('ca', 0.0) - cost)
 
                     cat_gmroi = round(cat_margin / cat_stock_cost, 1) if cat_stock_cost > 0 else 0.0
                     if cat_stock_cost > 0 or cat_margin > 0:
                         gmroi_categorie.append({
-                            'name': cat.name,
+                            'name': info['name'],
                             'gmroi': cat_gmroi,
                             'pct': min(100, int((cat_gmroi / 4.0) * 100)) if cat_gmroi > 0 else 10
                         })
@@ -821,36 +929,6 @@ class MaVieDashboardController(http.Controller):
 
             gmroi_categorie.sort(key=lambda x: x['gmroi'], reverse=True)
             gmroi_categorie = gmroi_categorie[:5]
-
-            candidate_proches_tids = [tid for tid in relevant_tmpl_ids if 0 < stock_by_tmpl.get(tid, 0) <= 10 or product_coverages.get(tid, 999) < 30]
-
-            proches_rupture = []
-            for tid in candidate_proches_tids:
-                stock = stock_by_tmpl.get(tid, 0)
-                cov = product_coverages.get(tid, 999)
-                t = tmpl_by_id.get(tid, {})
-                tmpl_obj = request.env['product.template'].sudo().browse(tid)
-                col_name = tmpl_obj.collection_id.name if tmpl_obj.collection_id else '—'
-                if col_name == '—':
-                    ref_base = request.env['mv.article.base'].sudo().search([('product_tmpl_id', '=', tid)], limit=1)
-                    if ref_base and ref_base.collection_id:
-                        col_name = ref_base.collection_id.name
-
-                store_loc = _resolve_magasin_name(tid)
-
-                proches_rupture.append({
-                    'id': tid,
-                    'name': tmpl_obj.display_name or t.get('name') or '—',
-                    'ref': t.get('base_pivot_reference') or t.get('default_code') or '—',
-                    'collection': col_name,
-                    'magasin': store_loc,
-                    'stock': int(stock),
-                    'couverture': round(cov) if cov < 999 else min(90, int(stock * 7)),
-                    'classe': abc_class_map.get(tid, 'C')
-                })
-
-            proches_rupture.sort(key=lambda x: (x['stock'], x['couverture']))
-            proches_rupture = proches_rupture[:100]
 
             if page == 'stock':
                 top_products = sorted(product_stats, key=lambda a: a['stock'], reverse=True)[:top_limit]
@@ -866,6 +944,92 @@ class MaVieDashboardController(http.Controller):
                 else:
                     flop_products = sorted(product_stats, key=lambda a: a['ca'])[:flop_limit]
 
+            # ✅ VALORISATION DU STOCK (Société & Par Magasin)
+            val_ht_total = 0.0
+            val_cost_total = 0.0
+            stock_val_by_store = []
+
+            quant_val_grouped = request.env['stock.quant'].sudo().read_group(
+                quant_domain,
+                ['quantity:sum', 'product_id', 'company_id'],
+                ['product_id', 'company_id'],
+                lazy=False
+            )
+
+            val_pids = [g['product_id'][0] for g in quant_val_grouped if g.get('product_id')]
+            if val_pids:
+                val_prods = request.env['product.product'].sudo().search_read(
+                    [('id', 'in', val_pids)],
+                    ['id', 'list_price', 'standard_price']
+                )
+                val_prod_map = {p['id']: p for p in val_prods}
+
+                val_by_company = {}
+                for g in quant_val_grouped:
+                    pid = g['product_id'][0] if g.get('product_id') else None
+                    cid = g['company_id'][1] if g.get('company_id') else 'Société'
+                    qty = g.get('quantity') or 0.0
+                    if qty <= 0 or not pid or pid not in val_prod_map:
+                        continue
+                    p_data = val_prod_map[pid]
+                    price_ht = p_data.get('list_price') or 0.0
+                    cost_price = p_data.get('standard_price') or 0.0
+
+                    v_ht = qty * price_ht
+                    v_cost = qty * cost_price
+
+                    val_ht_total += v_ht
+                    val_cost_total += v_cost
+
+                    if cid not in val_by_company:
+                        val_by_company[cid] = {'ht': 0.0, 'cost': 0.0, 'qty': 0}
+                    val_by_company[cid]['ht'] += v_ht
+                    val_by_company[cid]['cost'] += v_cost
+                    val_by_company[cid]['qty'] += int(qty)
+
+                for comp_name, vdata in val_by_company.items():
+                    stock_val_by_store.append({
+                        'store_name': comp_name,
+                        'valeur_ht': round(vdata['ht'], 2),
+                        'valeur_cost': round(vdata['cost'], 2),
+                        'qty': vdata['qty']
+                    })
+
+            # ✅ ALERTE RUPTURE SOUS 30 JOURS (Prévision de rupture)
+            proches_rupture_30j = []
+            for tid in relevant_tmpl_ids:
+                stk = stock_by_tmpl.get(tid, 0)
+                qs = sales_by_tmpl.get(tid, {}).get('qty', 0)
+                daily_rate = qs / days_in_period if days_in_period > 0 else 0.0
+                if stk > 0 and daily_rate > 0:
+                    days_left = round(stk / daily_rate, 1)
+                    if days_left <= 30:
+                        t = tmpl_by_id.get(tid, {})
+                        ref = (
+                            t.get('base_pivot_reference')
+                            or ref_by_tmpl_all.get(tid)
+                            or t.get('default_code')
+                            or t.get('name')
+                            or '—'
+                        )
+                        proches_rupture_30j.append({
+                            'id': tid,
+                            'name': t.get('name') or '—',
+                            'ref': ref,
+                            'stock': int(stk),
+                            'qty_sold': int(qs),
+                            'daily_rate': round(daily_rate, 2),
+                            'days_left': days_left
+                        })
+
+            proches_rupture_30j.sort(key=lambda x: x['days_left'])
+
+            magasin_by_tid_30j = self._resolve_magasin_batch(
+                [p['id'] for p in proches_rupture_30j], shop_mappings, kw.get('shop_field')
+            )
+            for p in proches_rupture_30j:
+                p['magasin'] = magasin_by_tid_30j.get(p['id'], 'Réseau')
+
             return {
                 'ca_total': round(ca_total, 2),
                 'tickets': tickets,
@@ -874,6 +1038,9 @@ class MaVieDashboardController(http.Controller):
                 'qty_sold': qty_sold_total,
                 'qty_purchased': qty_purchased_total,
                 'stock_total': stock_total,
+                'valeur_stock_ht': round(val_ht_total, 2),
+                'valeur_stock_cost': round(val_cost_total, 2),
+                'stock_val_by_store': stock_val_by_store,
                 'sell_through': sell_through,
                 'ruptures_count': ruptures_count,
                 'ruptures_list': ruptures_list,
@@ -892,7 +1059,7 @@ class MaVieDashboardController(http.Controller):
                 'alertes_stock': alertes_stock,
                 'rotation_collection': rotation_collection,
                 'gmroi_categorie': gmroi_categorie,
-                'proches_rupture': proches_rupture,
+                'proches_rupture_30j': proches_rupture_30j[:100],
             }
 
         except Exception as e:
@@ -1198,11 +1365,13 @@ class MaVieDashboardController(http.Controller):
                 stat = sales_by_variant.get(v.id, {'qty': 0, 'ca': 0, 'shops': {}})
 
                 color_name = "—"
+                size_name = None
                 for attr_val in v.product_template_attribute_value_ids:
                     attr_name = (attr_val.attribute_id.name or '').upper()
                     if any(k in attr_name for k in ['COULEUR', 'COLOR', 'COL']):
                         color_name = attr_val.name.upper().strip()
-                        break
+                    elif any(k in attr_name for k in ['TAILLE', 'POINTURE', 'SIZE']):
+                        size_name = attr_val.name.strip()
 
                 dispatched = int(dispatch_by_color.get(color_name, 0))
 
@@ -1215,8 +1384,15 @@ class MaVieDashboardController(http.Controller):
                 if dispatched == 0 and var_stock > 0:
                     dispatched = var_stock
 
+                # Nom court : juste la couleur (+ taille si présente), sans le
+                # préfixe "[réf] nom produit" de display_name — la référence
+                # est déjà affichée en en-tête de la fiche produit.
+                variant_label = color_name if color_name != '—' else 'Standard'
+                if size_name:
+                    variant_label += ', ' + size_name
+
                 best_variants.append({
-                    'name': v.display_name,
+                    'name': variant_label,
                     'qty': int(stat['qty']),
                     'ca': round(stat['ca'], 2),
                     'dispatched': dispatched,
@@ -1293,8 +1469,16 @@ class MaVieDashboardController(http.Controller):
                     stock_by_store_pivot.append({
                         'field': s['store_name'],
                         'name': s['store_name'],
-                        'qty': s['stock']
+                        'qty': s['stock'],
+                        'stock': s['stock'],
                     })
+            else:
+                # ✅ Fusion des 2 tableaux (dispatch pivot + stock réel stock.quant)
+                # en un seul, comme demandé : le label du dispatch pivot est déjà
+                # basé sur warehouse_id.name donc correspond au store_name réel.
+                stock_by_name = {s['store_name']: s['stock'] for s in stock_by_store}
+                for row in stock_by_store_pivot:
+                    row['stock'] = stock_by_name.get(row['name'], 0)
 
             batch_data = None
             if articles and articles[0].batch_id:
@@ -1304,10 +1488,15 @@ class MaVieDashboardController(http.Controller):
                     'collection': articles[0].collection_id.name if articles[0].collection_id else '—'
                 }
 
+            # ✅ IMAGE LAZY LOADING — chargée uniquement au clic sur le produit (pas au chargement initial)
+            # NB : mv.article.base ne stocke QUE image_1920 (Binary simple, pas de
+            # variante _512/_256 auto-générée comme sur product.template.image qui
+            # est un vrai champ Image). Demander image_512 sur mv.article.base
+            # n'existait pas -> 404 systématique, d'où l'absence de photo constatée.
             image_url = (
-                f'/web/image/mv.article.base/{articles[0].id}/image_128'
+                f'/web/image/mv.article.base/{articles[0].id}/image_1920'
                 if articles
-                else f'/web/image/product.template/{product_tmpl.id}/image_128'
+                else f'/web/image/product.template/{product_tmpl.id}/image_512'
             )
 
             return {
@@ -1336,4 +1525,245 @@ class MaVieDashboardController(http.Controller):
             }
         except Exception as e:
             _logger.error(f"Erreur api_product_detail: {str(e)}", exc_info=True)
+            return {'error': str(e)}
+
+    # ─────────────────────────────────────────────────────────────
+    # EXTRACTION / TRANSFERT INTER-MAGASINS
+    # ─────────────────────────────────────────────────────────────
+
+    def _stock_by_mapping_for_template(self, product_tmpl_id, mappings):
+        """Retourne {shop_field: qty disponible} pour ce template, par magasin
+        (basé sur stock.quant réel dans mapping.warehouse_id.lot_stock_id)."""
+        variants = request.env['product.product'].sudo().search(
+            [('product_tmpl_id', '=', product_tmpl_id)]
+        )
+        if not variants:
+            return {}
+
+        result = {}
+        for m in mappings:
+            if not m.warehouse_id or not m.warehouse_id.lot_stock_id:
+                continue
+            quants = request.env['stock.quant'].sudo().search([
+                ('product_id', 'in', variants.ids),
+                ('location_id', 'child_of', m.warehouse_id.lot_stock_id.id),
+            ])
+            result[m.shop_field] = sum(quants.mapped('quantity')) if quants else 0.0
+        return result
+
+    def _notify_transfer_responsible(self, transfer, source_mapping, dest_mapping):
+        """Notifie (boîte de réception Odoo + email selon préférence utilisateur)
+        le responsable du magasin source, avec référence/quantité/photo."""
+        responsible = source_mapping.responsible_user_id
+        if not responsible:
+            label = source_mapping.shop_label or source_mapping.shop_field
+            return f"Aucun responsable configuré pour le magasin {label} : notification non envoyée."
+
+        lines_txt = []
+        attachments = []
+        for line in transfer.line_ids:
+            lines_txt.append(
+                f"<li>{line.product_id.display_name} — Réf : {line.reference or '—'} — Qté : {int(line.quantity)}</li>"
+            )
+            image = line.product_id.image_1920 or line.product_id.product_tmpl_id.image_1920
+            if image and len(attachments) < 5:
+                fname = f"{line.product_id.default_code or line.product_id.id}.png"
+                try:
+                    attachments.append((fname, base64.b64decode(image)))
+                except Exception:
+                    pass
+
+        source_label = source_mapping.shop_label or source_mapping.shop_field
+        dest_label = dest_mapping.shop_label or dest_mapping.shop_field
+        body = (
+            f"<p><strong>Transfert {transfer.name}</strong> à préparer : "
+            f"<strong>{source_label}</strong> → <strong>{dest_label}</strong></p>"
+            f"<ul>{''.join(lines_txt)}</ul>"
+        )
+
+        request.env['mail.thread'].sudo().message_notify(
+            partner_ids=[responsible.partner_id.id],
+            subject=f"Transfert {transfer.name} à préparer — {source_label}",
+            body=body,
+            model='inter.internal.transfer',
+            res_id=transfer.id,
+            attachments=attachments,
+        )
+        return None
+
+    @http.route('/mavie/api/transfer-suggestions', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_transfer_suggestions(self, **kw):
+        try:
+            product_tmpl_id = kw.get('product_tmpl_id')
+            dest_shop_field = kw.get('dest_shop_field')
+            if not product_tmpl_id:
+                return {'error': 'Produit manquant.', 'suggestions': []}
+
+            product_tmpl_id = int(product_tmpl_id)
+            mappings = self._get_active_shop_mappings()
+
+            dest_mapping = mappings.filtered(lambda m: m.shop_field == dest_shop_field)[:1]
+            dest_city = (dest_mapping.city or '').strip() if dest_mapping else ''
+            nearby_cities = set(CITY_PROXIMITY.get(dest_city, [])) if dest_city else set()
+
+            source_mappings = mappings.filtered(lambda m: m.shop_field != dest_shop_field)
+            stock_by_field = self._stock_by_mapping_for_template(product_tmpl_id, source_mappings)
+
+            suggestions = []
+            for m in source_mappings:
+                qty = stock_by_field.get(m.shop_field, 0.0)
+                if qty <= 0:
+                    continue
+                city = (m.city or '').strip()
+                if dest_city and city == dest_city:
+                    tier = 'same_city'
+                elif city and city in nearby_cities:
+                    tier = 'nearby'
+                else:
+                    tier = 'other'
+                suggestions.append({
+                    'shop_field': m.shop_field,
+                    'shop_label': m.warehouse_id.name if m.warehouse_id else (m.shop_label or m.shop_field),
+                    'city': city or '—',
+                    'available_qty': int(qty),
+                    'tier': tier,
+                    'has_responsible': bool(m.responsible_user_id),
+                })
+
+            tier_order = {'same_city': 0, 'nearby': 1, 'other': 2}
+            suggestions.sort(key=lambda s: (tier_order.get(s['tier'], 3), -s['available_qty']))
+
+            return {'suggestions': suggestions, 'dest_city': dest_city or None}
+        except Exception as e:
+            _logger.error(f"Erreur api_transfer_suggestions: {str(e)}", exc_info=True)
+            return {'error': str(e), 'suggestions': []}
+
+    @http.route('/mavie/api/transfer-variant-stock', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_transfer_variant_stock(self, **kw):
+        """Détail par variante (couleur/taille) du stock disponible pour un
+        produit dans UN magasin source précis — alimente la "matrice" affichée
+        quand on clique sur un magasin suggéré, pour choisir les quantités
+        ligne par ligne au lieu d'une quantité globale devinée automatiquement."""
+        try:
+            product_tmpl_id = kw.get('product_tmpl_id')
+            source_shop_field = kw.get('source_shop_field')
+            if not (product_tmpl_id and source_shop_field):
+                return {'error': 'Produit ou magasin source manquant.', 'variants': []}
+
+            product_tmpl_id = int(product_tmpl_id)
+            mappings = self._get_active_shop_mappings()
+            source_mapping = mappings.filtered(lambda m: m.shop_field == source_shop_field)[:1]
+            if not source_mapping or not source_mapping.warehouse_id or not source_mapping.warehouse_id.lot_stock_id:
+                return {'error': 'Magasin source non configuré (entrepôt manquant).', 'variants': []}
+
+            source_location = source_mapping.warehouse_id.lot_stock_id
+            variants = request.env['product.product'].sudo().search(
+                [('product_tmpl_id', '=', product_tmpl_id)]
+            )
+            if not variants:
+                return {'error': 'Aucune variante trouvée pour ce produit.', 'variants': []}
+
+            Quant = request.env['stock.quant'].sudo().with_company(source_mapping.company_id)
+            rows = []
+            for v in variants:
+                available = Quant._get_available_quantity(v, source_location)
+                if available <= 0:
+                    continue
+                color_name = None
+                size_name = None
+                for attr_val in v.product_template_attribute_value_ids:
+                    attr_name = (attr_val.attribute_id.name or '').upper()
+                    if any(k in attr_name for k in ['COULEUR', 'COLOR', 'COL']):
+                        color_name = attr_val.name.strip()
+                    elif any(k in attr_name for k in ['TAILLE', 'POINTURE', 'SIZE']):
+                        size_name = attr_val.name.strip()
+                rows.append({
+                    'product_id': v.id,
+                    'color': color_name or '—',
+                    'size': size_name or '—',
+                    'available_qty': int(available),
+                })
+
+            rows.sort(key=lambda r: (r['color'], r['size']))
+            return {'variants': rows}
+        except Exception as e:
+            _logger.error(f"Erreur api_transfer_variant_stock: {str(e)}", exc_info=True)
+            return {'error': str(e), 'variants': []}
+
+    @http.route('/mavie/api/transfer-create', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_transfer_create(self, **kw):
+        try:
+            product_tmpl_id = kw.get('product_tmpl_id')
+            source_shop_field = kw.get('source_shop_field')
+            dest_shop_field = kw.get('dest_shop_field')
+            lines = kw.get('lines') or []
+
+            if not (product_tmpl_id and source_shop_field and dest_shop_field and lines):
+                return {'error': 'Paramètres manquants (produit, magasin source, magasin cible, lignes).'}
+
+            product_tmpl_id = int(product_tmpl_id)
+
+            mappings = self._get_active_shop_mappings()
+            source_mapping = mappings.filtered(lambda m: m.shop_field == source_shop_field)[:1]
+            dest_mapping = mappings.filtered(lambda m: m.shop_field == dest_shop_field)[:1]
+
+            if not source_mapping or not source_mapping.warehouse_id or not source_mapping.warehouse_id.lot_stock_id:
+                return {'error': 'Magasin source non configuré (entrepôt manquant).'}
+            if not dest_mapping or not dest_mapping.warehouse_id or not dest_mapping.warehouse_id.lot_stock_id:
+                return {'error': 'Magasin cible non configuré (entrepôt manquant).'}
+            if not source_mapping.company_id or not dest_mapping.company_id:
+                return {'error': 'Société non configurée pour un des deux magasins.'}
+            if source_mapping.company_id.id == dest_mapping.company_id.id:
+                return {'error': 'Le magasin source et le magasin cible appartiennent à la même société.'}
+
+            source_location = source_mapping.warehouse_id.lot_stock_id
+            Quant = request.env['stock.quant'].sudo().with_company(source_mapping.company_id)
+
+            line_vals = []
+            warning_parts = []
+            for line in lines:
+                try:
+                    variant_id = int(line.get('product_id'))
+                    requested = float(line.get('qty') or 0)
+                except (TypeError, ValueError):
+                    continue
+                if requested <= 0:
+                    continue
+                variant = request.env['product.product'].sudo().browse(variant_id)
+                if not variant.exists() or variant.product_tmpl_id.id != product_tmpl_id:
+                    continue
+                available = Quant._get_available_quantity(variant, source_location)
+                take = min(requested, available)
+                if take <= 0:
+                    continue
+                if take < requested:
+                    warning_parts.append(f"{variant.display_name} : {take:.0f}/{requested:.0f}")
+                line_vals.append((0, 0, {'product_id': variant_id, 'quantity': take}))
+
+            if not line_vals:
+                return {'error': 'Aucune quantité valide à transférer (stock insuffisant ou lignes vides).'}
+
+            warning = ("Quantités réduites (stock insuffisant) : " + ", ".join(warning_parts)) if warning_parts else None
+
+            transfer = request.env['inter.internal.transfer'].sudo().create({
+                'company_source_id': source_mapping.company_id.id,
+                'location_source_id': source_location.id,
+                'company_target_id': dest_mapping.company_id.id,
+                'location_target_id': dest_mapping.warehouse_id.lot_stock_id.id,
+                'line_ids': line_vals,
+            })
+            transfer.sudo().action_submit()
+
+            notif_warning = self._notify_transfer_responsible(transfer, source_mapping, dest_mapping)
+
+            return {
+                'transfer_id': transfer.id,
+                'transfer_name': transfer.name,
+                'warning': warning,
+                'notif_warning': notif_warning,
+            }
+        except UserError as e:
+            return {'error': str(e)}
+        except Exception as e:
+            _logger.error(f"Erreur api_transfer_create: {str(e)}", exc_info=True)
             return {'error': str(e)}

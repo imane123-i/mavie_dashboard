@@ -34,10 +34,16 @@ var state = {
     flop_limit: 10,
     filters_loaded: false,
     shops: [],
-    proches_rupture_cache: [],
+    proches_rupture_30j_cache: [],
     detail: {
         article_id: null,
         shop_field: null,
+    },
+    transfer: {
+        article_id: null,
+        article_name: '',
+        source_shop_field: null,
+        dest_shop_field: null,
     },
 };
 
@@ -167,6 +173,17 @@ function _populateDetailFilters(data) {
             detailMagasin.appendChild(opt);
         });
     }
+
+    var transferDest = el('transfer-dest-shop');
+    if (transferDest && data.shops) {
+        while (transferDest.options.length > 1) transferDest.remove(1);
+        data.shops.forEach(function(s) {
+            var opt = document.createElement('option');
+            opt.value = s.field;
+            opt.textContent = s.name;
+            transferDest.appendChild(opt);
+        });
+    }
 }
 
 function updateFiltersFromUI() {
@@ -205,7 +222,7 @@ function getFilterParams() {
 
 function adjustUIForPage() {
     // ── Bascule entre l'ancien tableau de bord et le nouveau "Stock & Rupture" ──
-    var stockOnlyIds  = ['stock-kpi-grid', 'stock-middle-section', 'stock-bottom-section'];
+    var stockOnlyIds  = ['stock-kpi-grid', 'stock-middle-section', 'stock-30j-section', 'stock-valorisation-section'];
     var legacyOnlyIds = ['main-kpi-grid', 'section-top-flop'];
 
     if (currentPage === 'stock') {
@@ -546,7 +563,15 @@ async function _fetchAndRenderDetail() {
     }
 
     if (el('detail-name'))       el('detail-name').textContent = data.name || '—';
-    if (el('detail-ref'))        el('detail-ref').textContent  = 'Réf: ' + (data.ref || '—');
+    var refEl = el('detail-ref');
+    if (refEl) {
+        if (data.ref && data.ref !== '—') {
+            refEl.textContent = 'Réf: ' + data.ref;
+            refEl.style.display = '';
+        } else {
+            refEl.style.display = 'none';
+        }
+    }
     if (el('detail-collection')) el('detail-collection').textContent = data.collection_name || '—';
     if (el('detail-family'))     el('detail-family').textContent     = data.family || '—';
 
@@ -580,7 +605,6 @@ async function _fetchAndRenderDetail() {
     }
 
     _renderStockByStore('detail-stock-pivot-tbody', data.stock_by_store, state.detail.shop_field);
-    _renderRealStock('detail-stock-real-tbody', data.real_stock_by_store);
     _renderVariants('detail-variants-tbody', data.variants, state.detail.shop_field);
 
     var batchEl = el('detail-batch-info');
@@ -612,6 +636,18 @@ function _renderStockByStore(tbodyId, stores, activeShop) {
         return;
     }
 
+    var hasNegative = stores.some(function(s) { return (s.stock || 0) < 0; });
+    if (hasNegative) {
+        var noteRow = document.createElement('tr');
+        var noteTd = document.createElement('td');
+        noteTd.colSpan = 3;
+        noteTd.innerHTML = '<span style="font-size:0.78rem;color:#92400E;background:#FFFBEB;border:1px solid #FEF3C7;border-radius:6px;padding:4px 10px;display:block;margin-bottom:4px;">'
+            + '⚠️ Stock négatif = plus de sorties enregistrées que d\'entrées dans Odoo (ajustements, retours ou imports manquants)'
+            + '</span>';
+        noteRow.appendChild(noteTd);
+        tbody.appendChild(noteRow);
+    }
+
     stores.forEach(function(s) {
         var tr = document.createElement('tr');
         if (activeShop && s.field === activeShop) {
@@ -628,53 +664,12 @@ function _renderStockByStore(tbodyId, stores, activeShop) {
         tdQty.textContent = formatNumber(s.qty);
         tr.appendChild(tdQty);
 
-        tbody.appendChild(tr);
-    });
-}
-
-function _renderRealStock(tbodyId, stores) {
-    var tbody = el(tbodyId);
-    if (!tbody) return;
-    tbody.innerHTML = '';
-
-    if (!stores || stores.length === 0) {
-        var tr = document.createElement('tr');
-        var td = document.createElement('td');
-        td.colSpan = 2;
-        td.textContent = 'Aucun stock dans Odoo';
-        td.style.textAlign = 'center';
-        td.style.color = '#999';
-        tr.appendChild(td);
-        tbody.appendChild(tr);
-        return;
-    }
-
-    // CORRECTION #4c : Affichage du stock réel Odoo avec note explicative si négatif
-    var hasNegative = stores.some(function(s) { return s.stock < 0; });
-    if (hasNegative) {
-        var noteRow = document.createElement('tr');
-        var noteTd = document.createElement('td');
-        noteTd.colSpan = 2;
-        noteTd.innerHTML = '<span style="font-size:0.78rem;color:#92400E;background:#FFFBEB;border:1px solid #FEF3C7;border-radius:6px;padding:4px 10px;display:block;margin-bottom:4px;">'
-            + '⚠️ Stock négatif = plus de sorties enregistrées que d\'entrées dans Odoo (ajustements, retours ou imports manquants)'
-            + '</span>';
-        noteRow.appendChild(noteTd);
-        tbody.appendChild(noteRow);
-    }
-
-    stores.forEach(function(s) {
-        var tr = document.createElement('tr');
-
-        var tdName = document.createElement('td');
-        tdName.textContent = s.store_name || '—';
-        tr.appendChild(tdName);
-
         var tdStock = document.createElement('td');
         tdStock.textContent = formatNumber(s.stock);
-        if (s.stock < 0) {
+        if ((s.stock || 0) < 0) {
             tdStock.style.color = '#EF4444';
             tdStock.title = 'Stock négatif dans Odoo : sorties > entrées. Vérifier les mouvements de stock.';
-        } else if (s.stock === 0) {
+        } else if (!s.stock) {
             tdStock.style.color = '#F59E0B';
         } else {
             tdStock.style.color = '#10B981';
@@ -793,6 +788,282 @@ function closeDetail() {
     var overlay = el('detail-overlay');
     if (overlay) overlay.classList.remove('active');
     state.detail.article_id = null;
+}
+
+// ═══════════════════════════════════════════════════════════
+// EXTRACTION / TRANSFERT INTER-MAGASINS
+// ═══════════════════════════════════════════════════════════
+function openTransferPanel(articleId, productName) {
+    var overlay = el('transfer-overlay');
+    if (!overlay || !articleId) return;
+
+    state.transfer.article_id = articleId;
+    state.transfer.article_name = productName || '';
+
+    var nameEl = el('transfer-product-name');
+    if (nameEl) nameEl.textContent = productName || '—';
+
+    var destSel = el('transfer-dest-shop');
+    if (destSel) destSel.value = state.shop_field || '';
+
+    var msgEl = el('transfer-suggestions-msg');
+    if (msgEl) msgEl.textContent = '';
+
+    var resultEl = el('transfer-result');
+    if (resultEl) { resultEl.style.display = 'none'; resultEl.innerHTML = ''; }
+
+    var tbody = el('transfer-suggestions-tbody');
+    if (tbody) tbody.innerHTML = '';
+
+    _showTransferSuggestionsView();
+
+    overlay.classList.add('active');
+
+    if (destSel && destSel.value) {
+        _loadTransferSuggestions();
+    }
+}
+
+function closeTransferPanel() {
+    var overlay = el('transfer-overlay');
+    if (overlay) overlay.classList.remove('active');
+    state.transfer.article_id = null;
+}
+
+function _showTransferSuggestionsView() {
+    var suggSection = el('transfer-suggestions-section');
+    var matrixSection = el('transfer-matrix-section');
+    if (suggSection) suggSection.style.display = '';
+    if (matrixSection) matrixSection.style.display = 'none';
+}
+
+function _showTransferMatrixView() {
+    var suggSection = el('transfer-suggestions-section');
+    var matrixSection = el('transfer-matrix-section');
+    if (suggSection) suggSection.style.display = 'none';
+    if (matrixSection) matrixSection.style.display = '';
+}
+
+async function _loadTransferSuggestions() {
+    var destSel = el('transfer-dest-shop');
+    var destShopField = destSel ? destSel.value : '';
+    var tbody = el('transfer-suggestions-tbody');
+    var msgEl = el('transfer-suggestions-msg');
+
+    if (!destShopField) {
+        if (tbody) tbody.innerHTML = '';
+        if (msgEl) msgEl.textContent = 'Choisissez un magasin cible pour voir les suggestions.';
+        return;
+    }
+    if (!state.transfer.article_id) return;
+
+    if (msgEl) msgEl.textContent = 'Recherche des magasins source…';
+    if (tbody) tbody.innerHTML = '';
+
+    var data = await rpc('/mavie/api/transfer-suggestions', {
+        product_tmpl_id: state.transfer.article_id,
+        dest_shop_field: destShopField,
+    });
+
+    if (!data || data.error) {
+        if (msgEl) msgEl.textContent = 'Erreur : ' + (data && data.error || 'inconnue');
+        return;
+    }
+
+    _renderTransferSuggestions(data.suggestions || [], destShopField);
+
+    if (msgEl) {
+        var suggestions = data.suggestions || [];
+        if (suggestions.length === 0) {
+            msgEl.textContent = 'Aucun stock disponible pour ce produit dans les autres magasins.';
+        } else if (data.dest_city && !suggestions.some(function(s) { return s.tier === 'same_city'; })) {
+            msgEl.textContent = 'Aucun magasin de ' + data.dest_city + ' (même ville) n\'a de stock disponible pour ce produit — voici les autres magasins qui en ont.';
+        } else {
+            msgEl.textContent = '';
+        }
+    }
+}
+
+function _renderTransferSuggestions(suggestions, destShopField) {
+    var tbody = el('transfer-suggestions-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    var tierLabels = { same_city: 'Même ville', nearby: 'Environs', other: 'Autre' };
+
+    suggestions.forEach(function(s) {
+        var tr = document.createElement('tr');
+        tr.style.cursor = 'pointer';
+        tr.onclick = function() { openTransferMatrix(s.shop_field, s.shop_label, destShopField); };
+
+        var tdName = document.createElement('td');
+        tdName.textContent = s.shop_label;
+        tr.appendChild(tdName);
+
+        var tdCity = document.createElement('td');
+        tdCity.textContent = s.city || '—';
+        tr.appendChild(tdCity);
+
+        var tdTier = document.createElement('td');
+        var badge = document.createElement('span');
+        badge.className = 'transfer-tier-badge transfer-tier-' + s.tier;
+        badge.textContent = tierLabels[s.tier] || s.tier;
+        tdTier.appendChild(badge);
+        tr.appendChild(tdTier);
+
+        var tdStock = document.createElement('td');
+        tdStock.textContent = formatNumber(s.available_qty);
+        tr.appendChild(tdStock);
+
+        var tdAction = document.createElement('td');
+        var chooseBtn = document.createElement('button');
+        chooseBtn.className = 'btn-transfer-create';
+        chooseBtn.textContent = 'Choisir →';
+        chooseBtn.onclick = function(e) {
+            e.stopPropagation();
+            openTransferMatrix(s.shop_field, s.shop_label, destShopField);
+        };
+        tdAction.appendChild(chooseBtn);
+        tr.appendChild(tdAction);
+
+        tbody.appendChild(tr);
+    });
+}
+
+async function openTransferMatrix(sourceShopField, sourceLabel, destShopField) {
+    state.transfer.source_shop_field = sourceShopField;
+    state.transfer.dest_shop_field = destShopField;
+
+    var nameEl = el('transfer-matrix-source-name');
+    if (nameEl) nameEl.textContent = sourceLabel || sourceShopField;
+
+    var msgEl = el('transfer-matrix-msg');
+    if (msgEl) msgEl.textContent = 'Chargement du stock par couleur/taille…';
+
+    var tbody = el('transfer-matrix-tbody');
+    if (tbody) tbody.innerHTML = '';
+
+    var resultEl = el('transfer-result');
+    if (resultEl) { resultEl.style.display = 'none'; resultEl.innerHTML = ''; }
+
+    _showTransferMatrixView();
+
+    var data = await rpc('/mavie/api/transfer-variant-stock', {
+        product_tmpl_id: state.transfer.article_id,
+        source_shop_field: sourceShopField,
+    });
+
+    if (!data || data.error) {
+        if (msgEl) msgEl.textContent = 'Erreur : ' + (data && data.error || 'inconnue');
+        return;
+    }
+
+    if (msgEl) msgEl.textContent = '';
+    _renderTransferMatrix(data.variants || []);
+}
+
+function _renderTransferMatrix(variants) {
+    var tbody = el('transfer-matrix-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    if (variants.length === 0) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 4;
+        td.textContent = 'Aucun stock disponible dans ce magasin pour ce produit.';
+        td.style.textAlign = 'center';
+        td.style.color = '#999';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    variants.forEach(function(v) {
+        var tr = document.createElement('tr');
+
+        var tdColor = document.createElement('td');
+        tdColor.textContent = v.color;
+        tr.appendChild(tdColor);
+
+        var tdSize = document.createElement('td');
+        tdSize.textContent = v.size;
+        tr.appendChild(tdSize);
+
+        var tdStock = document.createElement('td');
+        tdStock.textContent = formatNumber(v.available_qty);
+        tr.appendChild(tdStock);
+
+        var tdQty = document.createElement('td');
+        var qtyInput = document.createElement('input');
+        qtyInput.type = 'number';
+        qtyInput.className = 'transfer-qty-input';
+        qtyInput.min = '0';
+        qtyInput.max = String(v.available_qty);
+        qtyInput.value = '0';
+        qtyInput.dataset.productId = v.product_id;
+        tdQty.appendChild(qtyInput);
+        tr.appendChild(tdQty);
+
+        tbody.appendChild(tr);
+    });
+}
+
+async function _createTransferFromMatrix(btnEl) {
+    var tbody = el('transfer-matrix-tbody');
+    if (!tbody) return;
+
+    var lines = [];
+    tbody.querySelectorAll('input.transfer-qty-input').forEach(function(input) {
+        var qty = parseFloat(input.value);
+        if (qty > 0) {
+            lines.push({ product_id: parseInt(input.dataset.productId, 10), qty: qty });
+        }
+    });
+
+    if (lines.length === 0) {
+        var msgEl = el('transfer-matrix-msg');
+        if (msgEl) msgEl.textContent = 'Indique au moins une quantité à transférer.';
+        return;
+    }
+
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = 'Création…'; }
+
+    var data = await rpc('/mavie/api/transfer-create', {
+        product_tmpl_id: state.transfer.article_id,
+        source_shop_field: state.transfer.source_shop_field,
+        dest_shop_field: state.transfer.dest_shop_field,
+        lines: lines,
+    });
+
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Créer le transfert'; }
+
+    var resultEl = el('transfer-result');
+    if (!resultEl) return;
+
+    if (!data || data.error) {
+        resultEl.style.display = 'block';
+        resultEl.style.background = '#FEF2F2';
+        resultEl.style.borderColor = '#FCA5A5';
+        resultEl.innerHTML = '<strong>Erreur :</strong> ' + (data && data.error || 'inconnue');
+        return;
+    }
+
+    var pdfUrl = '/report/pdf/mavie_dashboard.report_transfer_template/' + data.transfer_id;
+    var html = '<strong>✅ Transfert ' + data.transfer_name + ' créé</strong> — envoyé dans le module Transferts, en attente de validation par le Responsable Approvisionnement.';
+    html += ' <a href="' + pdfUrl + '" target="_blank">📄 Imprimer le bon (PDF)</a>';
+    if (data.warning) html += '<br/><span style="color:#B45309;">' + data.warning + '</span>';
+    if (data.notif_warning) html += '<br/><span style="color:#B45309;">' + data.notif_warning + '</span>';
+    if (!data.notif_warning) html += '<br/><span style="color:#15803D;">📩 Le responsable du magasin source a été notifié.</span>';
+
+    resultEl.style.display = 'block';
+    resultEl.style.background = '#F0FDF4';
+    resultEl.style.borderColor = '#86EFAC';
+    resultEl.innerHTML = html;
+
+    // Retour à la liste des suggestions (le stock source a changé)
+    _showTransferSuggestionsView();
+    _loadTransferSuggestions();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -954,13 +1225,131 @@ function _renderStockDashboard(data) {
     var subEl = el('kpi-stock-skus-rupture-sub');
     if (subEl) subEl.textContent = '/ ' + formatNumber(data.total_active_skus) + ' actifs';
 
-    state.proches_rupture_cache = data.proches_rupture || [];
     lastRupturesList = data.ruptures_list || [];
 
     _renderStockAlerts(data.alertes_stock);
     _renderRotationCollection(data.rotation_collection);
     _renderGmroiCategorie(data.gmroi_categorie);
-    _renderProchesRupture(state.proches_rupture_cache);
+    state.proches_rupture_30j_cache = data.proches_rupture_30j || [];
+    _renderStock30j(state.proches_rupture_30j_cache);
+    _renderStockValorisation(data);
+}
+
+function _renderStock30j(fullList) {
+    var tbody = el('stock-30j-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    var limitEl = el('stock-30j-limit');
+    var limit = (limitEl && parseInt(limitEl.value, 10) > 0) ? parseInt(limitEl.value, 10) : 10;
+    var list = (fullList || []).slice(0, limit);
+
+    if (list.length === 0) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 6;
+        td.textContent = 'Aucune rupture prévue sous 30 jours';
+        td.style.textAlign = 'center';
+        td.style.color = '#999';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    list.forEach(function(p) {
+        var tr = document.createElement('tr');
+        tr.style.cursor = 'pointer';
+        tr.onclick = function() { openDetail(p.id, p.name); };
+        var color = p.days_left <= 7 ? '#EF4444' : (p.days_left <= 15 ? '#F59E0B' : '#EAB308');
+
+        var tdRef = document.createElement('td');
+        var link = document.createElement('a');
+        link.href = 'javascript:void(0)';
+        link.className = 'td-link';
+        link.textContent = p.ref || p.name || '—';
+        tdRef.appendChild(link);
+        tr.appendChild(tdRef);
+
+        var tdMagasin = document.createElement('td');
+        tdMagasin.textContent = p.magasin || '—';
+        tr.appendChild(tdMagasin);
+
+        var tdStock = document.createElement('td');
+        tdStock.textContent = formatNumber(p.stock);
+        tr.appendChild(tdStock);
+
+        var tdRate = document.createElement('td');
+        tdRate.textContent = p.daily_rate;
+        tr.appendChild(tdRate);
+
+        var tdDays = document.createElement('td');
+        tdDays.textContent = p.days_left + ' j';
+        tdDays.style.color = color;
+        tdDays.style.fontWeight = '700';
+        tr.appendChild(tdDays);
+
+        var tdAction = document.createElement('td');
+        var btn = document.createElement('button');
+        btn.className = 'btn-transfer-row-icon';
+        btn.title = 'Proposer un transfert';
+        btn.textContent = '🔄';
+        btn.onclick = function(e) {
+            e.stopPropagation();
+            openTransferPanel(p.id, p.name);
+        };
+        tdAction.appendChild(btn);
+        tr.appendChild(tdAction);
+
+        tbody.appendChild(tr);
+    });
+}
+
+function _renderStockValorisation(data) {
+    var htEl = el('kpi-valeur-ht');
+    if (htEl) htEl.textContent = formatMAD(data.valeur_stock_ht);
+    var costEl = el('kpi-valeur-cost');
+    if (costEl) costEl.textContent = formatMAD(data.valeur_stock_cost);
+
+    var tbody = el('stock-valorisation-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    var rows = data.stock_val_by_store || [];
+    if (rows.length === 0) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 4;
+        td.textContent = 'Aucune donnée';
+        td.style.textAlign = 'center';
+        td.style.color = '#999';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    rows.sort(function(a, b) { return b.valeur_ht - a.valeur_ht; });
+
+    rows.forEach(function(r) {
+        var tr = document.createElement('tr');
+
+        var tdName = document.createElement('td');
+        tdName.textContent = r.store_name || '—';
+        tr.appendChild(tdName);
+
+        var tdQty = document.createElement('td');
+        tdQty.textContent = formatNumber(r.qty);
+        tr.appendChild(tdQty);
+
+        var tdHt = document.createElement('td');
+        tdHt.textContent = formatMAD(r.valeur_ht);
+        tr.appendChild(tdHt);
+
+        var tdCost = document.createElement('td');
+        tdCost.textContent = formatMAD(r.valeur_cost);
+        tr.appendChild(tdCost);
+
+        tbody.appendChild(tr);
+    });
 }
 
 function _renderStockAlerts(alertes) {
@@ -998,6 +1387,15 @@ function _renderStockAlerts(alertes) {
         locSpan.className = 'alert-location';
         locSpan.textContent = a.magasin || '';
         div.appendChild(locSpan);
+
+        if (a.id) {
+            var tBtn = document.createElement('button');
+            tBtn.className = 'btn-transfer-row-icon';
+            tBtn.title = 'Proposer un transfert';
+            tBtn.textContent = '🔄';
+            tBtn.onclick = function() { openTransferPanel(a.id, a.name || ''); };
+            div.appendChild(tBtn);
+        }
 
         container.appendChild(div);
     });
@@ -1085,83 +1483,6 @@ function _renderGmroiCategorie(gmroi) {
     });
 }
 
-function _renderProchesRupture(list) {
-    var tbody = el('stock-proches-tbody');
-    if (!tbody) return;
-    tbody.innerHTML = '';
-
-    var limitEl = el('stock-proches-limit');
-    var limit = (limitEl && parseInt(limitEl.value, 10) > 0) ? parseInt(limitEl.value, 10) : 5;
-    var items = (list || []).slice(0, limit);
-
-    if (items.length === 0) {
-        var tr = document.createElement('tr');
-        var td = document.createElement('td');
-        td.colSpan = 7;
-        td.textContent = 'Aucun produit proche de la rupture';
-        td.style.textAlign = 'center';
-        td.style.color = '#999';
-        tr.appendChild(td);
-        tbody.appendChild(tr);
-        return;
-    }
-
-    var classeMap = { A: 'badge-a', B: 'badge-b', C: 'badge-c' };
-
-    items.forEach(function(p, idx) {
-        var tr = document.createElement('tr');
-
-        var tdIdx = document.createElement('td');
-        tdIdx.textContent = idx + 1;
-        tr.appendChild(tdIdx);
-
-        var tdName = document.createElement('td');
-        var link = document.createElement('a');
-        link.href = 'javascript:void(0)';
-        link.className = 'td-link';
-        link.textContent = p.name;
-        link.onclick = function() { openDetail(p.id, p.name); };
-        tdName.appendChild(link);
-        tr.appendChild(tdName);
-
-        var tdCol = document.createElement('td');
-        var badge = document.createElement('span');
-        badge.textContent = p.collection || '—';
-        badge.style.background = '#F1F5F9';
-        badge.style.color = '#475569';
-        badge.style.padding = '3px 10px';
-        badge.style.borderRadius = '12px';
-        badge.style.fontSize = '0.78rem';
-        badge.style.fontWeight = '600';
-        badge.style.whiteSpace = 'nowrap';
-        tdCol.appendChild(badge);
-        tr.appendChild(tdCol);
-
-        var tdMagasin = document.createElement('td');
-        tdMagasin.textContent = p.magasin || '—';
-        tr.appendChild(tdMagasin);
-
-        var tdStock = document.createElement('td');
-        tdStock.textContent = formatNumber(p.stock);
-        tr.appendChild(tdStock);
-
-        var tdCouv = document.createElement('td');
-        tdCouv.textContent = p.couverture + ' j';
-        tdCouv.style.color = p.couverture < 10 ? '#EF4444' : '#F59E0B';
-        tdCouv.style.fontWeight = '700';
-        tr.appendChild(tdCouv);
-
-        var tdClasse = document.createElement('td');
-        var classeBadge = document.createElement('span');
-        classeBadge.className = 'badge-classe ' + (classeMap[p.classe] || 'badge-c');
-        classeBadge.textContent = p.classe || '—';
-        tdClasse.appendChild(classeBadge);
-        tr.appendChild(tdClasse);
-
-        tbody.appendChild(tr);
-    });
-}
-
 // ═══════════════════════════════════════════════════════════
 // EVENT LISTENERS
 // ═══════════════════════════════════════════════════════════
@@ -1228,6 +1549,47 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
+    var openTransferBtn = el('btn-open-transfer');
+    if (openTransferBtn) {
+        openTransferBtn.addEventListener('click', function() {
+            if (!state.detail.article_id) return;
+            var nameEl = el('detail-name');
+            openTransferPanel(state.detail.article_id, nameEl ? nameEl.textContent : '');
+        });
+    }
+
+    var closeTransferBtn = el('close-transfer-btn');
+    if (closeTransferBtn) closeTransferBtn.addEventListener('click', closeTransferPanel);
+
+    var transferOverlay = el('transfer-overlay');
+    if (transferOverlay) {
+        transferOverlay.addEventListener('click', function(e) {
+            if (e.target === transferOverlay) closeTransferPanel();
+        });
+    }
+
+    var transferDestSel = el('transfer-dest-shop');
+    if (transferDestSel) {
+        transferDestSel.addEventListener('change', function() {
+            _showTransferSuggestionsView();
+            _loadTransferSuggestions();
+        });
+    }
+
+    var transferMatrixBackBtn = el('transfer-matrix-back');
+    if (transferMatrixBackBtn) {
+        transferMatrixBackBtn.addEventListener('click', function() {
+            _showTransferSuggestionsView();
+        });
+    }
+
+    var transferMatrixCreateBtn = el('btn-transfer-matrix-create');
+    if (transferMatrixCreateBtn) {
+        transferMatrixCreateBtn.addEventListener('click', function() {
+            _createTransferFromMatrix(transferMatrixCreateBtn);
+        });
+    }
+
     var searchInput = el('product-search-input');
     if (searchInput) {
         searchInput.addEventListener('input', function() {
@@ -1281,20 +1643,20 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
-    // ── Section "Produits proches rupture" (nouvelle vue Stock) ──
-    var stockProchesOkBtn = el('btn-stock-proches-ok');
-    if (stockProchesOkBtn) {
-        stockProchesOkBtn.addEventListener('click', function() {
-            _renderProchesRupture(state.proches_rupture_cache || []);
+    // ── Section "Alerte rupture sous 30 jours" (vue Stock) ──
+    var stock30jOkBtn = el('btn-stock-30j-ok');
+    if (stock30jOkBtn) {
+        stock30jOkBtn.addEventListener('click', function() {
+            _renderStock30j(state.proches_rupture_30j_cache || []);
         });
     }
 
-    var stockProchesLimitEl = el('stock-proches-limit');
-    if (stockProchesLimitEl) {
-        stockProchesLimitEl.addEventListener('click', function(e) { e.stopPropagation(); });
-        stockProchesLimitEl.addEventListener('keydown', function(e) {
+    var stock30jLimitEl = el('stock-30j-limit');
+    if (stock30jLimitEl) {
+        stock30jLimitEl.addEventListener('click', function(e) { e.stopPropagation(); });
+        stock30jLimitEl.addEventListener('keydown', function(e) {
             if (e.key === 'Enter') {
-                _renderProchesRupture(state.proches_rupture_cache || []);
+                _renderStock30j(state.proches_rupture_30j_cache || []);
             }
         });
     }

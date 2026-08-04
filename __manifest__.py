@@ -1,6 +1,6 @@
 {
     'name': 'MaVie Dashboard — Centre d\'Analyse',
-    'version': '17.0.1.0.5',
+    'version': '17.0.1.0.7',
     'category': 'Sales',
     'summary': 'Dashboard analytique connecté aux ventes POS, stock et fournisseurs',
     'description': """
@@ -19,11 +19,14 @@
         'product_collection_arrivage',
         'spreadsheet_dashboard',
         'mv_base_pivot',      # mv.article.base, mv.article.batch, mv.batch.shop.mapping
+        'transfert_interne',  # inter.internal.transfer (extraction / transfert magasin à magasin)
     ],
     'data': [
         'security/ir.model.access.csv',
         'views/dashboard_menu.xml',
         'views/dashboard_templates.xml',
+        'views/mv_batch_shop_mapping_views_ext.xml',
+        'report/mavie_transfer_report.xml',
     ],
     'assets': {
         'web.assets_backend': [

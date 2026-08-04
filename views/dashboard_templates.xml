@@ -519,6 +519,77 @@
                     to   { opacity: 1; }
                 }
 
+                #transfer-overlay {
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(15,23,42,0.4);
+                    z-index: 9600;
+                    display: none;
+                    align-items: center;
+                    justify-content: center;
+                    backdrop-filter: blur(3px);
+                    padding: 16px;
+                }
+
+                #transfer-overlay.active {
+                    display: flex;
+                    animation: fadeInOverlay 0.22s ease;
+                }
+
+                .btn-transfer-open {
+                    background: #F3E8FF;
+                    border: 1px solid #C084FC;
+                    color: #6B21A8;
+                    font-weight: 600;
+                    padding: 8px 14px;
+                    border-radius: 8px;
+                    font-size: 0.85rem;
+                    cursor: pointer;
+                    white-space: nowrap;
+                    align-self: flex-start;
+                    margin-left: auto;
+                }
+                .btn-transfer-open:hover { background: #E9D5FF; }
+
+                .btn-transfer-row-icon {
+                    background: transparent;
+                    border: none;
+                    cursor: pointer;
+                    font-size: 1rem;
+                    padding: 2px 6px;
+                }
+
+                .transfer-tier-badge {
+                    padding: 2px 8px;
+                    border-radius: 10px;
+                    font-size: 0.72rem;
+                    font-weight: 700;
+                    white-space: nowrap;
+                }
+                .transfer-tier-same_city { background: #DCFCE7; color: #15803D; }
+                .transfer-tier-nearby    { background: #FEF3C7; color: #92400E; }
+                .transfer-tier-other     { background: #F1F5F9; color: #475569; }
+
+                .transfer-qty-input {
+                    width: 70px;
+                    padding: 4px 6px;
+                    border: 1px solid #CBD5E1;
+                    border-radius: 6px;
+                }
+
+                .btn-transfer-create {
+                    background: #7C3AED;
+                    color: #fff;
+                    border: none;
+                    padding: 6px 12px;
+                    border-radius: 6px;
+                    font-size: 0.8rem;
+                    font-weight: 600;
+                    cursor: pointer;
+                }
+                .btn-transfer-create:hover { background: #6D28D9; }
+                .btn-transfer-create:disabled { opacity: 0.5; cursor: not-allowed; }
+
                 .detail-panel {
                     background: var(--surface);
                     width: 100%;
@@ -1036,31 +1107,60 @@
                     </div>
                 </div>
 
-                <!-- ══════════ BOTTOM SECTION FOR STOCK PAGE ══════════ -->
-                <div class="section-card full-width" id="stock-bottom-section" style="display:none; padding:24px; margin-bottom:20px;">
-                    <div class="section-header-row" style="display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; flex-wrap:wrap; gap:12px;">
+                <!-- ══════════ RUPTURE SOUS 30 JOURS ══════════ -->
+                <div class="section-card full-width" id="stock-30j-section" style="display:none; padding:24px; margin-bottom:20px;">
+                    <div class="section-header-row" style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; flex-wrap:wrap; gap:12px;">
                         <div class="section-title" style="font-weight:700; font-size:1rem; color:#0F172A; display:flex; align-items:center; gap:8px; margin-bottom:0;">
-                            <span style="color:#F59E0B; font-size:1.2rem;">●</span> Produits proches rupture — Couverture &lt; 15 jours
+                            <span style="color:#F59E0B; font-size:1.2rem;">●</span> Alerte rupture sous 30 jours
                         </div>
                         <div class="section-actions" style="display:flex; align-items:center; gap:10px; margin-left:auto;">
                             <span style="font-size:0.85rem; color:#64748B;">Afficher :</span>
-                            <input type="number" id="stock-proches-limit" value="5" min="1" max="100" class="limit-input" style="width:50px; background:#F1F5F9; border:1px solid #CBD5E1; color:#0F172A; font-weight:500; height:32px;"/>
-                            <button id="btn-stock-proches-ok" style="background:#F3E8FF; border:1px solid #C084FC; color:#6B21A8; font-weight:600; padding:6px 12px; border-radius:6px; font-size:0.85rem; cursor:pointer; height:32px;">OK</button>
+                            <input type="number" id="stock-30j-limit" value="10" min="1" max="200" class="limit-input" style="width:50px; background:#F1F5F9; border:1px solid #CBD5E1; color:#0F172A; font-weight:500; height:32px;"/>
+                            <button id="btn-stock-30j-ok" style="background:#F3E8FF; border:1px solid #C084FC; color:#6B21A8; font-weight:600; padding:6px 12px; border-radius:6px; font-size:0.85rem; cursor:pointer; height:32px;">OK</button>
                         </div>
                     </div>
                     <table class="stock-table" style="width:100%; border-collapse:collapse;">
                         <thead>
                             <tr style="border-bottom:1px solid #F1F5F9; text-align:left;">
-                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">#</th>
-                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Article</th>
-                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Collection</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Référence</th>
                                 <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Magasin</th>
                                 <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Stock</th>
-                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Couverture</th>
-                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Classe</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Ventes / jour</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Jours restants</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;"></th>
                             </tr>
                         </thead>
-                        <tbody id="stock-proches-tbody">
+                        <tbody id="stock-30j-tbody">
+                            <!-- Populated by JS -->
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- ══════════ VALORISATION DU STOCK ══════════ -->
+                <div class="section-card full-width" id="stock-valorisation-section" style="display:none; padding:24px; margin-bottom:20px;">
+                    <div class="section-title" style="font-weight:700; font-size:1rem; color:#0F172A; display:flex; align-items:center; gap:8px;">
+                        <span style="color:#10B981; font-size:1.2rem;">●</span> Valorisation du stock
+                    </div>
+                    <div class="kpi-grid" style="margin-top:12px; grid-template-columns:repeat(2, minmax(0,1fr));">
+                        <div class="kpi-card stock-kpi-card border-green">
+                            <div class="kpi-label">Valeur totale HT</div>
+                            <div class="kpi-value value-green" id="kpi-valeur-ht">—</div>
+                        </div>
+                        <div class="kpi-card stock-kpi-card border-brown">
+                            <div class="kpi-label">Valeur totale au coût</div>
+                            <div class="kpi-value" id="kpi-valeur-cost">—</div>
+                        </div>
+                    </div>
+                    <table class="stock-table" style="width:100%; border-collapse:collapse; margin-top:16px;">
+                        <thead>
+                            <tr style="border-bottom:1px solid #F1F5F9; text-align:left;">
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Société / Magasin</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Qté</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Valeur HT</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Valeur au coût</th>
+                            </tr>
+                        </thead>
+                        <tbody id="stock-valorisation-tbody">
                             <!-- Populated by JS -->
                         </tbody>
                     </table>
@@ -1145,6 +1245,7 @@
                                 <span id="detail-family" class="detail-badge">—</span>
                             </div>
                         </div>
+                        <button id="btn-open-transfer" class="btn-transfer-open" title="Proposer un transfert inter-magasins">🔄 Transférer</button>
                     </div>
 
                     <div id="detail-batch-info" style="display:none"></div>
@@ -1199,34 +1300,91 @@
                     </div>
 
                     <div class="detail-section">
-                        <h3>🏪 Stock Dispatché par Magasin (Base Pivot)</h3>
+                        <h3>🏪 Stock par Magasin (Base Pivot)</h3>
                         <table>
                             <thead>
                                 <tr>
                                     <th>Magasin</th>
                                     <th>Qté Dispatché</th>
+                                    <th>Stock</th>
                                 </tr>
                             </thead>
                             <tbody id="detail-stock-pivot-tbody"></tbody>
                         </table>
                     </div>
 
-                    <!-- Stock réel Odoo (uniquement "En stock", Réservé/Disponible retirés) -->
-                    <div class="detail-section">
-                        <h3>🔵 Stock Réel Odoo (stock.quant)</h3>
+                </div><!-- /detail-panel -->
+            </div><!-- /detail-overlay -->
+
+            <!-- ══════════════════════════════════════════════════════
+                 TRANSFER OVERLAY — Extraction inter-magasins
+            ═══════════════════════════════════════════════════════ -->
+            <div id="transfer-overlay">
+                <div class="detail-panel">
+                    <button class="close-detail-btn" id="close-transfer-btn" title="Fermer">✕</button>
+
+                    <div class="detail-header">
+                        <div class="detail-title-block">
+                            <h2>🔄 Proposer un transfert</h2>
+                            <div class="detail-meta">
+                                <span id="transfer-product-name" class="detail-badge">—</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="detail-filters">
+                        <div>
+                            <label>🏪 Magasin cible (en tension)</label>
+                            <select id="transfer-dest-shop">
+                                <option value="">— Choisir un magasin —</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div id="transfer-suggestions-msg" style="margin:12px 0; font-size:0.85rem; color:#64748B;"></div>
+
+                    <div class="detail-section" id="transfer-suggestions-section">
+                        <h3>Magasins source suggérés (même ville en premier) — cliquer pour choisir les quantités</h3>
                         <table>
                             <thead>
                                 <tr>
-                                    <th>Entrepôt</th>
-                                    <th>En stock</th>
+                                    <th>Magasin</th>
+                                    <th>Ville</th>
+                                    <th>Priorité</th>
+                                    <th>Stock dispo (total)</th>
+                                    <th></th>
                                 </tr>
                             </thead>
-                            <tbody id="detail-stock-real-tbody"></tbody>
+                            <tbody id="transfer-suggestions-tbody"></tbody>
                         </table>
                     </div>
 
+                    <!-- ══ Matrice couleur/taille pour le magasin source choisi ══ -->
+                    <div class="detail-section" id="transfer-matrix-section" style="display:none;">
+                        <h3>
+                            <a href="javascript:void(0)" id="transfer-matrix-back" class="td-link" style="margin-right:8px;">← Retour</a>
+                            Quantités à transférer depuis <span id="transfer-matrix-source-name">—</span>
+                        </h3>
+                        <div id="transfer-matrix-msg" style="margin:8px 0; font-size:0.85rem; color:#64748B;"></div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Couleur</th>
+                                    <th>Taille</th>
+                                    <th>Stock dispo</th>
+                                    <th>Qté à transférer</th>
+                                </tr>
+                            </thead>
+                            <tbody id="transfer-matrix-tbody"></tbody>
+                        </table>
+                        <div style="margin-top:16px; text-align:right;">
+                            <button id="btn-transfer-matrix-create" class="btn-transfer-create" style="padding:10px 20px; font-size:0.9rem;">Créer le transfert</button>
+                        </div>
+                    </div>
+
+                    <div id="transfer-result" style="display:none; margin-top:16px; padding:16px; border-radius:8px; background:#F0FDF4; border:1px solid #86EFAC;"></div>
                 </div><!-- /detail-panel -->
-            </div><!-- /detail-overlay -->
+            </div><!-- /transfer-overlay -->
 
             <!-- ══════════════════════════════════════════════════════
                  OVERLAY — Liste des ruptures de stock
@@ -1260,7 +1418,7 @@
                 </div>
             </div>
 
-            <script src="/mavie_dashboard/static/src/js/dashboard.js?v=20260728c"></script>
+            <script t-attf-src="/mavie_dashboard/static/src/js/dashboard.js?v=#{js_version}"></script>
         </body>
     </html>
 </template>

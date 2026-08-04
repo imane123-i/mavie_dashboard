@@ -1,4 +1,5 @@
 from . import controllers
+from . import models
 import json
 import uuid
 import logging

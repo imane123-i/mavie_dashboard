@@ -32,6 +32,8 @@ var state = {
     batch_id: null,
     top_limit: 10,
     flop_limit: 10,
+    top_products_all: [],
+    flop_products_all: [],
     filters_loaded: false,
     shops: [],
     proches_rupture_30j_cache: [],
@@ -48,6 +50,7 @@ var state = {
 };
 
 var lastRupturesList = [];
+var lastDormantList = [];
 var _searchDebounce = null;
 
 function el(id) { return document.getElementById(id); }
@@ -186,22 +189,149 @@ function _populateDetailFilters(data) {
     }
 }
 
+function _pad2(n) { return n < 10 ? '0' + n : '' + n; }
+function _fmtDate(y, m, d) { return y + '-' + _pad2(m) + '-' + _pad2(d); }
+
+// Convertit une valeur <input type="week"> (ex: "2026-W31") en {start, end}
+// (lundi -> dimanche de cette semaine ISO).
+function _isoWeekToRange(weekValue) {
+    var parts = weekValue.split('-W');
+    var year = parseInt(parts[0], 10);
+    var week = parseInt(parts[1], 10);
+    // 4 janvier est toujours dans la semaine ISO 1
+    var jan4 = new Date(year, 0, 4);
+    var jan4Day = jan4.getDay() || 7; // dimanche = 0 -> 7
+    var monday1 = new Date(jan4);
+    monday1.setDate(jan4.getDate() - (jan4Day - 1));
+    var monday = new Date(monday1);
+    monday.setDate(monday1.getDate() + (week - 1) * 7);
+    var sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+    return {
+        start: _fmtDate(monday.getFullYear(), monday.getMonth() + 1, monday.getDate()),
+        end: _fmtDate(sunday.getFullYear(), sunday.getMonth() + 1, sunday.getDate()),
+    };
+}
+
+function _computePeriodDates() {
+    var typeEl = el('filter-period-type');
+    var type = typeEl ? typeEl.value : 'all';
+
+    if (type === 'all') {
+        return { start: null, end: null };
+    }
+
+    if (type === 'week') {
+        var weekEl = el('filter-period-week');
+        if (weekEl && weekEl.value) return _isoWeekToRange(weekEl.value);
+        return { start: null, end: null };
+    }
+
+    if (type === 'year') {
+        var yearEl = el('filter-period-year');
+        var y = yearEl && yearEl.value ? parseInt(yearEl.value, 10) : null;
+        if (!y) return { start: null, end: null };
+        return { start: _fmtDate(y, 1, 1), end: _fmtDate(y, 12, 31) };
+    }
+
+    if (type === 'custom') {
+        var startEl = el('filter-date-start');
+        var endEl = el('filter-date-end');
+        return {
+            start: (startEl && startEl.value) ? startEl.value : null,
+            end: (endEl && endEl.value) ? endEl.value : null,
+        };
+    }
+
+    // type === 'month' (par défaut)
+    var monthEl = el('filter-period-month');
+    var monthYearEl = el('filter-period-month-year');
+    var m = monthEl && monthEl.value ? parseInt(monthEl.value, 10) : null;
+    var my = monthYearEl && monthYearEl.value ? parseInt(monthYearEl.value, 10) : null;
+    if (!m || !my) return { start: null, end: null };
+    var lastDay = new Date(my, m, 0).getDate();
+    return { start: _fmtDate(my, m, 1), end: _fmtDate(my, m, lastDay) };
+}
+
+function _updatePeriodVisibility() {
+    var typeEl = el('filter-period-type');
+    var type = typeEl ? typeEl.value : 'all';
+
+    var monthEl = el('filter-period-month');
+    var monthYearEl = el('filter-period-month-year');
+    var weekEl = el('filter-period-week');
+    var yearEl = el('filter-period-year');
+    var customGroup = el('filter-period-custom-group');
+
+    if (monthEl) monthEl.style.display = (type === 'month') ? '' : 'none';
+    if (monthYearEl) monthYearEl.style.display = (type === 'month') ? '' : 'none';
+    if (weekEl) weekEl.style.display = (type === 'week') ? '' : 'none';
+    if (yearEl) yearEl.style.display = (type === 'year') ? '' : 'none';
+    if (customGroup) customGroup.style.display = (type === 'custom') ? '' : 'none';
+}
+
+function _initPeriodFilters() {
+    var monthEl = el('filter-period-month');
+    var monthYearEl = el('filter-period-month-year');
+    var yearEl = el('filter-period-year');
+    var weekEl = el('filter-period-week');
+    if (!monthEl || !monthYearEl || !yearEl) return;
+
+    var monthNames = ['Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin', 'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'];
+    var today = new Date();
+    var currentYear = today.getFullYear();
+    var currentMonth = today.getMonth() + 1;
+
+    monthNames.forEach(function(name, idx) {
+        var opt = document.createElement('option');
+        opt.value = idx + 1;
+        opt.textContent = name;
+        monthEl.appendChild(opt);
+    });
+    monthEl.value = currentMonth;
+
+    for (var y = currentYear + 1; y >= currentYear - 5; y--) {
+        var optY1 = document.createElement('option');
+        optY1.value = y;
+        optY1.textContent = y;
+        monthYearEl.appendChild(optY1);
+
+        var optY2 = document.createElement('option');
+        optY2.value = y;
+        optY2.textContent = y;
+        yearEl.appendChild(optY2);
+    }
+    monthYearEl.value = currentYear;
+    yearEl.value = currentYear;
+
+    if (weekEl) {
+        var jan4 = new Date(currentYear, 0, 4);
+        var jan4Day = jan4.getDay() || 7;
+        var monday1 = new Date(jan4);
+        monday1.setDate(jan4.getDate() - (jan4Day - 1));
+        var weekNum = Math.round(((today - monday1) / 86400000 - 3 + ((monday1.getDay() + 6) % 7)) / 7) + 1;
+        weekEl.value = currentYear + '-W' + _pad2(Math.max(1, weekNum));
+    }
+
+    _updatePeriodVisibility();
+}
+
 function updateFiltersFromUI() {
     var colEl  = el('filter-collection');
     var shopEl = el('filter-magasin');
     var catEl  = el('filter-category');
     var batEl  = el('filter-batch');
-    var startEl = el('filter-date-start');
-    var endEl   = el('filter-date-end');
     var topLimitEl = el('top-limit');
     var flopLimitEl = el('flop-limit');
+
+    var period = _computePeriodDates();
 
     state.collection_id = (colEl  && colEl.value)  ? colEl.value  : null;
     state.shop_field    = (shopEl && shopEl.value)  ? shopEl.value : null;
     state.categ_id      = (catEl  && catEl.value)   ? catEl.value  : null;
     state.batch_id      = (batEl  && batEl.value)   ? batEl.value  : null;
-    state.date_start    = (startEl && startEl.value) ? startEl.value : null;
-    state.date_end      = (endEl   && endEl.value)   ? endEl.value   : null;
+    state.date_start    = period.start;
+    state.date_end      = period.end;
     state.top_limit     = (topLimitEl && topLimitEl.value && !isNaN(parseInt(topLimitEl.value))) ? Math.max(1, parseInt(topLimitEl.value)) : 10;
     state.flop_limit    = (flopLimitEl && flopLimitEl.value && !isNaN(parseInt(flopLimitEl.value))) ? Math.max(1, parseInt(flopLimitEl.value)) : 10;
 }
@@ -358,14 +488,23 @@ async function loadKPIs() {
             stEl.style.color = st >= 70 ? '#10B981' : (st >= 40 ? '#F59E0B' : '#EF4444');
         }
 
-        _renderProductTable('top-products-tbody', data.top_products, false);
-        _renderProductTable('flop-products-tbody', data.flop_products, true);
+        // Le backend renvoie toujours jusqu'à 100 lignes (voir dashboard.py) ;
+        // on garde la liste complète en cache pour pouvoir changer le nombre
+        // affiché (10/20/50...) sans refaire tout l'appel KPI (coûteux).
+        state.top_products_all = data.top_products || [];
+        state.flop_products_all = data.flop_products || [];
+        _renderTopFlopFromCache();
 
         if (currentPage === 'ventes') {
             _renderABC(data.abc_analysis);
             loadSalesDaily();
         }
     }
+}
+
+function _renderTopFlopFromCache() {
+    _renderProductTable('top-products-tbody', state.top_products_all.slice(0, state.top_limit), false);
+    _renderProductTable('flop-products-tbody', state.flop_products_all.slice(0, state.flop_limit), true);
 }
 
 function _renderProductTable(tbodyId, products, isFlop) {
@@ -604,6 +743,24 @@ async function _fetchAndRenderDetail() {
         stEl.style.color = st >= 70 ? '#10B981' : (st >= 40 ? '#F59E0B' : '#EF4444');
     }
 
+    var ecartEl = el('detail-stock-ecart');
+    if (ecartEl) {
+        var ecart = data.stock_ecart || 0;
+        // Achetée - Vendue = stock théorique. Un écart notable avec le stock
+        // réel Odoo indique des mouvements de stock non tracés (pertes,
+        // ventes hors POS, stock négatif dans un magasin...) — pas un bug
+        // du dashboard, mais un signal à vérifier dans Odoo.
+        if (Math.abs(ecart) >= 1) {
+            ecartEl.style.display = 'block';
+            ecartEl.textContent = '⚠️ écart ' + (ecart > 0 ? '+' : '') + formatNumber(ecart) + ' vs théorique';
+            ecartEl.title = 'Stock théorique (achetée − vendue) = ' + formatNumber(data.stock_theorique)
+                + ', stock réel Odoo = ' + formatNumber(data.stock_total)
+                + '. Écart probable : sorties de stock non tracées.';
+        } else {
+            ecartEl.style.display = 'none';
+        }
+    }
+
     _renderStockByStore('detail-stock-pivot-tbody', data.stock_by_store, state.detail.shop_field);
     _renderVariants('detail-variants-tbody', data.variants, state.detail.shop_field);
 
@@ -661,7 +818,13 @@ function _renderStockByStore(tbodyId, stores, activeShop) {
         tr.appendChild(tdName);
 
         var tdQty = document.createElement('td');
-        tdQty.textContent = formatNumber(s.qty);
+        if (s.qty === null || s.qty === undefined) {
+            tdQty.textContent = '—';
+            tdQty.style.color = '#94A3B8';
+            tdQty.title = 'Aucun dispatch manuel enregistré en Base Pivot pour ce magasin';
+        } else {
+            tdQty.textContent = formatNumber(s.qty);
+        }
         tr.appendChild(tdQty);
 
         var tdStock = document.createElement('td');
@@ -724,31 +887,19 @@ function _renderVariants(tbodyId, variants, activeShop) {
         tr.appendChild(tdQty);
 
         var tdTotal = document.createElement('td');
-        // CORRECTION #4a : Si total_pieces est 0 (pas de données dispatch Base Pivot),
-        // afficher le stock réel Odoo à la place
-        var totalDisplay = v.total_pieces > 0 ? v.total_pieces : (v.stock > 0 ? v.stock : 0);
-        tdTotal.textContent = formatNumber(totalDisplay);
-        if (v.total_pieces === 0 && v.stock === 0) {
-            tdTotal.title = 'Aucun dispatch enregistré en Base Pivot';
+        // Le backend garantit déjà total_pieces >= stock + vendu (voir
+        // dashboard.py), donc plus besoin de fallback ici.
+        tdTotal.textContent = formatNumber(v.total_pieces);
+        if (v.total_pieces === 0) {
+            tdTotal.title = 'Aucun dispatch enregistré en Base Pivot, aucune vente et aucun stock';
             tdTotal.style.color = '#94A3B8';
         }
         tr.appendChild(tdTotal);
 
         var tdReste = document.createElement('td');
-        // CORRECTION #4b : Reste = total - vendu.
-        // Si pas de dispatch (total_pieces=0), on utilise stock réel.
-        // On n'affiche JAMAIS de négatif si on n'a pas de données dispatch.
-        var resteVal;
-        if (v.total_pieces > 0) {
-            // Dispatch enregistré : reste = dispatché - vendu (peut être négatif si survendu)
-            resteVal = v.reste;
-        } else if (v.stock > 0) {
-            // Pas de dispatch mais stock Odoo : reste = stock Odoo (on n'a pas dispatché officiellement)
-            resteVal = v.stock;
-        } else {
-            // Aucune donnée : on affiche 0
-            resteVal = 0;
-        }
+        // Reste = total colis - vendu (le backend calcule déjà total_pieces
+        // pour qu'il ne soit jamais inférieur à vendu + stock restant).
+        var resteVal = v.reste;
         tdReste.textContent = formatNumber(resteVal);
         if (resteVal < 0) {
             tdReste.style.color = '#EF4444'; // Rouge si survendu par rapport au dispatch
@@ -1206,6 +1357,95 @@ function closeRuptures() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// STOCK DORMANT
+// ═══════════════════════════════════════════════════════════
+function _renderDormantList(searchFilter) {
+    var tbody = el('dormant-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    var badge = el('dormant-count-badge');
+    if (badge) badge.textContent = formatNumber(lastDormantList.length) + ' articles';
+
+    var list = lastDormantList;
+    if (searchFilter) {
+        var q = searchFilter.toLowerCase().trim();
+        list = list.filter(function(p) {
+            return (p.name && p.name.toLowerCase().includes(q)) ||
+                   (p.ref && p.ref.toLowerCase().includes(q));
+        });
+    }
+
+    if (!list || list.length === 0) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 4;
+        td.textContent = searchFilter ? 'Aucun produit ne correspond à votre recherche.' : 'Aucun stock dormant';
+        td.style.textAlign = 'center';
+        td.style.padding = '24px';
+        td.style.color = '#94A3B8';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    list.forEach(function(p) {
+        var tr = document.createElement('tr');
+        tr.style.cursor = 'pointer';
+        tr.style.borderBottom = '1px solid #F1F5F9';
+        tr.onclick = function() {
+            closeDormant();
+            openDetail(p.id, p.name);
+        };
+
+        var tdRef = document.createElement('td');
+        tdRef.textContent = p.ref || '—';
+        tdRef.style.padding = '10px';
+        tdRef.style.color = '#64748B';
+        tdRef.style.fontWeight = '600';
+        tdRef.style.fontSize = '0.85rem';
+        tr.appendChild(tdRef);
+
+        var tdName = document.createElement('td');
+        tdName.textContent = p.name || '—';
+        tdName.style.padding = '10px';
+        tdName.style.fontWeight = '600';
+        tdName.style.color = '#0F172A';
+        tdName.style.fontSize = '0.85rem';
+        tr.appendChild(tdName);
+
+        var tdMagasin = document.createElement('td');
+        tdMagasin.textContent = p.magasin || '—';
+        tdMagasin.style.padding = '10px';
+        tdMagasin.style.color = '#334155';
+        tdMagasin.style.fontSize = '0.85rem';
+        tr.appendChild(tdMagasin);
+
+        var tdStock = document.createElement('td');
+        tdStock.textContent = formatNumber(p.stock || 0);
+        tdStock.style.padding = '10px';
+        tdStock.style.textAlign = 'center';
+        tdStock.style.color = '#B45309';
+        tdStock.style.fontWeight = '700';
+        tdStock.style.fontSize = '0.85rem';
+        tr.appendChild(tdStock);
+
+        tbody.appendChild(tr);
+    });
+}
+
+function openDormant() {
+    _renderDormantList();
+    var overlay = el('dormant-overlay');
+    if (overlay) overlay.classList.add('active');
+}
+
+function closeDormant() {
+    var overlay = el('dormant-overlay');
+    if (overlay) overlay.classList.remove('active');
+}
+
+// ═══════════════════════════════════════════════════════════
 // DASHBOARD STOCK & RUPTURE (nouvelle vue)
 // ═══════════════════════════════════════════════════════════
 
@@ -1226,6 +1466,7 @@ function _renderStockDashboard(data) {
     if (subEl) subEl.textContent = '/ ' + formatNumber(data.total_active_skus) + ' actifs';
 
     lastRupturesList = data.ruptures_list || [];
+    lastDormantList = data.dormant_list || [];
 
     _renderStockAlerts(data.alertes_stock);
     _renderRotationCollection(data.rotation_collection);
@@ -1488,6 +1729,8 @@ function _renderGmroiCategorie(gmroi) {
 // ═══════════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', function() {
 
+    _initPeriodFilters();
+
     // CORRECTION #1 : Chargement en parallèle pour accélérer l'affichage
     // On lance les filtres et les KPIs en même temps
     var filtersPromise = loadFilters();
@@ -1497,7 +1740,8 @@ document.addEventListener('DOMContentLoaded', function() {
     // KPIs lancés immédiatement sans attendre les filtres
     loadKPIs();
 
-    ['filter-collection', 'filter-magasin', 'filter-category', 'filter-batch', 'filter-date-start', 'filter-date-end'].forEach(function(id) {
+    ['filter-collection', 'filter-magasin', 'filter-category', 'filter-batch', 'filter-date-start', 'filter-date-end',
+     'filter-period-month', 'filter-period-month-year', 'filter-period-week', 'filter-period-year'].forEach(function(id) {
         var sel = el(id);
         if (sel) {
             sel.addEventListener('change', function() {
@@ -1507,23 +1751,38 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
 
-    var _limitDebounce = null;
+    var periodTypeEl = el('filter-period-type');
+    if (periodTypeEl) {
+        periodTypeEl.addEventListener('change', function() {
+            _updatePeriodVisibility();
+            updateFiltersFromUI();
+            loadKPIs();
+        });
+    }
+
     ['top-limit', 'flop-limit'].forEach(function(id) {
         var sel = el(id);
         if (sel) {
             sel.addEventListener('click', function(e) { e.stopPropagation(); });
+            // Changer le nombre affiché ne relance plus l'appel KPI complet :
+            // le backend renvoie déjà jusqu'à 100 lignes (cf. loadKPIs), donc
+            // on tranche simplement le cache local — c'est instantané, sans
+            // aller re-scanner ventes/achats/stock côté serveur pour ça.
+            // Si le cache est vide (page pas encore chargée), on retombe sur
+            // un chargement complet.
             sel.addEventListener('change', function() {
                 updateFiltersFromUI();
-                loadKPIs();
+                if (state.top_products_all.length || state.flop_products_all.length) {
+                    _renderTopFlopFromCache();
+                } else {
+                    loadKPIs();
+                }
             });
             sel.addEventListener('input', function() {
-                clearTimeout(_limitDebounce);
-                _limitDebounce = setTimeout(function() {
-                    updateFiltersFromUI();
-                    if (state.top_limit >= 1 && state.flop_limit >= 1) {
-                        loadKPIs();
-                    }
-                }, 600);
+                updateFiltersFromUI();
+                if (state.top_products_all.length || state.flop_products_all.length) {
+                    _renderTopFlopFromCache();
+                }
             });
         }
     });
@@ -1556,6 +1815,41 @@ document.addEventListener('DOMContentLoaded', function() {
             var nameEl = el('detail-name');
             openTransferPanel(state.detail.article_id, nameEl ? nameEl.textContent : '');
         });
+    }
+
+    var exportDetailBtn = el('btn-export-detail');
+    if (exportDetailBtn) {
+        exportDetailBtn.addEventListener('click', function() {
+            if (!state.detail.article_id) return;
+            var params = new URLSearchParams();
+            params.set('article_id', state.detail.article_id);
+            if (state.detail.shop_field) params.set('shop_field', state.detail.shop_field);
+            if (state.batch_id) params.set('batch_id', state.batch_id);
+            if (state.collection_id) params.set('collection_id', state.collection_id);
+            window.open('/mavie/api/product-detail/export?' + params.toString(), '_blank');
+        });
+    }
+
+    function _exportTopFlop(kind) {
+        var filterParams = getFilterParams();
+        var params = new URLSearchParams();
+        params.set('kind', kind);
+        for (var k in filterParams) {
+            if (filterParams[k] !== null && filterParams[k] !== undefined && filterParams[k] !== '') {
+                params.set(k, filterParams[k]);
+            }
+        }
+        window.open('/mavie/api/top-flop/export?' + params.toString(), '_blank');
+    }
+
+    var exportTopBtn = el('btn-export-top');
+    if (exportTopBtn) {
+        exportTopBtn.addEventListener('click', function() { _exportTopFlop('top'); });
+    }
+
+    var exportFlopBtn = el('btn-export-flop');
+    if (exportFlopBtn) {
+        exportFlopBtn.addEventListener('click', function() { _exportTopFlop('flop'); });
     }
 
     var closeTransferBtn = el('close-transfer-btn');
@@ -1640,6 +1934,26 @@ document.addEventListener('DOMContentLoaded', function() {
     if (rupturesOverlay) {
         rupturesOverlay.addEventListener('click', function(e) {
             if (e.target === rupturesOverlay) closeRuptures();
+        });
+    }
+
+    var cardStockDormant = el('card-stock-dormant');
+    if (cardStockDormant) cardStockDormant.addEventListener('click', openDormant);
+
+    var searchDormantInput = el('search-dormant-input');
+    if (searchDormantInput) {
+        searchDormantInput.addEventListener('input', function(e) {
+            _renderDormantList(e.target.value);
+        });
+    }
+
+    var closeDormantBtn = el('close-dormant-btn');
+    if (closeDormantBtn) closeDormantBtn.addEventListener('click', closeDormant);
+
+    var dormantOverlay = el('dormant-overlay');
+    if (dormantOverlay) {
+        dormantOverlay.addEventListener('click', function(e) {
+            if (e.target === dormantOverlay) closeDormant();
         });
     }
 

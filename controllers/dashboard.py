@@ -6,12 +6,22 @@ import json
 import re
 import base64
 import os
+import csv
+import io
 from datetime import datetime, timedelta, date
 import logging
 
 from ..models.mv_batch_shop_mapping_ext import CITY_PROXIMITY
 
 _logger = logging.getLogger(__name__)
+
+# Sociétés qui ne sont PAS des magasins de vente au détail (société grossiste
+# d'import "MOD FOR LIFE" utilisée pour les ventes inter-sociétés, et "PAIE"
+# = paie/RH). Leur stock ne doit jamais compter dans les KPIs "stock retail"
+# (total, valorisation, stock dormant, alertes de rupture) sous peine de
+# chiffres totalement faussés — ex: stock dormant à 267% causé par un produit
+# dont l'essentiel du stock dormait dans l'entrepôt grossiste MOD FOR LIFE.
+NON_RETAIL_COMPANIES = ['MOD FOR LIFE', 'PAIE']
 
 _STATIC_JS_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), 'static', 'src', 'js', 'dashboard.js'
@@ -38,6 +48,19 @@ class MaVieDashboardController(http.Controller):
         except Exception as e:
             _logger.error(f"Erreur dashboard_page: {str(e)}")
             return f"<h1>Erreur</h1><p>{str(e)}</p>"
+
+    def _get_non_retail_company_ids(self):
+        """
+        Résout NON_RETAIL_COMPANIES en IDs une seule fois (recherche triviale,
+        5 lignes dans res.company) pour pouvoir filtrer stock.quant par
+        ('company_id', 'not in', [...ids]) — un simple NOT IN sur une colonne
+        entière indexée — plutôt que ('company_id.name', 'not in', [...]),
+        qui force Postgres à faire une sous-requête/jointure sur res_company
+        à CHAQUE ligne de stock.quant (185 000+ lignes) et ralentissait
+        nettement le chargement du dashboard.
+        """
+        companies = request.env['res.company'].sudo().search([('name', 'in', NON_RETAIL_COMPANIES)])
+        return companies.ids
 
     # ─────────────────────────────────────────────────────────────
     # DOMAINS
@@ -167,6 +190,7 @@ class MaVieDashboardController(http.Controller):
             ('location_id.usage', '=', 'internal'),
             ('product_id.product_tmpl_id.name', 'not ilike', 'sachet'),
             ('product_id.product_tmpl_id.name', 'not ilike', '2026'),
+            ('company_id', 'not in', self._get_non_retail_company_ids()),
         ]
         if shop_field:
             mapping = request.env['mv.batch.shop.mapping'].sudo().search(
@@ -285,12 +309,17 @@ class MaVieDashboardController(http.Controller):
         field_min = min(stock_by_shop, key=lambda f: stock_by_shop[f][0])
         return stock_by_shop[field_min][1]
 
-    def _resolve_magasin_batch(self, product_tmpl_ids, shop_mappings, shop_field_filter=None):
+    def _resolve_magasin_batch(self, product_tmpl_ids, shop_mappings, shop_field_filter=None, mode='min'):
         """
         Version "en masse" de _resolve_exact_magasin : résout le magasin pour
         une LISTE de templates en (nombre de magasins) requêtes au lieu de
         (nombre de templates × nombre de magasins) — évite le N+1 catastrophique
         si on appelait _resolve_exact_magasin dans une boucle Python.
+
+        mode='min' : magasin où le stock est le PLUS BAS (pour repérer où un
+        produit est en tension — alertes de rupture).
+        mode='max' : magasin où le stock est le PLUS ÉLEVÉ (pour repérer où un
+        stock dormant/excédentaire est réellement immobilisé).
         """
         product_tmpl_ids = list(product_tmpl_ids)
         magasin_by_tid = {}
@@ -334,13 +363,14 @@ class MaVieDashboardController(http.Controller):
                     qty = sum(qty_by_variant.get(vid, 0.0) for vid in vids)
                     shop_qty_by_tid[tid][sm.shop_field] = (qty, label)
 
+        picker = max if mode == 'max' else min
         for tid in product_tmpl_ids:
             shop_data = shop_qty_by_tid.get(tid) or {}
             if not shop_data:
                 magasin_by_tid[tid] = 'Réseau'
             else:
-                field_min = min(shop_data, key=lambda f: shop_data[f][0])
-                magasin_by_tid[tid] = shop_data[field_min][1]
+                field_pick = picker(shop_data, key=lambda f: shop_data[f][0])
+                magasin_by_tid[tid] = shop_data[field_pick][1]
 
         return magasin_by_tid
 
@@ -420,6 +450,9 @@ class MaVieDashboardController(http.Controller):
 
     @http.route('/mavie/api/kpis', type='json', auth='user', methods=['POST'], csrf=False)
     def api_kpis(self, **kw):
+        return self._compute_kpis(kw)
+
+    def _compute_kpis(self, kw):
         try:
             is_filtered = bool(kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'))
 
@@ -437,7 +470,7 @@ class MaVieDashboardController(http.Controller):
                         'abc_analysis': {'A': [], 'B': [], 'C': []},
                         'references_count': 0, 'total_active_skus': 0,
                         'taux_rupture': 0, 'couverture_moy': 0,
-                        'stock_dormant_pct': 0, 'precision_inventaire': 99.5,
+                        'stock_dormant_pct': 0, 'dormant_list': [], 'precision_inventaire': 99.5,
                         'alertes_stock': [], 'rotation_collection': [],
                         'gmroi_categorie': [], 'proches_rupture_30j': [],
                         'valeur_stock_ht': 0, 'valeur_stock_cost': 0, 'stock_val_by_store': [],
@@ -448,41 +481,32 @@ class MaVieDashboardController(http.Controller):
 
             pos_domain = self._build_pos_domain(kw, product_tmpl_ids)
 
-            # ✅ OPTIMISATION SQL read_group ultra-rapide (0.01s au lieu de 20s)
-            pos_agg = request.env['pos.order.line'].sudo().read_group(
-                pos_domain,
-                ['price_subtotal_incl:sum', 'qty:sum', 'order_id:count_distinct'],
-                []
-            )
-            if pos_agg and pos_agg[0]:
-                ca_total = pos_agg[0].get('price_subtotal_incl') or 0.0
-                tickets = pos_agg[0].get('order_id') or 0
-                qty_sold_total = int(pos_agg[0].get('qty') or 0)
-            else:
-                ca_total = 0.0
-                tickets = 0
-                qty_sold_total = 0
-
-            panier_moyen = ca_total / tickets if tickets > 0 else 0.0
-
-            purchase_domain = self._build_purchase_domain(kw, product_tmpl_ids)
-            po_agg = request.env['purchase.order.line'].sudo().read_group(
-                purchase_domain,
-                ['product_qty:sum'],
-                []
-            )
-            qty_purchased_total = int(po_agg[0].get('product_qty') or 0) if (po_agg and po_agg[0]) else 0
-
-            total_qty = qty_sold_total + qty_purchased_total
-            sell_through = round((qty_sold_total / total_qty * 100), 1) if total_qty > 0 else 0.0
-
-            # ✅ Groupement par produit POS (SQL GROUP BY product_id)
+            # ✅ OPTIMISATION PERF : pos_agg (totaux) et pos_grouped (par
+            # produit) scannaient chacun TOUTE pos_order_line (400k+ lignes,
+            # jointure product_product/product_template) avec le même
+            # domaine — un doublon pur qui coûtait ~0.5s par scan. La somme
+            # des groupes par produit = la somme globale (SUM distributif),
+            # donc ca_total/qty_sold_total se déduisent de pos_grouped sans
+            # 2e scan. Seul le nombre de tickets (commandes DISTINCTES) ne
+            # peut pas se déduire d'un regroupement par produit (une commande
+            # multi-produits serait comptée plusieurs fois) : c'est la seule
+            # requête encore séparée.
             pos_grouped = request.env['pos.order.line'].sudo().read_group(
                 pos_domain,
                 ['price_subtotal_incl:sum', 'qty:sum', 'product_id'],
                 ['product_id'],
                 lazy=False
             )
+            ca_total = sum(g.get('price_subtotal_incl') or 0.0 for g in pos_grouped)
+            qty_sold_total = int(sum(g.get('qty') or 0 for g in pos_grouped))
+
+            pos_tickets_agg = request.env['pos.order.line'].sudo().read_group(
+                pos_domain, ['order_id:count_distinct'], []
+            )
+            tickets = (pos_tickets_agg[0].get('order_id') or 0) if pos_tickets_agg else 0
+
+            panier_moyen = ca_total / tickets if tickets > 0 else 0.0
+
             pos_pids = [g['product_id'][0] for g in pos_grouped if g.get('product_id')]
             sales_by_tmpl = {}
             if pos_pids:
@@ -501,13 +525,21 @@ class MaVieDashboardController(http.Controller):
                     sales_by_tmpl[tid]['qty'] += g.get('qty') or 0
                     sales_by_tmpl[tid]['ca'] += g.get('price_subtotal_incl') or 0.0
 
-            # ✅ Groupement par produit Achats (SQL GROUP BY product_id)
+            # ✅ Idem achats : un seul scan groupé par produit, le total
+            # s'obtient en sommant les groupes au lieu d'un 2e scan complet
+            # (po_agg supprimé).
+            purchase_domain = self._build_purchase_domain(kw, product_tmpl_ids)
             po_grouped = request.env['purchase.order.line'].sudo().read_group(
                 purchase_domain,
                 ['product_qty:sum', 'product_id'],
                 ['product_id'],
                 lazy=False
             )
+            qty_purchased_total = int(sum(g.get('product_qty') or 0 for g in po_grouped))
+
+            total_qty = qty_sold_total + qty_purchased_total
+            sell_through = round((qty_sold_total / total_qty * 100), 1) if total_qty > 0 else 0.0
+
             po_pids = [g['product_id'][0] for g in po_grouped if g.get('product_id')]
             purchase_by_tmpl = {}
             if po_pids:
@@ -523,11 +555,14 @@ class MaVieDashboardController(http.Controller):
                         continue
                     purchase_by_tmpl[tid] = purchase_by_tmpl.get(tid, 0) + int(g.get('product_qty') or 0)
 
-            # ✅ Groupement Stock Quant (SQL GROUP BY product_id)
+            # ✅ Groupement Stock Quant (SQL GROUP BY product_id) — même
+            # principe : stock_total se déduit de quant_grouped (quant_agg
+            # supprimé), ce qui évite un 3e scan complet en double.
             quant_domain = [
                 ('location_id.usage', '=', 'internal'),
                 ('product_id.product_tmpl_id.name', 'not ilike', 'sachet'),
                 ('product_id.product_tmpl_id.name', 'not ilike', '2026'),
+                ('company_id', 'not in', self._get_non_retail_company_ids()),
             ]
             shop_field = kw.get('shop_field')
             if shop_field:
@@ -546,15 +581,13 @@ class MaVieDashboardController(http.Controller):
                 )
                 quant_domain.append(('product_id', 'in', [v['id'] for v in q_variants]))
 
-            quant_agg = request.env['stock.quant'].sudo().read_group(quant_domain, ['quantity:sum'], [])
-            stock_total = int(quant_agg[0].get('quantity') or 0) if (quant_agg and quant_agg[0]) else 0
-
             quant_grouped = request.env['stock.quant'].sudo().read_group(
                 quant_domain,
                 ['quantity:sum', 'product_id'],
                 ['product_id'],
                 lazy=False
             )
+            stock_total = int(sum(g.get('quantity') or 0 for g in quant_grouped))
             quant_pids = [g['product_id'][0] for g in quant_grouped if g.get('product_id')]
             stock_by_tmpl = {}
             if quant_pids:
@@ -571,8 +604,16 @@ class MaVieDashboardController(http.Controller):
                     stock_by_tmpl[tid] = stock_by_tmpl.get(tid, 0) + int(g.get('quantity') or 0)
 
             page = kw.get('page', 'ventes')
-            top_limit = max(1, int(kw.get('top_limit', 10)))
-            flop_limit = max(1, int(kw.get('flop_limit', 10)))
+            # ✅ On calcule et renvoie toujours jusqu'à 100 lignes (= le max du
+            # sélecteur côté client), quelle que soit la valeur actuellement
+            # affichée. Le nombre choisi par l'utilisateur (10, 20, 50...) ne
+            # sert plus qu'à trancher côté client la liste déjà reçue : changer
+            # cette valeur ne relance donc plus tout le calcul KPI (ABC,
+            # ruptures, GMROI, stock dormant, valorisation...), qui scanne les
+            # ventes/achats/stock et coûtait plusieurs centaines de ms à
+            # chaque clic pour un simple changement d'affichage.
+            top_limit = 100
+            flop_limit = 100
 
             if is_filtered:
                 filtered_set = set(product_tmpl_ids)
@@ -761,19 +802,36 @@ class MaVieDashboardController(http.Controller):
                 )
                 sold_90d_tmpl_ids = {p['product_tmpl_id'][0] for p in p90_prods if p.get('product_tmpl_id')}
 
+            # ✅ CORRECTION : le pourcentage pouvait dépasser 100% quand des
+            # stock.quant négatifs (écarts d'inventaire) faisaient chuter
+            # stock_total en dessous de la somme des stocks POSITIFS dormants
+            # (celle-ci ignorant volontairement les négatifs). On calcule donc
+            # le dénominateur de la même façon que le numérateur : uniquement
+            # sur les stocks positifs, pour que le ratio reste borné à 100%.
             dormant_stock_total = 0
+            positive_stock_total = 0
             dormant_products = []
             for tid in relevant_tmpl_ids:
                 stock = stock_by_tmpl.get(tid, 0)
-                if stock > 0 and tid not in sold_90d_tmpl_ids:
-                    dormant_stock_total += stock
-                    t = tmpl_by_id.get(tid, {})
-                    dormant_products.append({
-                        'id': tid,
-                        'name': t.get('name') or '—',
-                        'stock': stock
-                    })
-            stock_dormant_pct = round((dormant_stock_total / stock_total) * 100, 1) if stock_total > 0 else 0.0
+                if stock > 0:
+                    positive_stock_total += stock
+                    if tid not in sold_90d_tmpl_ids:
+                        dormant_stock_total += stock
+                        t = tmpl_by_id.get(tid, {})
+                        ref = (
+                            t.get('base_pivot_reference')
+                            or ref_by_tmpl_all.get(tid)
+                            or t.get('default_code')
+                            or t.get('name')
+                            or '—'
+                        )
+                        dormant_products.append({
+                            'id': tid,
+                            'name': t.get('name') or '—',
+                            'ref': ref,
+                            'stock': stock
+                        })
+            stock_dormant_pct = round((dormant_stock_total / positive_stock_total) * 100, 1) if positive_stock_total > 0 else 0.0
 
             inv_adjustments_count = request.env['stock.move'].sudo().search_count([
                 ('date', '>=', (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d 00:00:00')),
@@ -809,6 +867,14 @@ class MaVieDashboardController(http.Controller):
                 return self._resolve_exact_magasin(
                     tid, shop_mappings=shop_mappings, shop_field_filter=kw.get('shop_field')
                 )
+
+            # Magasin où le stock dormant est réellement immobilisé (le plus
+            # de stock, pas le moins — contraire de la résolution "rupture").
+            magasin_by_tid_dormant = self._resolve_magasin_batch(
+                [d['id'] for d in dormant_products], shop_mappings, kw.get('shop_field'), mode='max'
+            )
+            for d in dormant_products:
+                d['magasin'] = magasin_by_tid_dormant.get(d['id'], 'Réseau')
 
             alertes_stock = []
 
@@ -945,12 +1011,19 @@ class MaVieDashboardController(http.Controller):
                     flop_products = sorted(product_stats, key=lambda a: a['ca'])[:flop_limit]
 
             # ✅ VALORISATION DU STOCK (Société & Par Magasin)
+            # NB : contrairement à stock_total/stock_by_tmpl (KPIs "retail" —
+            # dormant, rupture, couverture — qui excluent volontairement les
+            # sociétés non-magasin comme MOD FOR LIFE), la valorisation garde
+            # TOUTES les sociétés : c'est un inventaire financier global, pas
+            # une analyse de stock en boutique, donc le stock grossiste doit
+            # y apparaître (comme la ligne "MOD FOR LIFE" déjà affichée).
             val_ht_total = 0.0
             val_cost_total = 0.0
             stock_val_by_store = []
 
+            quant_domain_valorisation = [t for t in quant_domain if t[0] != 'company_id.name']
             quant_val_grouped = request.env['stock.quant'].sudo().read_group(
-                quant_domain,
+                quant_domain_valorisation,
                 ['quantity:sum', 'product_id', 'company_id'],
                 ['product_id', 'company_id'],
                 lazy=False
@@ -1055,6 +1128,7 @@ class MaVieDashboardController(http.Controller):
                 'total_active_skus': total_active_skus,
                 'couverture_moy': couverture_moy,
                 'stock_dormant_pct': stock_dormant_pct,
+                'dormant_list': sorted(dormant_products, key=lambda x: x['stock'], reverse=True)[:500],
                 'precision_inventaire': precision_inventaire,
                 'alertes_stock': alertes_stock,
                 'rotation_collection': rotation_collection,
@@ -1065,6 +1139,51 @@ class MaVieDashboardController(http.Controller):
         except Exception as e:
             _logger.error(f"Erreur api_kpis: {str(e)}", exc_info=True)
             return {'error': str(e)}
+
+    @http.route('/mavie/api/top-flop/export', type='http', auth='user', methods=['GET'], csrf=False)
+    def api_top_flop_export(self, **kw):
+        """Export CSV du Top ou Flop Produits, avec les mêmes filtres et la
+        même limite (top_limit / flop_limit) qu'affichés à l'écran."""
+        kind = kw.get('kind') or 'top'
+        data = self._compute_kpis(kw)
+        if not data or data.get('error'):
+            message = data.get('error') if data else 'Erreur inconnue'
+            return request.make_response(
+                'Erreur : ' + message,
+                headers=[('Content-Type', 'text/plain; charset=utf-8')],
+                status=404,
+            )
+
+        rows = data.get('flop_products') if kind == 'flop' else data.get('top_products')
+        # _compute_kpis renvoie toujours jusqu'à 100 lignes (voir commentaire
+        # sur top_limit/flop_limit) ; on tranche ici à la valeur réellement
+        # demandée/affichée à l'écran au moment de l'export.
+        try:
+            requested_limit = max(1, int(kw.get('flop_limit' if kind == 'flop' else 'top_limit', 10)))
+        except (ValueError, TypeError):
+            requested_limit = 10
+        rows = (rows or [])[:requested_limit]
+
+        buffer = io.StringIO()
+        buffer.write('﻿')  # BOM pour qu'Excel détecte l'UTF-8
+        writer = csv.writer(buffer, delimiter=';')
+        writer.writerow(['Top Produits' if kind != 'flop' else 'Flop Produits'])
+        writer.writerow(['#', 'Produit', 'Réf', 'Qté vendue', 'CA Potentiel', 'Stock', 'Qté achetée'])
+        for row in rows or []:
+            writer.writerow([
+                row.get('rank'), row.get('name'), row.get('ref'),
+                row.get('qty_sold', row.get('qty', 0)), row.get('ca', 0),
+                row.get('stock', 0), row.get('qty_purchased', 0),
+            ])
+
+        filename = 'mavie_export_{}.csv'.format('flop_produits' if kind == 'flop' else 'top_produits')
+        return request.make_response(
+            buffer.getvalue(),
+            headers=[
+                ('Content-Type', 'text/csv; charset=utf-8'),
+                ('Content-Disposition', f'attachment; filename="{filename}"'),
+            ],
+        )
 
     # ─────────────────────────────────────────────────────────────
     # VENTES PAR ARRIVAGE
@@ -1231,6 +1350,9 @@ class MaVieDashboardController(http.Controller):
 
     @http.route('/mavie/api/product-detail', type='json', auth='user', methods=['POST'], csrf=False)
     def api_product_detail(self, **kw):
+        return self._compute_product_detail(kw)
+
+    def _compute_product_detail(self, kw):
         try:
             article_id = kw.get('article_id')
             product_name = kw.get('product_name')
@@ -1403,17 +1525,25 @@ class MaVieDashboardController(http.Controller):
             best_variants = sorted(best_variants, key=lambda x: x['ca'], reverse=True)[:10]
             for idx, v in enumerate(best_variants):
                 v['rank'] = idx + 1
-                v['total_pieces'] = max(0, v.get('dispatched', 0) if v.get('dispatched', 0) > 0 else v.get('stock', 0))
-                v['reste'] = v.get('total_pieces', 0) - v.get('qty', 0)
+                qty_sold_v = v.get('qty', 0)
+                stock_v = v.get('stock', 0)
+                dispatched_v = v.get('dispatched', 0)
+                # Total colis ne doit jamais être inférieur à (vendu + stock
+                # restant) : ces pièces ont forcément été reçues, même si le
+                # dispatch manuel (Base Pivot) n'a pas été renseigné pour
+                # cette couleur — sinon on affichait 0 colis pour une
+                # variante qui a pourtant déjà généré des ventes.
+                v['total_pieces'] = max(dispatched_v, stock_v + qty_sold_v, 0)
+                v['reste'] = v['total_pieces'] - qty_sold_v
 
             stock_by_store = []
+            non_retail_company_ids = self._get_non_retail_company_ids()
             try:
-                warehouses = request.env['stock.warehouse'].sudo().search([])
+                warehouses = request.env['stock.warehouse'].sudo().search([
+                    ('company_id', 'not in', non_retail_company_ids)
+                ])
                 for wh in warehouses:
                     if not wh.lot_stock_id:
-                        continue
-                    wh_name = (wh.name or '').upper()
-                    if any(x in wh_name for x in ['MOD FOR LIFE', 'DIGITAL SHOP', 'PAIE', 'ORANGER']):
                         continue
                     quants = request.env['stock.quant'].sudo().search([
                         ('product_id', 'in', product_variants.ids),
@@ -1465,11 +1595,17 @@ class MaVieDashboardController(http.Controller):
                     _logger.warning(f"Erreur dispatch pivot: {str(e)}")
 
             if not stock_by_store_pivot and stock_by_store:
+                # Aucune donnée de dispatch manuel (Base Pivot) pour ce
+                # produit : on affiche quand même le stock réel par magasin,
+                # mais on ne DOIT PAS recopier le stock dans la colonne
+                # "Qté Dispatché" — ça donnerait l'illusion trompeuse que le
+                # dispatch a été saisi et correspond exactement au stock,
+                # alors qu'il n'y a simplement aucune donnée.
                 for s in stock_by_store:
                     stock_by_store_pivot.append({
                         'field': s['store_name'],
                         'name': s['store_name'],
-                        'qty': s['stock'],
+                        'qty': None,
                         'stock': s['stock'],
                     })
             else:
@@ -1507,6 +1643,12 @@ class MaVieDashboardController(http.Controller):
                 'qty_sold': qty_sold,
                 'qty_purchased': qty_purchased,
                 'stock_total': stock_total,
+                # Stock théorique = ce qu'il devrait rester si tout mouvement
+                # de stock était correctement tracé dans Odoo (achats - ventes).
+                # L'écart avec stock_total pointe des pertes/sorties non
+                # tracées (stock négatif ailleurs, ventes hors POS, casse...).
+                'stock_theorique': qty_purchased - qty_sold,
+                'stock_ecart': (qty_purchased - qty_sold) - stock_total,
                 'ca': ca,
                 'margin': margin,
                 'sell_through': sell_through,
@@ -1526,6 +1668,62 @@ class MaVieDashboardController(http.Controller):
         except Exception as e:
             _logger.error(f"Erreur api_product_detail: {str(e)}", exc_info=True)
             return {'error': str(e)}
+
+    @http.route('/mavie/api/product-detail/export', type='http', auth='user', methods=['GET'], csrf=False)
+    def api_product_detail_export(self, **kw):
+        """Export CSV de la fiche d'une seule référence : KPIs, variantes
+        couleurs et stock par magasin, tels qu'affichés dans le panneau
+        détail du dashboard."""
+        data = self._compute_product_detail(kw)
+        if not data or data.get('error'):
+            message = data.get('error') if data else 'Produit introuvable'
+            return request.make_response(
+                'Erreur : ' + message,
+                headers=[('Content-Type', 'text/plain; charset=utf-8')],
+                status=404,
+            )
+
+        buffer = io.StringIO()
+        buffer.write('﻿')  # BOM pour qu'Excel détecte l'UTF-8
+        writer = csv.writer(buffer, delimiter=';')
+
+        writer.writerow(['Fiche produit', data.get('name') or ''])
+        writer.writerow(['Référence', data.get('ref') or ''])
+        writer.writerow(['Famille', data.get('family') or ''])
+        writer.writerow(['Collection', data.get('collection_name') or ''])
+        writer.writerow([])
+
+        writer.writerow(['KPI', 'Valeur'])
+        writer.writerow(['Qté vendue', data.get('qty_sold', 0)])
+        writer.writerow(['Qté achetée', data.get('qty_purchased', 0)])
+        writer.writerow(['Stock réel Odoo', data.get('stock_total', 0)])
+        writer.writerow(['Stock théorique (achetée - vendue)', data.get('stock_theorique', 0)])
+        writer.writerow(['Écart stock (théorique - réel)', data.get('stock_ecart', 0)])
+        writer.writerow(['CA potentiel', data.get('ca', 0)])
+        writer.writerow(['Sell-through (%)', data.get('sell_through', 0)])
+        writer.writerow([])
+
+        writer.writerow(['Variantes couleurs (meilleure vente en tête)'])
+        writer.writerow(['#', 'Couleur', 'Qté vendue', 'Total colis', 'Reste'])
+        for idx, v in enumerate(data.get('variants') or [], start=1):
+            writer.writerow([idx, v.get('name'), v.get('qty', 0), v.get('total_pieces', 0), v.get('reste', 0)])
+        writer.writerow([])
+
+        writer.writerow(['Stock par magasin'])
+        writer.writerow(['Magasin', 'Qté dispatché', 'Stock'])
+        for s in data.get('stock_by_store') or []:
+            writer.writerow([s.get('name'), s.get('qty', 0), s.get('stock', 0)])
+
+        ref_for_filename = re.sub(r'[^A-Za-z0-9_-]+', '_', data.get('ref') or str(data.get('id') or 'produit'))
+        filename = f'mavie_export_{ref_for_filename}.csv'
+
+        return request.make_response(
+            buffer.getvalue(),
+            headers=[
+                ('Content-Type', 'text/csv; charset=utf-8'),
+                ('Content-Disposition', f'attachment; filename="{filename}"'),
+            ],
+        )
 
     # ─────────────────────────────────────────────────────────────
     # EXTRACTION / TRANSFERT INTER-MAGASINS

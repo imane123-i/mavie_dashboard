@@ -62,6 +62,29 @@ class MaVieDashboardController(http.Controller):
         companies = request.env['res.company'].sudo().search([('name', 'in', NON_RETAIL_COMPANIES)])
         return companies.ids
 
+    def _get_context_company_ids(self):
+        """
+        Sociétés actuellement cochées dans le sélecteur multi-société standard
+        d'Odoo (menu en haut à droite : SALMEDO / BLACK AND GOLD / ...).
+        Le dashboard tourne dans un iframe (voir dashboard_action.js), il n'a
+        donc pas accès au contexte JS du client web (allowed_company_ids) —
+        mais le client web pose ce choix dans un cookie "cids" (voir
+        odoo/addons/web/static/src/webclient/company_service.js), partagé
+        avec l'iframe car même origine. On le lit ici pour que le dashboard
+        réagisse à ce sélecteur standard sans dupliquer un choix de société
+        dans sa propre UI.
+        """
+        raw = request.httprequest.cookies.get('cids')
+        if not raw:
+            return []
+        ids = []
+        for part in raw.split(','):
+            try:
+                ids.append(int(part))
+            except (ValueError, TypeError):
+                continue
+        return ids
+
     # ─────────────────────────────────────────────────────────────
     # DOMAINS
     # ─────────────────────────────────────────────────────────────
@@ -166,6 +189,12 @@ class MaVieDashboardController(http.Controller):
                     ])
                     if configs:
                         domain.append(('order_id.session_id.config_id', 'in', configs.ids))
+        else:
+            # Pas de magasin précis choisi dans le dashboard : on retombe sur
+            # la/les société(s) cochée(s) dans le sélecteur standard Odoo.
+            context_company_ids = self._get_context_company_ids()
+            if context_company_ids:
+                domain.append(('order_id.company_id', 'in', context_company_ids))
 
         return domain
 
@@ -182,6 +211,29 @@ class MaVieDashboardController(http.Controller):
             domain.append(('order_id.date_order', '>=', kw['date_start'] + ' 00:00:00'))
         if kw.get('date_end'):
             domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
+
+        # CORRECTION : la Qté achetée ne bougeait jamais avec le filtre
+        # société/magasin car ce domaine, contrairement à _build_pos_domain,
+        # n'appliquait aucun filtre company/warehouse — les achats de TOUTES
+        # les sociétés étaient donc toujours comptés, peu importe le magasin
+        # sélectionné. On réplique ici le même filtre que pour les ventes
+        # POS : société via order_id.company_id, magasin via le picking
+        # (bon de réception) rattaché à l'entrepôt du magasin.
+        if kw.get('shop_field'):
+            mapping = request.env['mv.batch.shop.mapping'].sudo().search(
+                [('shop_field', '=', kw['shop_field'])], limit=1
+            )
+            if mapping:
+                if mapping.company_id:
+                    domain.append(('order_id.company_id', '=', mapping.company_id.id))
+                if mapping.warehouse_id:
+                    domain.append(('order_id.picking_type_id.warehouse_id', '=', mapping.warehouse_id.id))
+        else:
+            # Pas de magasin précis choisi dans le dashboard : on retombe sur
+            # la/les société(s) cochée(s) dans le sélecteur standard Odoo.
+            context_company_ids = self._get_context_company_ids()
+            if context_company_ids:
+                domain.append(('order_id.company_id', 'in', context_company_ids))
         return domain
 
     def _get_stock_quants(self, product_tmpl_ids=None, shop_field=None):
@@ -574,6 +626,12 @@ class MaVieDashboardController(http.Controller):
                         quant_domain.append(('company_id', '=', mapping.company_id.id))
                     if mapping.warehouse_id and mapping.warehouse_id.lot_stock_id:
                         quant_domain.append(('location_id', 'child_of', mapping.warehouse_id.lot_stock_id.id))
+            else:
+                # Pas de magasin précis choisi : on retombe sur la/les
+                # société(s) cochée(s) dans le sélecteur standard Odoo.
+                context_company_ids = self._get_context_company_ids()
+                if context_company_ids:
+                    quant_domain.append(('company_id', 'in', context_company_ids))
             if product_tmpl_ids is not None:
                 q_variants = request.env['product.product'].sudo().search_read(
                     [('product_tmpl_id', 'in', product_tmpl_ids)],
@@ -727,9 +785,29 @@ class MaVieDashboardController(http.Controller):
             ruptures_count = len(all_ruptures)
             ruptures_list = sorted(all_ruptures, key=lambda a: a['qty_sold'], reverse=True)[:500]
 
-            # CORRECTION #2c : references_count = nombre de références dans la sélection
-            # Si filtré par collection/batch : on compte les produits du filtre
-            # Sinon : on compte tous les SKUs actifs (ceux avec des données)
+            # CORRECTION #2c : references_count = nombre RÉEL de références Achats.
+            # On exclut la collection "Sachet 2026" via son vrai lien relationnel
+            # (collection_id), pas via un filtre texte sur le nom du produit :
+            # l'ancien filtre ('name', 'not ilike', '2026') excluait à tort tout
+            # produit dont la référence contient simplement les chiffres "2026"
+            # (ex: "2026AA", "JEANS2026"...), sans rapport avec cette collection.
+            sachet_collection_ids = request.env['product.collection'].sudo().search([
+                '|', ('name', 'ilike', 'sachet'), ('name', 'ilike', 'sacher'),
+            ]).ids
+            references_exclude_domain = (
+                [('collection_id', 'not in', sachet_collection_ids)] if sachet_collection_ids else []
+            )
+
+            # Si filtré par collection/batch/catégorie : on compte les produits du filtre.
+            # Si filtré par société/magasin (shop_field) : on compte les produits
+            # réellement présents en stock dans CETTE société — la référence
+            # "bouge" donc avec la société sélectionnée.
+            # Sinon (vue globale) : on compte le vrai catalogue actif tel qu'affiché
+            # dans Achats > Produits (product.template.search_count live, donc les
+            # ajouts/suppressions de produits se répercutent automatiquement),
+            # et non plus seulement les SKUs ayant déjà une vente/achat/stock —
+            # c'est ce sous-ensemble qui faisait chuter le chiffre affiché très en
+            # dessous du total réel du catalogue (ex: 3922 affiché pour 5996 produits).
             if is_filtered and product_tmpl_ids:
                 if kw.get('collection_id') or kw.get('batch_id'):
                     pivot_domain = []
@@ -747,8 +825,37 @@ class MaVieDashboardController(http.Controller):
                     references_count = max(len(product_tmpl_ids), pivot_count)
                 else:
                     references_count = len(product_tmpl_ids)
+            elif shop_field:
+                quant_domain_refs = [('location_id.usage', '=', 'internal')]
+                mapping_refs = request.env['mv.batch.shop.mapping'].sudo().search(
+                    [('shop_field', '=', shop_field)], limit=1
+                )
+                if mapping_refs and mapping_refs.company_id:
+                    quant_domain_refs.append(('company_id', '=', mapping_refs.company_id.id))
+                else:
+                    quant_domain_refs.append(('company_id', 'not in', self._get_non_retail_company_ids()))
+                if mapping_refs and mapping_refs.warehouse_id and mapping_refs.warehouse_id.lot_stock_id:
+                    quant_domain_refs.append(('location_id', 'child_of', mapping_refs.warehouse_id.lot_stock_id.id))
+                tmpl_ids_here = request.env['stock.quant'].sudo().search(quant_domain_refs).mapped(
+                    'product_id.product_tmpl_id'
+                ).ids
+                references_count = (
+                    ProductTemplate.search_count(references_exclude_domain + [('id', 'in', tmpl_ids_here)])
+                    if tmpl_ids_here else 0
+                )
             else:
-                references_count = len(relevant_tmpl_ids) if relevant_tmpl_ids else len(sales_by_tmpl)
+                context_company_ids = self._get_context_company_ids()
+                if context_company_ids:
+                    tmpl_ids_ctx = request.env['stock.quant'].sudo().search([
+                        ('location_id.usage', '=', 'internal'),
+                        ('company_id', 'in', context_company_ids),
+                    ]).mapped('product_id.product_tmpl_id').ids
+                    references_count = (
+                        ProductTemplate.search_count(references_exclude_domain + [('id', 'in', tmpl_ids_ctx)])
+                        if tmpl_ids_ctx else 0
+                    )
+                else:
+                    references_count = ProductTemplate.search_count(references_exclude_domain)
 
             total_active_skus = len(relevant_tmpl_ids) or 1
             taux_rupture = round((ruptures_count / total_active_skus) * 100, 1)
@@ -1554,6 +1661,7 @@ class MaVieDashboardController(http.Controller):
 
                     stock_by_store.append({
                         'store_name': wh.name,
+                        'company_id': wh.company_id.id,
                         'stock': int(stock_qty),
                         'reserved': int(reserved_qty),
                         'available': int(stock_qty - reserved_qty),
@@ -1572,7 +1680,15 @@ class MaVieDashboardController(http.Controller):
                 else:
                     stock_total = sum(s['stock'] for s in stock_by_store)
             else:
-                stock_total = sum(s['stock'] for s in stock_by_store)
+                # Pas de magasin précis choisi : on retombe sur la/les
+                # société(s) cochée(s) dans le sélecteur standard Odoo.
+                context_company_ids = self._get_context_company_ids()
+                if context_company_ids:
+                    stock_total = sum(
+                        s['stock'] for s in stock_by_store if s['company_id'] in context_company_ids
+                    )
+                else:
+                    stock_total = sum(s['stock'] for s in stock_by_store)
 
             stock_by_store_pivot = []
             if articles and shop_fields_cleaned:

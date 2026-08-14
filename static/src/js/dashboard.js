@@ -1,7 +1,8 @@
 /**
  * MaVie Dashboard – logique client principale
  * Module Odoo 17 : mavie_dashboard
- * Données depuis mv.article.base (Base Pivot)
+ * Données natives Odoo (Achats, Ventes/POS, Stock) — plus de dépendance à
+ * mv.article.base (Base Pivot) pour les calculs affichés.
  */
 
 function detectCurrentPage() {
@@ -40,17 +41,38 @@ var state = {
     detail: {
         article_id: null,
         shop_field: null,
+        // Dernière liste de variantes (couleurs) chargée pour la fiche
+        // produit ouverte — réutilisée par le popup de transfert (liste des
+        // couleurs) et le popup détail couleur, sans nouvel appel serveur.
+        variants: [],
     },
     transfer: {
         article_id: null,
         article_name: '',
         source_shop_field: null,
         dest_shop_field: null,
+        color: null,
+        // Repère commun posé sur tous les bons créés dans la même session de
+        // transfert pour la même référence + destination (permet de les
+        // regrouper à l'affichage quand plusieurs magasins source sont
+        // nécessaires — voir _createTransferFromMatrix).
+        group_ref: null,
+        group_count: 0,
+    },
+    colorDetail: {
+        article_id: null,
+        product_name: '',
+        color: null,
     },
 };
 
 var lastRupturesList = [];
 var lastDormantList = [];
+// Compteurs RÉELS (non plafonnés) — les listes ci-dessus sont limitées à
+// 500 côté serveur pour l'affichage, mais le badge doit montrer le vrai
+// total, pas la longueur de la liste tronquée.
+var lastRupturesCount = 0;
+var lastDormantCount = 0;
 var _searchDebounce = null;
 
 function el(id) { return document.getElementById(id); }
@@ -459,11 +481,19 @@ async function loadKPIs() {
     return;
 }
 
+    if (data.is_modforlife) {
+        _renderModForLifeDashboard(data);
+        return;
+    }
+    var mflGrid = el('modforlife-kpi-grid');
+    if (mflGrid) mflGrid.style.display = 'none';
+
     if (currentPage === 'stock') {
         _renderStockDashboard(data);
     } else {
         var kpiMap = {
             'kpi-ca-total':      formatMAD(data.ca_total),
+            'kpi-ca-achat':      formatMAD(data.ca_achat),
             // CORRECTION #2b : On affiche references_count (nb SKUs actifs) et non tickets POS
             // La carte HTML indique "Références" donc on doit montrer le bon chiffre
             'kpi-tickets':       formatNumber(data.references_count || data.total_active_skus || data.tickets),
@@ -480,7 +510,13 @@ async function loadKPIs() {
             if (el_obj) el_obj.textContent = kpiMap[id];
         }
 
+        var qtySoldSoldeEl = el('kpi-qty-sold-solde');
+        if (qtySoldSoldeEl) {
+            qtySoldSoldeEl.textContent = data.qty_sold_solde ? ('dont ' + formatNumber(data.qty_sold_solde) + ' en solde') : '';
+        }
+
         lastRupturesList = data.ruptures_list || [];
+        lastRupturesCount = data.ruptures_count || 0;
 
         var stEl = el('kpi-sell-through');
         if (stEl) {
@@ -488,6 +524,41 @@ async function loadKPIs() {
             stEl.style.color = st >= 70 ? '#10B981' : (st >= 40 ? '#F59E0B' : '#EF4444');
         }
 
+        var stockTotalKpiEl = el('kpi-stock-total');
+        if (stockTotalKpiEl) {
+            stockTotalKpiEl.style.color = (data.stock_total || 0) < 0 ? '#EF4444' : '';
+        }
+
+        var caAchatNoteEl = el('kpi-ca-achat-note');
+        if (caAchatNoteEl) {
+            // Beaucoup de bons de commande fournisseur sont saisis sans prix
+            // unitaire dans cette base : CA Achat/Marge peuvent donc être
+            // sous-estimés (voire à 0) même quand des quantités ont bien été
+            // achetées. Ce n'est pas un bug du dashboard, mais un rappel que
+            // le prix d'achat doit être renseigné sur les commandes.
+            caAchatNoteEl.textContent = (data.ca_achat === 0 && data.qty_purchased > 0)
+                ? '⚠️ prix d\'achat non renseigné sur les commandes'
+                : '';
+        }
+        var caAchatSplitEl = el('kpi-ca-achat-split');
+        if (caAchatSplitEl) {
+            // Achat externe (vrai fournisseur) vs achat interne (depuis
+            // MOD FOR LIFE, au prix coûtant) — voir _get_mod_for_life_partner_id.
+            caAchatSplitEl.textContent = (data.qty_purchased > 0)
+                ? ('Externe : ' + formatMAD(data.ca_achat_externe) + ' · Interne (MOD FOR LIFE) : ' + formatMAD(data.ca_achat_interne))
+                : '';
+        }
+        var caAchatByCompanyEl = el('kpi-ca-achat-by-company');
+        if (caAchatByCompanyEl) {
+            // Détail par société magasin (SALMEDO / BLACK AND GOLD /
+            // DELTA-GOLD) — la somme égale toujours le total ci-dessus ;
+            // n'affiche rien quand une seule société/magasin est déjà
+            // sélectionnée (le détail n'apporterait rien de plus).
+            var byCompany = data.ca_achat_by_company || [];
+            caAchatByCompanyEl.textContent = (byCompany.length > 1)
+                ? byCompany.map(function(c) { return c.societe + ' : ' + formatMAD(c.ca_achat); }).join(' · ')
+                : '';
+        }
         // Le backend renvoie toujours jusqu'à 100 lignes (voir dashboard.py) ;
         // on garde la liste complète en cache pour pouvoir changer le nombre
         // affiché (10/20/50...) sans refaire tout l'appel KPI (coûteux).
@@ -500,6 +571,66 @@ async function loadKPIs() {
             loadSalesDaily();
         }
     }
+}
+
+function _renderModForLifeDashboard(data) {
+    // MOD FOR LIFE n'est pas un magasin (pas de vente en caisse, pas
+    // d'alertes rupture retail) : on masque tout l'affichage normal
+    // (ventes/stock/commandes) et on montre sa propre grille dédiée.
+    var idsToHide = [
+        'main-kpi-grid', 'stock-kpi-grid', 'section-top-flop',
+        'stock-middle-section', 'stock-30j-section', 'stock-valorisation-section',
+        'section-abc', 'section-sales-chart',
+    ];
+    idsToHide.forEach(function(id) { var e = el(id); if (e) e.style.display = 'none'; });
+
+    var grid = el('modforlife-kpi-grid');
+    if (grid) grid.style.display = '';
+
+    var kpiMap = {
+        'mfl-ca-achats':    formatMAD(data.ca_achats_fournisseurs),
+        'mfl-nb-commandes': formatNumber(data.nb_commandes_fournisseurs),
+        'mfl-ca-ventes':    formatMAD(data.ca_ventes_societes),
+        'mfl-stock':        formatNumber(data.stock_entrepot),
+    };
+    for (var id in kpiMap) {
+        var e = el(id);
+        if (e) e.textContent = kpiMap[id];
+    }
+
+    var qtyAchatsSubEl = el('mfl-qty-achats-sub');
+    if (qtyAchatsSubEl) qtyAchatsSubEl.textContent = formatNumber(data.qty_achats_fournisseurs) + ' pièces';
+    var qtyVentesSubEl = el('mfl-qty-ventes-sub');
+    if (qtyVentesSubEl) qtyVentesSubEl.textContent = formatNumber(data.qty_ventes_societes) + ' pièces';
+
+    var tbody = el('modforlife-ventes-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+    var rows = data.ventes_par_societe || [];
+    if (rows.length === 0) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 3;
+        td.textContent = 'Aucune vente inter-société sur cette période.';
+        td.style.textAlign = 'center';
+        td.style.color = '#999';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+    rows.forEach(function(r) {
+        var tr = document.createElement('tr');
+        var tdName = document.createElement('td');
+        tdName.textContent = r.societe;
+        tr.appendChild(tdName);
+        var tdQty = document.createElement('td');
+        tdQty.textContent = formatNumber(r.qty);
+        tr.appendChild(tdQty);
+        var tdCa = document.createElement('td');
+        tdCa.textContent = formatMAD(r.ca);
+        tr.appendChild(tdCa);
+        tbody.appendChild(tr);
+    });
 }
 
 function _renderTopFlopFromCache() {
@@ -606,24 +737,72 @@ function _renderABC(abc) {
     });
 }
 
+var SHOP_CHART_COLORS = [
+    '#7C3AED', '#2563EB', '#059669', '#D97706', '#DC2626',
+    '#DB2777', '#0891B2', '#65A30D', '#9333EA', '#EA580C',
+];
+
+var lastSalesDailyData = null;
+var salesChartMode = 'arrivage';
+
+function _showChartTooltip(e, html) {
+    var tip = el('chart-tooltip');
+    if (tip) {
+        tip.style.display = 'block';
+        tip.style.left = (e.pageX + 10) + 'px';
+        tip.style.top  = (e.pageY - 30) + 'px';
+        tip.innerHTML = html;
+    }
+}
+function _hideChartTooltip() {
+    var tip = el('chart-tooltip');
+    if (tip) tip.style.display = 'none';
+}
+
 async function loadSalesDaily() {
     var params = getFilterParams();
     var data = await rpc('/mavie/api/sales-daily', params);
     if (!data || data.error) return;
+    lastSalesDailyData = data;
+    _renderSalesChart();
+}
 
+function setSalesChartMode(mode) {
+    salesChartMode = mode;
+    var arrBtn = el('chart-mode-arrivage');
+    var shopBtn = el('chart-mode-shop');
+    if (arrBtn) arrBtn.classList.toggle('active', mode === 'arrivage');
+    if (shopBtn) shopBtn.classList.toggle('active', mode === 'shop');
+    _renderSalesChart();
+}
+
+function _renderSalesChart() {
     var chartDiv = el('sales-daily-chart');
+    var legendDiv = el('sales-daily-legend');
     if (!chartDiv) return;
     chartDiv.innerHTML = '';
+    if (legendDiv) { legendDiv.innerHTML = ''; legendDiv.style.display = 'none'; }
 
-    if (!data.daily || data.daily.length === 0) {
+    var data = lastSalesDailyData;
+    if (!data) return;
+
+    if (salesChartMode === 'shop') {
+        _renderSalesChartByShop(chartDiv, legendDiv, data.by_shop || []);
+    } else {
+        _renderSalesChartByArrivage(chartDiv, data.daily || []);
+    }
+}
+
+function _renderSalesChartByArrivage(chartDiv, daily) {
+    if (!daily || daily.length === 0) {
         chartDiv.innerHTML = '<p style="color:#999;text-align:center;padding:20px">Aucune donnée disponible</p>';
         return;
     }
 
-    var maxCA = Math.max.apply(null, data.daily.map(function(d) { return d.ca || 0; }));
+    var maxCA = Math.max.apply(null, daily.map(function(d) { return d.ca || 0; }));
     if (maxCA === 0) maxCA = 1;
 
-    data.daily.forEach(function(d) {
+    daily.forEach(function(d) {
         var wrapper = document.createElement('div');
         wrapper.className = 'chart-bar-wrapper';
 
@@ -637,20 +816,9 @@ async function loadSalesDaily() {
         bar.title = formatMAD(d.ca) + '\n' + d.articles + ' article(s)';
 
         bar.addEventListener('mouseover', function(e) {
-            var tip = el('chart-tooltip');
-            if (tip) {
-                tip.style.display = 'block';
-                tip.style.left = (e.pageX + 10) + 'px';
-                tip.style.top  = (e.pageY - 30) + 'px';
-                tip.innerHTML = '<strong>' + d.date + '</strong><br>'
-                    + formatMAD(d.ca) + '<br>'
-                    + d.articles + ' art.';
-            }
+            _showChartTooltip(e, '<strong>' + d.date + '</strong><br>' + formatMAD(d.ca) + '<br>' + d.articles + ' art.');
         });
-        bar.addEventListener('mouseout', function() {
-            var tip = el('chart-tooltip');
-            if (tip) tip.style.display = 'none';
-        });
+        bar.addEventListener('mouseout', _hideChartTooltip);
 
         barInner.appendChild(bar);
         wrapper.appendChild(barInner);
@@ -662,6 +830,87 @@ async function loadSalesDaily() {
 
         chartDiv.appendChild(wrapper);
     });
+}
+
+function _renderSalesChartByShop(chartDiv, legendDiv, byShop) {
+    if (!byShop || byShop.length === 0) {
+        chartDiv.innerHTML = '<p style="color:#999;text-align:center;padding:20px">Aucune donnée disponible</p>';
+        return;
+    }
+
+    // Palette stable par magasin : même couleur pour un magasin donné sur
+    // toutes les barres, dans l'ordre où il apparaît (le magasin avec le
+    // plus gros CA total passe en premier grâce au tri déjà fait côté
+    // backend sur chaque arrivage).
+    var shopColorByName = {};
+    var colorIdx = 0;
+    byShop.forEach(function(a) {
+        a.shops.forEach(function(s) {
+            if (!(s.shop in shopColorByName)) {
+                shopColorByName[s.shop] = SHOP_CHART_COLORS[colorIdx % SHOP_CHART_COLORS.length];
+                colorIdx++;
+            }
+        });
+    });
+
+    var totals = byShop.map(function(a) { return a.shops.reduce(function(sum, s) { return sum + (s.ca || 0); }, 0); });
+    var maxCA = Math.max.apply(null, totals.concat([0]));
+    if (maxCA === 0) maxCA = 1;
+
+    byShop.forEach(function(a) {
+        var totalCA = a.shops.reduce(function(sum, s) { return sum + (s.ca || 0); }, 0);
+
+        var wrapper = document.createElement('div');
+        wrapper.className = 'chart-bar-wrapper';
+
+        var barInner = document.createElement('div');
+        barInner.className = 'chart-bar-inner';
+
+        var stack = document.createElement('div');
+        stack.className = 'chart-bar-stack';
+        var stackHeight = Math.max(((totalCA / maxCA) * 180), 4);
+        stack.style.height = stackHeight + 'px';
+
+        a.shops.forEach(function(s) {
+            var segHeight = totalCA > 0 ? (s.ca / totalCA) * stackHeight : 0;
+            if (segHeight <= 0) return;
+            var seg = document.createElement('div');
+            seg.className = 'chart-bar-segment';
+            seg.style.height = segHeight + 'px';
+            seg.style.background = shopColorByName[s.shop];
+            seg.addEventListener('mouseover', function(e) {
+                _showChartTooltip(e, '<strong>' + a.arrivage + '</strong><br>' + s.shop + ': ' + formatMAD(s.ca) + '<br>' + s.qty + ' art.');
+            });
+            seg.addEventListener('mouseout', _hideChartTooltip);
+            stack.appendChild(seg);
+        });
+
+        barInner.appendChild(stack);
+        wrapper.appendChild(barInner);
+
+        var label = document.createElement('div');
+        label.className = 'chart-bar-label';
+        label.textContent = a.arrivage || '';
+        wrapper.appendChild(label);
+
+        chartDiv.appendChild(wrapper);
+    });
+
+    if (legendDiv) {
+        legendDiv.style.display = 'flex';
+        Object.keys(shopColorByName).forEach(function(shopName) {
+            var item = document.createElement('div');
+            item.className = 'chart-legend-item';
+            var swatch = document.createElement('span');
+            swatch.className = 'chart-legend-swatch';
+            swatch.style.background = shopColorByName[shopName];
+            item.appendChild(swatch);
+            var text = document.createElement('span');
+            text.textContent = shopName;
+            item.appendChild(text);
+            legendDiv.appendChild(item);
+        });
+    }
 }
 
 async function openDetail(articleId, productName) {
@@ -729,12 +978,31 @@ async function _fetchAndRenderDetail() {
         'detail-qty-purchased': formatNumber(data.qty_purchased),
         'detail-stock-total':   formatNumber(data.stock_total),
         'detail-ca':            formatMAD(data.ca),
+        'detail-ca-achat':      formatMAD(data.ca_achat),
         'detail-sell-through':  formatPct(data.sell_through),
-    
+
     };
     for (var id in kpiMap) {
         var e = el(id);
         if (e) e.textContent = kpiMap[id];
+    }
+
+    var detailQtySoldSoldeEl = el('detail-qty-sold-solde');
+    if (detailQtySoldSoldeEl) {
+        detailQtySoldSoldeEl.textContent = data.qty_sold_solde ? ('dont ' + formatNumber(data.qty_sold_solde) + ' en solde') : '';
+    }
+
+    var detailCaAchatNoteEl = el('detail-ca-achat-note');
+    if (detailCaAchatNoteEl) {
+        detailCaAchatNoteEl.textContent = (data.ca_achat === 0 && data.qty_purchased > 0)
+            ? '⚠️ prix d\'achat non renseigné'
+            : '';
+    }
+    var detailCaAchatSplitEl = el('detail-ca-achat-split');
+    if (detailCaAchatSplitEl) {
+        detailCaAchatSplitEl.textContent = (data.qty_purchased > 0)
+            ? ('Externe : ' + formatMAD(data.ca_achat_externe) + ' · Interne (MOD FOR LIFE) : ' + formatMAD(data.ca_achat_interne))
+            : '';
     }
 
     var stEl = el('detail-sell-through');
@@ -744,13 +1012,24 @@ async function _fetchAndRenderDetail() {
     }
 
     var ecartEl = el('detail-stock-ecart');
+    var stockTotalEl = el('detail-stock-total');
     if (ecartEl) {
         var ecart = data.stock_ecart || 0;
+        var stockTotal = data.stock_total || 0;
         // Achetée - Vendue = stock théorique. Un écart notable avec le stock
         // réel Odoo indique des mouvements de stock non tracés (pertes,
         // ventes hors POS, stock négatif dans un magasin...) — pas un bug
         // du dashboard, mais un signal à vérifier dans Odoo.
-        if (Math.abs(ecart) >= 1) {
+        if (stockTotal < 0) {
+            // Stock réel négatif = plus vendu en caisse que jamais réceptionné
+            // dans Odoo pour ce(s) magasin(s) : message en clair plutôt que le
+            // seul libellé technique "écart", qui prêtait à confusion.
+            ecartEl.style.display = 'block';
+            ecartEl.textContent = '⚠️ Stock négatif — ventes non couvertes par des réceptions trackées dans Odoo';
+            ecartEl.title = 'Stock réel Odoo = ' + formatNumber(stockTotal) + ' (négatif). '
+                + 'Stock théorique (achetée − vendue) = ' + formatNumber(data.stock_theorique)
+                + '. Cela signifie que plus d\'unités ont été vendues en caisse que de réceptions enregistrées dans Odoo pour ce(s) magasin(s) — à vérifier : réceptions manquantes, transferts non tracés, ou ventes hors POS.';
+        } else if (Math.abs(ecart) >= 1) {
             ecartEl.style.display = 'block';
             ecartEl.textContent = '⚠️ écart ' + (ecart > 0 ? '+' : '') + formatNumber(ecart) + ' vs théorique';
             ecartEl.title = 'Stock théorique (achetée − vendue) = ' + formatNumber(data.stock_theorique)
@@ -760,19 +1039,31 @@ async function _fetchAndRenderDetail() {
             ecartEl.style.display = 'none';
         }
     }
+    if (stockTotalEl) {
+        stockTotalEl.style.color = (data.stock_total || 0) < 0 ? '#EF4444' : '';
+    }
+
+    state.detail.variants = data.variants || [];
 
     _renderStockByStore('detail-stock-pivot-tbody', data.stock_by_store, state.detail.shop_field);
-    _renderVariants('detail-variants-tbody', data.variants, state.detail.shop_field);
+    _renderVariants('detail-variants-tbody', data.variants, state.detail.shop_field, data.has_base_pivot_data);
+    _renderVerification(data.verification);
 
     var batchEl = el('detail-batch-info');
-    if (batchEl && data.batch) {
-        batchEl.innerHTML = '<strong>' + data.batch.name + '</strong>'
-            + (data.batch.date ? ' — ' + data.batch.date : '')
-            + (data.batch.collection && data.batch.collection !== '—'
-               ? ' — Collection: <em>' + data.batch.collection + '</em>' : '');
-        batchEl.style.display = 'block';
-    } else if (batchEl) {
-        batchEl.style.display = 'none';
+    if (batchEl) {
+        // Arrivage/collection natifs (product.arrivage / product.collection),
+        // pas Base Pivot — voir data.batch_name / data.collection_name.
+        var hasBatch = data.batch_name && data.batch_name !== '—';
+        var hasCollection = data.collection_name && data.collection_name !== '—';
+        if (hasBatch || hasCollection) {
+            var parts = [];
+            if (hasBatch) parts.push('<strong>' + data.batch_name + '</strong>');
+            if (hasCollection) parts.push('Collection: <em>' + data.collection_name + '</em>');
+            batchEl.innerHTML = parts.join(' — ');
+            batchEl.style.display = 'block';
+        } else {
+            batchEl.style.display = 'none';
+        }
     }
 }
 
@@ -821,9 +1112,11 @@ function _renderStockByStore(tbodyId, stores, activeShop) {
         if (s.qty === null || s.qty === undefined) {
             tdQty.textContent = '—';
             tdQty.style.color = '#94A3B8';
-            tdQty.title = 'Aucun dispatch manuel enregistré en Base Pivot pour ce magasin';
+            tdQty.title = 'Aucune commande fournisseur confirmée pour ce magasin';
         } else {
-            tdQty.textContent = formatNumber(s.qty);
+            var whSourceLabel = s.dispatch_source === 'achats' ? ' achats' : '';
+            tdQty.innerHTML = formatNumber(s.qty)
+                + (whSourceLabel ? ' <small style="color:#94A3B8">(' + whSourceLabel.trim() + ')</small>' : '');
         }
         tr.appendChild(tdQty);
 
@@ -844,10 +1137,23 @@ function _renderStockByStore(tbodyId, stores, activeShop) {
     });
 }
 
-function _renderVariants(tbodyId, variants, activeShop) {
+function _renderVariants(tbodyId, variants, activeShop, hasBasePivotData) {
     var tbody = el(tbodyId);
     if (!tbody) return;
     tbody.innerHTML = '';
+
+    if (hasBasePivotData === false && variants && variants.length > 0) {
+        var noteRow = document.createElement('tr');
+        var noteTd = document.createElement('td');
+        noteTd.colSpan = 5;
+        noteTd.style.fontSize = '0.8em';
+        noteTd.style.color = '#B45309';
+        noteTd.style.background = '#FFFBEB';
+        noteTd.style.padding = '6px 8px';
+        noteTd.textContent = 'ℹ️ Ce produit n\'a aucune commande fournisseur confirmée enregistrée — "Total pièces" et "Reste" ne sont pas disponibles pour lui.';
+        noteRow.appendChild(noteTd);
+        tbody.appendChild(noteRow);
+    }
 
     if (!variants || variants.length === 0) {
         var tr = document.createElement('tr');
@@ -866,6 +1172,14 @@ function _renderVariants(tbodyId, variants, activeShop) {
         if (idx === 0) {
             tr.style.background = 'rgba(124,58,237,0.08)';
         }
+        if (v.color && v.color !== '—') {
+            tr.style.cursor = 'pointer';
+            tr.title = 'Cliquer pour voir le stock de cette couleur dans chaque magasin';
+            tr.onclick = function() {
+                var nameEl = el('detail-name');
+                openColorDetail(state.detail.article_id, nameEl ? nameEl.textContent : '', v.color);
+            };
+        }
 
         var tdRank = document.createElement('td');
         tdRank.textContent = idx === 0 ? '🏆' : (idx + 1);
@@ -877,37 +1191,56 @@ function _renderVariants(tbodyId, variants, activeShop) {
         tdName.style.fontWeight = idx === 0 ? '700' : 'normal';
         tr.appendChild(tdName);
 
+        var tdTotal = document.createElement('td');
+        if (v.total_pieces === null || v.total_pieces === undefined) {
+            tdTotal.textContent = '—';
+            tdTotal.title = 'Aucune commande fournisseur confirmée pour cette couleur';
+            tdTotal.style.color = '#94A3B8';
+        } else {
+            var sourceLabel = v.dispatch_source === 'achats' ? ' achats' : '';
+            tdTotal.innerHTML = formatNumber(v.total_pieces)
+                + (sourceLabel ? ' <small style="color:#94A3B8">(' + sourceLabel.trim() + ')</small>' : '');
+            if (v.total_pieces === 0) {
+                tdTotal.title = 'Aucun dispatch/achat enregistré, aucune vente et aucun stock';
+                tdTotal.style.color = '#94A3B8';
+            }
+            if (v.dispatch_missing) {
+                tdTotal.innerHTML += ' <span title="Aucune commande fournisseur confirmée pour cette couleur, alors qu\'il y a du stock et/ou des ventes" style="color:#F59E0B;cursor:help">⚠️</span>';
+            }
+        }
+        tr.appendChild(tdTotal);
+
         var tdQty = document.createElement('td');
-        if (activeShop && v.shops && v.shops[activeShop]) {
+        // "Qté (magasin)" = stock ACTUEL de cette variante dans le magasin
+        // filtré (v.stock_shop), pas les ventes — v.shops reste dédié au
+        // bloc "répartition des ventes par magasin" plus bas.
+        if (activeShop && v.stock_shop !== null && v.stock_shop !== undefined) {
             tdQty.innerHTML = formatNumber(v.qty)
-                + ' <small style="color:#7C3AED">(magasin: ' + formatNumber(v.shops[activeShop]) + ')</small>';
+                + ' <small style="color:#7C3AED">(stock magasin: ' + formatNumber(v.stock_shop) + ')</small>';
         } else {
             tdQty.textContent = formatNumber(v.qty);
         }
         tr.appendChild(tdQty);
 
-        var tdTotal = document.createElement('td');
-        // Le backend garantit déjà total_pieces >= stock + vendu (voir
-        // dashboard.py), donc plus besoin de fallback ici.
-        tdTotal.textContent = formatNumber(v.total_pieces);
-        if (v.total_pieces === 0) {
-            tdTotal.title = 'Aucun dispatch enregistré en Base Pivot, aucune vente et aucun stock';
-            tdTotal.style.color = '#94A3B8';
-        }
-        tr.appendChild(tdTotal);
-
         var tdReste = document.createElement('td');
-        // Reste = total colis - vendu (le backend calcule déjà total_pieces
-        // pour qu'il ne soit jamais inférieur à vendu + stock restant).
+        // Reste = total pièces (dispatché, jamais recalculé) - vendu.
         var resteVal = v.reste;
-        tdReste.textContent = formatNumber(resteVal);
-        if (resteVal < 0) {
-            tdReste.style.color = '#EF4444'; // Rouge si survendu par rapport au dispatch
-            tdReste.title = 'Plus vendu que dispatché — vérifier les données Base Pivot';
-        } else if (resteVal === 0) {
-            tdReste.style.color = '#10B981';
+        if (resteVal === null || resteVal === undefined) {
+            tdReste.textContent = '—';
+            tdReste.style.color = '#94A3B8';
         } else {
-            tdReste.style.color = '#F59E0B';
+            tdReste.textContent = formatNumber(resteVal);
+            if (resteVal < 0) {
+                tdReste.style.color = '#EF4444'; // Rouge si survendu par rapport au dispatch
+                tdReste.title = 'Plus vendu que dispatché — vérifier les commandes fournisseur';
+            } else if (resteVal === 0) {
+                tdReste.style.color = '#10B981';
+            } else {
+                tdReste.style.color = '#F59E0B';
+            }
+        }
+        if (v.discordance) {
+            tdReste.innerHTML += ' <span title="' + (v.discordance_detail || 'Écart entre dispatché et stock+vendu') + '" style="color:#EF4444;cursor:help">⚠️</span>';
         }
         tr.appendChild(tdReste);
 
@@ -924,7 +1257,7 @@ function _renderVariants(tbodyId, variants, activeShop) {
             td.style.paddingTop = '8px';
             td.style.fontSize = '0.85em';
             td.style.color = '#666';
-            td.innerHTML = '<strong>Meilleure variante (' + best.name + ') — répartition par magasin :</strong> '
+            td.innerHTML = '<strong>Meilleure variante (' + best.name + ') — répartition des ventes par magasin :</strong> '
                 + allShops.map(function(s) {
                     return '<span style="margin:0 4px;padding:2px 6px;background:#f3f4f6;border-radius:4px">'
                         + s + ': ' + formatNumber(best.shops[s]) + '</span>';
@@ -933,6 +1266,48 @@ function _renderVariants(tbodyId, variants, activeShop) {
             tbody.appendChild(tr);
         }
     }
+}
+
+function _renderVerification(verification) {
+    var colorTbody = el('detail-verif-color-tbody');
+    var magasinTbody = el('detail-verif-magasin-tbody');
+    if (!colorTbody || !magasinTbody) return;
+
+    function fillRows(tbody, rows, firstColKey) {
+        tbody.innerHTML = '';
+        if (!rows || rows.length === 0) {
+            var tr = document.createElement('tr');
+            var td = document.createElement('td');
+            td.colSpan = 3;
+            td.textContent = 'Aucune donnée achats pour ce produit.';
+            td.style.textAlign = 'center';
+            td.style.color = '#94A3B8';
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+            return;
+        }
+        rows.forEach(function(r) {
+            var tr = document.createElement('tr');
+
+            var tdName = document.createElement('td');
+            tdName.textContent = r[firstColKey] || '—';
+            tr.appendChild(tdName);
+
+            var tdAchats = document.createElement('td');
+            tdAchats.textContent = formatNumber(r.achats);
+            tr.appendChild(tdAchats);
+
+            var tdDash = document.createElement('td');
+            tdDash.textContent = (r.dashboard === null || r.dashboard === undefined) ? '—' : formatNumber(r.dashboard);
+            tdDash.style.fontWeight = '700';
+            tr.appendChild(tdDash);
+
+            tbody.appendChild(tr);
+        });
+    }
+
+    fillRows(colorTbody, verification && verification.by_color, 'color');
+    fillRows(magasinTbody, verification && verification.by_magasin, 'magasin');
 }
 
 function closeDetail() {
@@ -944,18 +1319,41 @@ function closeDetail() {
 // ═══════════════════════════════════════════════════════════
 // EXTRACTION / TRANSFERT INTER-MAGASINS
 // ═══════════════════════════════════════════════════════════
-function openTransferPanel(articleId, productName) {
+function openTransferPanel(articleId, productName, presetColor) {
     var overlay = el('transfer-overlay');
     if (!overlay || !articleId) return;
 
     state.transfer.article_id = articleId;
     state.transfer.article_name = productName || '';
+    state.transfer.color = presetColor || null;
+    state.transfer.group_ref = null;
+    state.transfer.group_count = 0;
 
     var nameEl = el('transfer-product-name');
     if (nameEl) nameEl.textContent = productName || '—';
 
     var destSel = el('transfer-dest-shop');
     if (destSel) destSel.value = state.shop_field || '';
+
+    // Liste des couleurs de ce produit — dérivée de state.detail.variants,
+    // déjà chargé pour le tableau "Variantes Couleurs" (pas de nouvel appel
+    // serveur nécessaire pour peupler ce filtre).
+    var colorSel = el('transfer-color-filter');
+    if (colorSel) {
+        while (colorSel.options.length > 1) colorSel.remove(1);
+        var seenColors = {};
+        (state.detail.variants || []).forEach(function(v) {
+            var c = v.color;
+            if (c && c !== '—' && !seenColors[c]) {
+                seenColors[c] = true;
+                var opt = document.createElement('option');
+                opt.value = c;
+                opt.textContent = c;
+                colorSel.appendChild(opt);
+            }
+        });
+        colorSel.value = presetColor || '';
+    }
 
     var msgEl = el('transfer-suggestions-msg');
     if (msgEl) msgEl.textContent = '';
@@ -979,6 +1377,8 @@ function closeTransferPanel() {
     var overlay = el('transfer-overlay');
     if (overlay) overlay.classList.remove('active');
     state.transfer.article_id = null;
+    state.transfer.group_ref = null;
+    state.transfer.group_count = 0;
 }
 
 function _showTransferSuggestionsView() {
@@ -1011,9 +1411,14 @@ async function _loadTransferSuggestions() {
     if (msgEl) msgEl.textContent = 'Recherche des magasins source…';
     if (tbody) tbody.innerHTML = '';
 
+    var colorSel = el('transfer-color-filter');
+    var colorFilter = colorSel ? colorSel.value : '';
+    state.transfer.color = colorFilter || null;
+
     var data = await rpc('/mavie/api/transfer-suggestions', {
         product_tmpl_id: state.transfer.article_id,
         dest_shop_field: destShopField,
+        color: colorFilter || null,
     });
 
     if (!data || data.error) {
@@ -1025,10 +1430,11 @@ async function _loadTransferSuggestions() {
 
     if (msgEl) {
         var suggestions = data.suggestions || [];
+        var forWhat = colorFilter ? ('pour la couleur ' + colorFilter) : 'pour ce produit';
         if (suggestions.length === 0) {
-            msgEl.textContent = 'Aucun stock disponible pour ce produit dans les autres magasins.';
+            msgEl.textContent = 'Aucun stock disponible ' + forWhat + ' dans les autres magasins.';
         } else if (data.dest_city && !suggestions.some(function(s) { return s.tier === 'same_city'; })) {
-            msgEl.textContent = 'Aucun magasin de ' + data.dest_city + ' (même ville) n\'a de stock disponible pour ce produit — voici les autres magasins qui en ont.';
+            msgEl.textContent = 'Aucun magasin de ' + data.dest_city + ' (même ville) n\'a de stock disponible ' + forWhat + ' — voici les autres magasins qui en ont.';
         } else {
             msgEl.textContent = '';
         }
@@ -1088,6 +1494,16 @@ async function openTransferMatrix(sourceShopField, sourceLabel, destShopField) {
     var nameEl = el('transfer-matrix-source-name');
     if (nameEl) nameEl.textContent = sourceLabel || sourceShopField;
 
+    var emetteurRecepteurEl = el('transfer-emetteur-recepteur');
+    if (emetteurRecepteurEl) {
+        var destSelEl = el('transfer-dest-shop');
+        var destLabel = (destSelEl && destSelEl.selectedOptions && destSelEl.selectedOptions[0])
+            ? destSelEl.selectedOptions[0].textContent
+            : destShopField;
+        emetteurRecepteurEl.innerHTML = '📤 <strong>Émetteur :</strong> ' + (sourceLabel || sourceShopField)
+            + '&nbsp;&nbsp;→&nbsp;&nbsp;📥 <strong>Récepteur :</strong> ' + destLabel;
+    }
+
     var msgEl = el('transfer-matrix-msg');
     if (msgEl) msgEl.textContent = 'Chargement du stock par couleur/taille…';
 
@@ -1102,6 +1518,7 @@ async function openTransferMatrix(sourceShopField, sourceLabel, destShopField) {
     var data = await rpc('/mavie/api/transfer-variant-stock', {
         product_tmpl_id: state.transfer.article_id,
         source_shop_field: sourceShopField,
+        color: state.transfer.color || null,
     });
 
     if (!data || data.error) {
@@ -1180,11 +1597,20 @@ async function _createTransferFromMatrix(btnEl) {
 
     if (btnEl) { btnEl.disabled = true; btnEl.textContent = 'Création…'; }
 
+    // Un seul bon par référence + destination : si un autre bon a déjà été
+    // créé dans cette même session (magasin source différent), on réutilise
+    // son group_ref pour qu'ils soient regroupés à l'affichage (liste + PDF)
+    // au lieu d'apparaître comme des transferts sans rapport.
+    if (!state.transfer.group_ref) {
+        state.transfer.group_ref = state.transfer.article_id + '-' + state.transfer.dest_shop_field + '-' + Date.now();
+    }
+
     var data = await rpc('/mavie/api/transfer-create', {
         product_tmpl_id: state.transfer.article_id,
         source_shop_field: state.transfer.source_shop_field,
         dest_shop_field: state.transfer.dest_shop_field,
         lines: lines,
+        group_ref: state.transfer.group_ref,
     });
 
     if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Créer le transfert'; }
@@ -1200,8 +1626,13 @@ async function _createTransferFromMatrix(btnEl) {
         return;
     }
 
+    state.transfer.group_count = (state.transfer.group_count || 0) + 1;
+
     var pdfUrl = '/report/pdf/mavie_dashboard.report_transfer_template/' + data.transfer_id;
     var html = '<strong>✅ Transfert ' + data.transfer_name + ' créé</strong> — envoyé dans le module Transferts, en attente de validation par le Responsable Approvisionnement.';
+    if (state.transfer.group_count > 1) {
+        html += ' (regroupé avec ' + (state.transfer.group_count - 1) + ' autre(s) bon(s) créé(s) pour cette même référence + destination — un seul PDF imprimera tout le groupe)';
+    }
     html += ' <a href="' + pdfUrl + '" target="_blank">📄 Imprimer le bon (PDF)</a>';
     if (data.warning) html += '<br/><span style="color:#B45309;">' + data.warning + '</span>';
     if (data.notif_warning) html += '<br/><span style="color:#B45309;">' + data.notif_warning + '</span>';
@@ -1215,6 +1646,131 @@ async function _createTransferFromMatrix(btnEl) {
     // Retour à la liste des suggestions (le stock source a changé)
     _showTransferSuggestionsView();
     _loadTransferSuggestions();
+}
+
+// ═══════════════════════════════════════════════════════════
+// DÉTAIL D'UNE COULEUR — stock par magasin (popup depuis Variantes Couleurs)
+// ═══════════════════════════════════════════════════════════
+function openColorDetail(articleId, productName, color) {
+    var overlay = el('color-detail-overlay');
+    if (!overlay || !articleId || !color) return;
+
+    state.colorDetail.article_id = articleId;
+    state.colorDetail.product_name = productName || '';
+    state.colorDetail.color = color;
+
+    var colorNameEl = el('color-detail-color-name');
+    if (colorNameEl) colorNameEl.textContent = color;
+    var productNameEl = el('color-detail-product-name');
+    if (productNameEl) productNameEl.textContent = productName || '—';
+
+    // KPIs calculés côté client à partir de state.detail.variants, déjà
+    // chargé pour le tableau "Variantes Couleurs" — pas de second calcul
+    // serveur pour ces totaux, seule la répartition par magasin (ci-dessous)
+    // vient d'un nouvel appel.
+    var matching = (state.detail.variants || []).filter(function(v) { return v.color === color; });
+    var qtySold = 0, ca = 0, totalPieces = 0, hasTotalPieces = false, stockTotal = 0;
+    matching.forEach(function(v) {
+        qtySold += v.qty || 0;
+        ca += v.ca || 0;
+        stockTotal += v.stock || 0;
+        if (v.total_pieces !== null && v.total_pieces !== undefined) {
+            totalPieces += v.total_pieces;
+            hasTotalPieces = true;
+        }
+    });
+    var reste = hasTotalPieces ? (totalPieces - qtySold) : null;
+
+    var qtySoldEl = el('color-detail-qty-sold');
+    if (qtySoldEl) qtySoldEl.textContent = formatNumber(qtySold);
+    var caEl = el('color-detail-ca');
+    if (caEl) caEl.textContent = formatMAD(ca);
+    var totalPiecesEl = el('color-detail-total-pieces');
+    if (totalPiecesEl) totalPiecesEl.textContent = hasTotalPieces ? formatNumber(totalPieces) : '—';
+    var resteEl = el('color-detail-reste');
+    if (resteEl) resteEl.textContent = (reste === null) ? '—' : formatNumber(reste);
+    var stockTotalEl = el('color-detail-stock-total');
+    if (stockTotalEl) stockTotalEl.textContent = formatNumber(stockTotal);
+
+    var msgEl = el('color-detail-msg');
+    if (msgEl) msgEl.textContent = 'Chargement du stock par magasin…';
+    var tbody = el('color-detail-stores-tbody');
+    if (tbody) tbody.innerHTML = '';
+
+    overlay.classList.add('active');
+
+    _loadColorDetailStores(articleId, color);
+}
+
+function closeColorDetail() {
+    var overlay = el('color-detail-overlay');
+    if (overlay) overlay.classList.remove('active');
+}
+
+async function _loadColorDetailStores(articleId, color) {
+    var msgEl = el('color-detail-msg');
+
+    var data = await rpc('/mavie/api/color-stock-by-store', {
+        product_tmpl_id: articleId,
+        color: color,
+    });
+
+    if (!data || data.error) {
+        if (msgEl) msgEl.textContent = 'Erreur : ' + (data && data.error || 'inconnue');
+        return;
+    }
+
+    if (msgEl) msgEl.textContent = '';
+    _renderColorDetailStores(data.stores || []);
+}
+
+function _renderColorDetailStores(stores) {
+    var tbody = el('color-detail-stores-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    if (!stores || stores.length === 0) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 4;
+        td.textContent = 'Aucun stock trouvé pour cette couleur dans les magasins actifs.';
+        td.style.textAlign = 'center';
+        td.style.color = '#999';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    stores.forEach(function(s) {
+        var tr = document.createElement('tr');
+
+        var tdName = document.createElement('td');
+        tdName.textContent = s.shop_label;
+        tr.appendChild(tdName);
+
+        var tdCity = document.createElement('td');
+        tdCity.textContent = s.city || '—';
+        tr.appendChild(tdCity);
+
+        var tdStock = document.createElement('td');
+        tdStock.textContent = formatNumber(s.stock_total);
+        if (s.stock_total <= 0) tdStock.style.color = '#94A3B8';
+        tr.appendChild(tdStock);
+
+        var tdSizes = document.createElement('td');
+        var sizeKeys = Object.keys(s.by_size || {}).sort();
+        if (sizeKeys.length === 0) {
+            tdSizes.textContent = '—';
+        } else {
+            tdSizes.innerHTML = sizeKeys.map(function(sz) {
+                return '<span style="margin:0 4px 4px 0;padding:2px 6px;background:#f3f4f6;border-radius:4px;display:inline-block;font-size:0.85em">'
+                    + sz + ': ' + formatNumber(s.by_size[sz]) + '</span>';
+            }).join('');
+        }
+        tr.appendChild(tdSizes);
+
+        tbody.appendChild(tr);
+    });
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1265,7 +1821,12 @@ function _renderRupturesList(searchFilter) {
     tbody.innerHTML = '';
 
     var badge = el('ruptures-count-badge');
-    if (badge) badge.textContent = formatNumber(lastRupturesList.length) + ' articles';
+    if (badge) {
+        // lastRupturesList est plafonnée à 500 côté serveur (perf) —
+        // lastRupturesCount est le vrai total, jamais tronqué.
+        badge.textContent = formatNumber(lastRupturesCount) + ' articles'
+            + (lastRupturesCount > lastRupturesList.length ? ' (' + formatNumber(lastRupturesList.length) + ' affichés)' : '');
+    }
 
     var list = lastRupturesList;
     if (searchFilter) {
@@ -1365,7 +1926,10 @@ function _renderDormantList(searchFilter) {
     tbody.innerHTML = '';
 
     var badge = el('dormant-count-badge');
-    if (badge) badge.textContent = formatNumber(lastDormantList.length) + ' articles';
+    if (badge) {
+        badge.textContent = formatNumber(lastDormantCount) + ' articles'
+            + (lastDormantCount > lastDormantList.length ? ' (' + formatNumber(lastDormantList.length) + ' affichés)' : '');
+    }
 
     var list = lastDormantList;
     if (searchFilter) {
@@ -1467,6 +2031,8 @@ function _renderStockDashboard(data) {
 
     lastRupturesList = data.ruptures_list || [];
     lastDormantList = data.dormant_list || [];
+    lastRupturesCount = data.ruptures_count || 0;
+    lastDormantCount = data.dormant_count || 0;
 
     _renderStockAlerts(data.alertes_stock);
     _renderRotationCollection(data.rotation_collection);
@@ -1740,6 +2306,15 @@ document.addEventListener('DOMContentLoaded', function() {
     // KPIs lancés immédiatement sans attendre les filtres
     loadKPIs();
 
+    var chartModeArrivageBtn = el('chart-mode-arrivage');
+    if (chartModeArrivageBtn) {
+        chartModeArrivageBtn.addEventListener('click', function() { setSalesChartMode('arrivage'); });
+    }
+    var chartModeShopBtn = el('chart-mode-shop');
+    if (chartModeShopBtn) {
+        chartModeShopBtn.addEventListener('click', function() { setSalesChartMode('shop'); });
+    }
+
     ['filter-collection', 'filter-magasin', 'filter-category', 'filter-batch', 'filter-date-start', 'filter-date-end',
      'filter-period-month', 'filter-period-month-year', 'filter-period-week', 'filter-period-year'].forEach(function(id) {
         var sel = el(id);
@@ -1862,9 +2437,47 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
+    var closeColorDetailBtn = el('close-color-detail-btn');
+    if (closeColorDetailBtn) closeColorDetailBtn.addEventListener('click', closeColorDetail);
+
+    var colorDetailOverlay = el('color-detail-overlay');
+    if (colorDetailOverlay) {
+        colorDetailOverlay.addEventListener('click', function(e) {
+            if (e.target === colorDetailOverlay) closeColorDetail();
+        });
+    }
+
+    var btnColorDetailTransfer = el('btn-color-detail-transfer');
+    if (btnColorDetailTransfer) {
+        btnColorDetailTransfer.addEventListener('click', function() {
+            var articleId = state.colorDetail.article_id;
+            var productName = state.colorDetail.product_name;
+            var color = state.colorDetail.color;
+            closeColorDetail();
+            openTransferPanel(articleId, productName, color);
+        });
+    }
+
     var transferDestSel = el('transfer-dest-shop');
     if (transferDestSel) {
         transferDestSel.addEventListener('change', function() {
+            // Changer de destination = un nouveau groupe de bons (les bons
+            // déjà créés visaient une autre destination).
+            state.transfer.group_ref = null;
+            state.transfer.group_count = 0;
+            _showTransferSuggestionsView();
+            _loadTransferSuggestions();
+        });
+    }
+
+    var transferColorSel = el('transfer-color-filter');
+    if (transferColorSel) {
+        transferColorSel.addEventListener('change', function() {
+            // Changer de couleur = un nouveau groupe de bons, même logique
+            // que changer de destination ci-dessus.
+            state.transfer.color = transferColorSel.value || null;
+            state.transfer.group_ref = null;
+            state.transfer.group_count = 0;
             _showTransferSuggestionsView();
             _loadTransferSuggestions();
         });

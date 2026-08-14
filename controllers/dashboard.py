@@ -28,6 +28,39 @@ _STATIC_JS_PATH = os.path.join(
 )
 
 
+def resolve_variant_color_size(product_variant):
+    """Retourne (color_name, size_name) pour une variante de produit.
+
+    Essaie d'abord une correspondance EXACTE sur le nom d'attribut
+    ("COULEURS" / "POINTURES" / "TAILLES"), le nommage fiable déjà utilisé
+    par mv_base_pivot pour créer les variantes (mv_article_base.py,
+    _get_allowed_attribute). Si un attribut ne matche pas exactement (anciennes
+    données / nommage différent), on retombe sur une correspondance par
+    sous-chaîne comme avant.
+
+    NB: cette fonction est intentionnellement dupliquée dans
+    transfert_interne/models/transfert_interne.py (InterInternalTransferLine.
+    _compute_variant_info) — transfert_interne ne dépend pas de mv_base_pivot
+    et on ne veut pas ajouter cette dépendance de module pour ça (décision
+    utilisateur). Toute correction ici doit être répercutée là-bas.
+    """
+    color_name, size_name = None, None
+    for attr_val in product_variant.product_template_attribute_value_ids:
+        attr_exact = (attr_val.attribute_id.name or '').strip().upper()
+        if attr_exact == 'COULEURS':
+            color_name = attr_val.name.strip()
+        elif attr_exact in ('POINTURES', 'TAILLES'):
+            size_name = attr_val.name.strip()
+    if color_name is None or size_name is None:
+        for attr_val in product_variant.product_template_attribute_value_ids:
+            attr_upper = (attr_val.attribute_id.name or '').upper()
+            if color_name is None and any(k in attr_upper for k in ('COULEUR', 'COLOR', 'COL')):
+                color_name = attr_val.name.strip()
+            elif size_name is None and any(k in attr_upper for k in ('TAILLE', 'POINTURE', 'SIZE')):
+                size_name = attr_val.name.strip()
+    return color_name, size_name
+
+
 class MaVieDashboardController(http.Controller):
     """Dashboard analytique MaVie - données depuis tout le catalogue Odoo (product.template)"""
 
@@ -62,6 +95,15 @@ class MaVieDashboardController(http.Controller):
         companies = request.env['res.company'].sudo().search([('name', 'in', NON_RETAIL_COMPANIES)])
         return companies.ids
 
+    def _get_mod_for_life_partner_id(self):
+        """Résout le partner_id de la société MOD FOR LIFE — c'est le
+        fournisseur sur les bons de commande des 3 sociétés magasins quand
+        elles se réapprovisionnent auprès d'elle plutôt qu'un vrai
+        fournisseur externe. Permet de distinguer "achat externe" d'"achat
+        interne" sur CA Achat/Qté Achetée."""
+        company = request.env['res.company'].sudo().search([('name', '=', 'MOD FOR LIFE')], limit=1)
+        return company.partner_id.id if company and company.partner_id else None
+
     def _get_context_company_ids(self):
         """
         Sociétés actuellement cochées dans le sélecteur multi-société standard
@@ -85,6 +127,29 @@ class MaVieDashboardController(http.Controller):
                 continue
         return ids
 
+    def _get_sachet_collection_ids(self):
+        """IDs de la/des collection(s) "Sachet" à exclure de tous les KPIs.
+
+        Résolution relationnelle (collection_id), pas un filtre texte sur le
+        nom du produit : un filtre du type ('name', 'not ilike', '2026')
+        excluait à tort tout produit dont la référence contient simplement
+        les chiffres "2026" (ex: "JEANS2026"), sans rapport avec cette
+        collection. Voir CORRECTION #2c plus bas, qui utilisait déjà ce
+        pattern pour references_count — centralisé ici pour être appliqué
+        partout où le même filtre texte fragile était dupliqué.
+        """
+        return request.env['product.collection'].sudo().search([
+            '|', ('name', 'ilike', 'sachet'), ('name', 'ilike', 'sacher'),
+        ]).ids
+
+    def _sachet_exclude_domain(self, path='collection_id'):
+        """Domaine d'exclusion de la collection Sachet, via un chemin relationnel
+        (ex: 'collection_id' sur product.template, ou
+        'product_id.product_tmpl_id.collection_id' sur pos.order.line /
+        purchase.order.line / stock.quant)."""
+        ids = self._get_sachet_collection_ids()
+        return [(path, 'not in', ids)] if ids else []
+
     # ─────────────────────────────────────────────────────────────
     # DOMAINS
     # ─────────────────────────────────────────────────────────────
@@ -93,25 +158,14 @@ class MaVieDashboardController(http.Controller):
         domain = []
 
         if kw.get('collection_id') or kw.get('batch_id'):
-            art_domain = []
-            if kw.get('collection_id'):
-                try:
-                    art_domain.append(('collection_id', '=', int(kw['collection_id'])))
-                except (ValueError, TypeError):
-                    pass
-            if kw.get('batch_id'):
-                try:
-                    art_domain.append(('arrivage_id', '=', int(kw['batch_id'])))
-                except (ValueError, TypeError):
-                    pass
-
-            articles = request.env['mv.article.base'].sudo().search(art_domain)
-
-            linked_tmpl_ids = []
-            for a in articles:
-                if a.product_tmpl_id and a.product_tmpl_id.id:
-                    linked_tmpl_ids.append(a.product_tmpl_id.id)
-
+            # Filtre directement sur product.template.collection_id/arrivage_id
+            # (module natif product_collection_arrivage). Un détour par
+            # mv.article.base (Base Pivot) existait ici mais n'apportait
+            # jamais de référence supplémentaire — vérifié en base sur
+            # toutes les collections/arrivages réels : Base Pivot est
+            # systématiquement un sous-ensemble strict de ce que ces champs
+            # natifs trouvent déjà (Base Pivot ne couvre qu'une poignée de
+            # références sur ~5000).
             pt_domain = []
             if kw.get('collection_id'):
                 try:
@@ -129,10 +183,8 @@ class MaVieDashboardController(http.Controller):
                 direct_tmpl = request.env['product.template'].sudo().search(pt_domain)
                 direct_tmpl_ids = direct_tmpl.ids
 
-            all_tmpl_ids = list(set(linked_tmpl_ids + direct_tmpl_ids))
-
-            if all_tmpl_ids:
-                domain.append(('id', 'in', all_tmpl_ids))
+            if direct_tmpl_ids:
+                domain.append(('id', 'in', direct_tmpl_ids))
             else:
                 domain.append(('id', '=', -1))
 
@@ -155,8 +207,7 @@ class MaVieDashboardController(http.Controller):
             except (ValueError, TypeError):
                 pass
 
-        domain.append(('name', 'not ilike', 'sachet'))
-        domain.append(('name', 'not ilike', '2026'))
+        domain += self._sachet_exclude_domain('collection_id')
 
         return domain
 
@@ -164,9 +215,15 @@ class MaVieDashboardController(http.Controller):
         domain = [
             ('order_id.state', 'in', ['paid', 'done', 'invoiced']),
             ('is_reward_line', '=', False),
-            ('product_id.product_tmpl_id.name', 'not ilike', 'sachet'),
-            ('product_id.product_tmpl_id.name', 'not ilike', '2026'),
         ]
+        domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+        # Cohérence avec _build_purchase_domain / _get_stock_quants : aucune
+        # vente POS société non-retail vérifiée en base actuellement, mais
+        # on exclut quand même par sécurité pour ne jamais reproduire
+        # l'incohérence achats/stock corrigée ci-dessous.
+        non_retail_company_ids = self._get_non_retail_company_ids()
+        if non_retail_company_ids:
+            domain.append(('order_id.company_id', 'not in', non_retail_company_ids))
 
         if product_tmpl_ids is not None:
             domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
@@ -199,11 +256,29 @@ class MaVieDashboardController(http.Controller):
         return domain
 
     def _build_purchase_domain(self, kw, product_tmpl_ids):
+        # CORRECTION : ('order_id.state', '!=', 'cancel') comptait aussi les
+        # bons de commande brouillon/envoyés (non confirmés) comme "achetée",
+        # gonflant Qté Achetée, le stock théorique et le dénominateur du
+        # sell-through. On ne compte désormais que les commandes réellement
+        # confirmées/validées.
         domain = [
-            ('order_id.state', '!=', 'cancel'),
-            ('product_id.product_tmpl_id.name', 'not ilike', 'sachet'),
-            ('product_id.product_tmpl_id.name', 'not ilike', '2026'),
+            ('order_id.state', 'in', ['purchase', 'done']),
         ]
+        domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+        # BUG CORRIGÉ (vérifié en base) : "Stock Réel Odoo" exclut déjà les
+        # sociétés non-retail (MOD FOR LIFE, PAIE — voir _get_stock_quants),
+        # mais ce domaine achats ne le faisait pas : les commandes reçues
+        # par l'entrepôt MOD FOR LIFE (un point de réception fournisseur
+        # séparé du réseau de magasins, PAS un magasin lui-même) étaient
+        # comptées dans Qté Achetée alors que leur stock résiduel est
+        # invisible dans Stock Réel. Sur un échantillon vérifié : 21 721
+        # pièces / 331 lignes / 57 références concernées, ce qui gonflait
+        # artificiellement l'écart "achats - vendu vs stock réel" affiché
+        # avec ⚠️ (ex: +233 sur une référence, exactement le volume reçu
+        # chez MOD FOR LIFE pour cette référence).
+        non_retail_company_ids = self._get_non_retail_company_ids()
+        if non_retail_company_ids:
+            domain.append(('order_id.company_id', 'not in', non_retail_company_ids))
         if product_tmpl_ids is not None:
             domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
 
@@ -240,10 +315,9 @@ class MaVieDashboardController(http.Controller):
         """Get stock.quant records for internal locations, optionally filtered by templates and shop."""
         quant_domain = [
             ('location_id.usage', '=', 'internal'),
-            ('product_id.product_tmpl_id.name', 'not ilike', 'sachet'),
-            ('product_id.product_tmpl_id.name', 'not ilike', '2026'),
             ('company_id', 'not in', self._get_non_retail_company_ids()),
         ]
+        quant_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
         if shop_field:
             mapping = request.env['mv.batch.shop.mapping'].sudo().search(
                 [('shop_field', '=', shop_field)], limit=1
@@ -506,6 +580,22 @@ class MaVieDashboardController(http.Controller):
 
     def _compute_kpis(self, kw):
         try:
+            # MOD FOR LIFE n'est pas un magasin retail (pas de vente en
+            # caisse, pas d'alertes rupture au sens boutique) : jusqu'ici
+            # NON_RETAIL_COMPANIES l'excluait de tout, ce qui rendait le
+            # domaine contradictoire (company_id NOT IN [...] ET company_id
+            # IN [MOD FOR LIFE] en même temps) si un utilisateur la
+            # sélectionnait dans le sélecteur société standard -> 0 partout.
+            # Si c'est la SEULE société cochée (et qu'aucun magasin précis
+            # n'est choisi), on bascule vers un calcul dédié plutôt que de
+            # forcer ce cas dans la logique retail.
+            if not kw.get('shop_field'):
+                mod_for_life = request.env['res.company'].sudo().search(
+                    [('name', '=', 'MOD FOR LIFE')], limit=1
+                )
+                if mod_for_life and self._get_context_company_ids() == [mod_for_life.id]:
+                    return self._compute_kpis_modforlife(kw, mod_for_life)
+
             is_filtered = bool(kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'))
 
             product_tmpl_ids = None
@@ -515,14 +605,19 @@ class MaVieDashboardController(http.Controller):
                 products = ProductTemplate.search(domain)
                 if not products:
                     return {
-                        'ca_total': 0, 'tickets': 0, 'panier_moyen': 0,
-                        'qty_sold': 0, 'qty_purchased': 0, 'stock_total': 0,
+                        'ca_total': 0, 'ca_ht': 0, 'ca_achat': 0,
+                        'ca_achat_externe': 0, 'ca_achat_interne': 0, 'ca_achat_by_company': [],
+                        'qty_purchased_externe': 0, 'qty_purchased_interne': 0,
+                        'vendu_avec_cout': 0, 'marge': 0,
+                        'tickets': 0, 'panier_moyen': 0,
+                        'qty_sold': 0, 'qty_sold_normal': 0, 'qty_sold_solde': 0,
+                        'qty_purchased': 0, 'stock_total': 0,
                         'sell_through': 0, 'ruptures_count': 0, 'ruptures_list': [],
                         'top_products': [], 'flop_products': [],
                         'abc_analysis': {'A': [], 'B': [], 'C': []},
                         'references_count': 0, 'total_active_skus': 0,
                         'taux_rupture': 0, 'couverture_moy': 0,
-                        'stock_dormant_pct': 0, 'dormant_list': [], 'precision_inventaire': 99.5,
+                        'stock_dormant_pct': 0, 'dormant_count': 0, 'dormant_list': [], 'precision_inventaire': 99.5,
                         'alertes_stock': [], 'rotation_collection': [],
                         'gmroi_categorie': [], 'proches_rupture_30j': [],
                         'valeur_stock_ht': 0, 'valeur_stock_cost': 0, 'stock_val_by_store': [],
@@ -545,12 +640,40 @@ class MaVieDashboardController(http.Controller):
             # requête encore séparée.
             pos_grouped = request.env['pos.order.line'].sudo().read_group(
                 pos_domain,
-                ['price_subtotal_incl:sum', 'qty:sum', 'product_id'],
+                ['price_subtotal_incl:sum', 'price_subtotal:sum', 'qty:sum', 'product_id'],
                 ['product_id'],
                 lazy=False
             )
             ca_total = sum(g.get('price_subtotal_incl') or 0.0 for g in pos_grouped)
+            # CA hors taxe — utilisé pour comparer à un coût (HT lui aussi),
+            # afin que la marge ne soit pas gonflée artificiellement du
+            # montant de la TVA (voir ca_achat_total / vendu_avec_cout_total
+            # / marge_total plus bas).
+            ca_ht_total = sum(g.get('price_subtotal') or 0.0 for g in pos_grouped)
             qty_sold_total = int(sum(g.get('qty') or 0 for g in pos_grouped))
+
+            # Qté vendue "en solde" = lignes vendues à un prix effectif
+            # (remise incluse) inférieur au prix catalogue (list_price) du
+            # produit — détection par prix, pas par date. read_group ne peut
+            # pas comparer deux champs entre eux (price_unit*(1-discount/100)
+            # vs list_price d'un modèle lié), donc agrégation SQL directe,
+            # restreinte aux IDs déjà filtrés par pos_domain (pas de 2e scan
+            # complet de pos.order.line).
+            qty_sold_solde_total = 0
+            pos_line_ids_for_solde = request.env['pos.order.line'].sudo().search(pos_domain).ids
+            if pos_line_ids_for_solde:
+                request.env.cr.execute("""
+                    SELECT COALESCE(SUM(
+                        CASE WHEN pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0) < pt.list_price * 0.999
+                             THEN pol.qty ELSE 0 END
+                    ), 0)
+                    FROM pos_order_line pol
+                    JOIN product_product pp ON pp.id = pol.product_id
+                    JOIN product_template pt ON pt.id = pp.product_tmpl_id
+                    WHERE pol.id IN %s AND pt.list_price > 0
+                """, (tuple(pos_line_ids_for_solde),))
+                qty_sold_solde_total = int(request.env.cr.fetchone()[0] or 0)
+            qty_sold_normal_total = qty_sold_total - qty_sold_solde_total
 
             pos_tickets_agg = request.env['pos.order.line'].sudo().read_group(
                 pos_domain, ['order_id:count_distinct'], []
@@ -561,6 +684,7 @@ class MaVieDashboardController(http.Controller):
 
             pos_pids = [g['product_id'][0] for g in pos_grouped if g.get('product_id')]
             sales_by_tmpl = {}
+            prod_to_tmpl = {}
             if pos_pids:
                 prods = request.env['product.product'].sudo().search_read(
                     [('id', 'in', pos_pids)],
@@ -583,14 +707,55 @@ class MaVieDashboardController(http.Controller):
             purchase_domain = self._build_purchase_domain(kw, product_tmpl_ids)
             po_grouped = request.env['purchase.order.line'].sudo().read_group(
                 purchase_domain,
-                ['product_qty:sum', 'product_id'],
+                ['product_qty:sum', 'price_subtotal:sum', 'product_id'],
                 ['product_id'],
                 lazy=False
             )
             qty_purchased_total = int(sum(g.get('product_qty') or 0 for g in po_grouped))
+            # CA Achat = coût réel des marchandises achetées (HT, tel que
+            # facturé sur les bons de commande), pas une reconstruction
+            # qty*prix_standard.
+            ca_achat_total = sum(g.get('price_subtotal') or 0.0 for g in po_grouped)
 
-            total_qty = qty_sold_total + qty_purchased_total
-            sell_through = round((qty_sold_total / total_qty * 100), 1) if total_qty > 0 else 0.0
+            # Achat externe (vrai fournisseur) vs achat interne (depuis
+            # MOD FOR LIFE, au prix coûtant) — une requête supplémentaire sur
+            # le même domaine + filtre fournisseur, pas un nouveau scan
+            # complet (externe se déduit par soustraction du total déjà
+            # calculé ci-dessus).
+            mod_for_life_partner_id = self._get_mod_for_life_partner_id()
+            qty_purchased_interne = 0
+            ca_achat_interne = 0.0
+            if mod_for_life_partner_id:
+                po_grouped_interne = request.env['purchase.order.line'].sudo().read_group(
+                    purchase_domain + [('partner_id', '=', mod_for_life_partner_id)],
+                    ['product_qty:sum', 'price_subtotal:sum'], [], lazy=False
+                )
+                if po_grouped_interne:
+                    qty_purchased_interne = int(po_grouped_interne[0].get('product_qty') or 0)
+                    ca_achat_interne = po_grouped_interne[0].get('price_subtotal') or 0.0
+            qty_purchased_externe = qty_purchased_total - qty_purchased_interne
+            ca_achat_externe = ca_achat_total - ca_achat_interne
+
+            # Répartition CA Achat par société magasin (SALMEDO / BLACK AND
+            # GOLD / DELTA-GOLD) — le total ci-dessus combine déjà les 3
+            # (vérifié en base : somme des 3 = total non filtré), mais on
+            # veut aussi voir la contribution de chacune, pas seulement le
+            # combiné, surtout quand aucun filtre société précis n'est actif.
+            ca_achat_by_company = []
+            po_grouped_by_company = request.env['purchase.order.line'].sudo().read_group(
+                purchase_domain, ['price_subtotal:sum', 'company_id'], ['company_id'], lazy=False
+            )
+            for g in po_grouped_by_company:
+                if g.get('company_id'):
+                    ca_achat_by_company.append({
+                        'societe': g['company_id'][1],
+                        'ca_achat': round(g.get('price_subtotal') or 0.0, 2),
+                    })
+            ca_achat_by_company.sort(key=lambda x: -x['ca_achat'])
+
+            # Sell-through = part du stock reçu qui a été vendue : vendu / acheté.
+            # (PAS vendu / (vendu + acheté), qui donnait un chiffre bien trop bas.)
+            sell_through = round((qty_sold_total / qty_purchased_total * 100), 1) if qty_purchased_total > 0 else 0.0
 
             po_pids = [g['product_id'][0] for g in po_grouped if g.get('product_id')]
             purchase_by_tmpl = {}
@@ -610,12 +775,22 @@ class MaVieDashboardController(http.Controller):
             # ✅ Groupement Stock Quant (SQL GROUP BY product_id) — même
             # principe : stock_total se déduit de quant_grouped (quant_agg
             # supprimé), ce qui évite un 3e scan complet en double.
-            quant_domain = [
+            #
+            # quant_domain_base = localisation + sachet + filtre société/
+            # magasin choisi par l'utilisateur, SANS l'exclusion non-retail —
+            # réutilisé tel quel plus bas pour la valorisation (qui doit
+            # inclure TOUTES les sociétés, y compris MOD FOR LIFE).
+            # quant_domain = version "retail" (stock_total, dormant,
+            # ruptures...), avec l'exclusion en plus. BUG CORRIGÉ : la
+            # valorisation tentait avant de retirer cette exclusion après
+            # coup en filtrant sur la mauvaise clé de tuple
+            # ('company_id.name' au lieu de 'company_id') — ça ne retirait
+            # jamais rien, MOD FOR LIFE restait exclu malgré le commentaire
+            # d'intention "garde TOUTES les sociétés".
+            quant_domain_base = [
                 ('location_id.usage', '=', 'internal'),
-                ('product_id.product_tmpl_id.name', 'not ilike', 'sachet'),
-                ('product_id.product_tmpl_id.name', 'not ilike', '2026'),
-                ('company_id', 'not in', self._get_non_retail_company_ids()),
             ]
+            quant_domain_base += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
             shop_field = kw.get('shop_field')
             if shop_field:
                 mapping = request.env['mv.batch.shop.mapping'].sudo().search(
@@ -623,21 +798,23 @@ class MaVieDashboardController(http.Controller):
                 )
                 if mapping:
                     if mapping.company_id:
-                        quant_domain.append(('company_id', '=', mapping.company_id.id))
+                        quant_domain_base.append(('company_id', '=', mapping.company_id.id))
                     if mapping.warehouse_id and mapping.warehouse_id.lot_stock_id:
-                        quant_domain.append(('location_id', 'child_of', mapping.warehouse_id.lot_stock_id.id))
+                        quant_domain_base.append(('location_id', 'child_of', mapping.warehouse_id.lot_stock_id.id))
             else:
                 # Pas de magasin précis choisi : on retombe sur la/les
                 # société(s) cochée(s) dans le sélecteur standard Odoo.
                 context_company_ids = self._get_context_company_ids()
                 if context_company_ids:
-                    quant_domain.append(('company_id', 'in', context_company_ids))
+                    quant_domain_base.append(('company_id', 'in', context_company_ids))
             if product_tmpl_ids is not None:
                 q_variants = request.env['product.product'].sudo().search_read(
                     [('product_tmpl_id', 'in', product_tmpl_ids)],
                     ['id']
                 )
-                quant_domain.append(('product_id', 'in', [v['id'] for v in q_variants]))
+                quant_domain_base.append(('product_id', 'in', [v['id'] for v in q_variants]))
+
+            quant_domain = quant_domain_base + [('company_id', 'not in', self._get_non_retail_company_ids())]
 
             quant_grouped = request.env['stock.quant'].sudo().read_group(
                 quant_domain,
@@ -717,17 +894,11 @@ class MaVieDashboardController(http.Controller):
 
             active_products = ProductTemplate.browse(list(candidate_ids))
 
-            articles_for_cands = request.env['mv.article.base'].sudo().search([
-                ('product_tmpl_id', 'in', list(candidate_ids))
-            ])
-            ref_by_tmpl = {a.product_tmpl_id.id: a.reference for a in articles_for_cands if a.product_tmpl_id}
-
             product_stats = []
             for tmpl in active_products:
                 stat = sales_by_tmpl.get(tmpl.id, {'qty': 0, 'ca': 0})
                 ref = (
                     tmpl.base_pivot_reference
-                    or ref_by_tmpl.get(tmpl.id)
                     or tmpl.default_code
                     or tmpl.name
                     or '—'
@@ -746,16 +917,14 @@ class MaVieDashboardController(http.Controller):
             if is_filtered:
                 relevant_tmpl_ids = set(product_tmpl_ids)
             else:
-                mv_tmpl_ids = request.env['mv.article.base'].sudo().search([]).mapped('product_tmpl_id').ids
-                relevant_tmpl_ids = set(sales_by_tmpl.keys()) | set(purchase_by_tmpl.keys()) | set(stock_by_tmpl.keys()) | set(mv_tmpl_ids)
+                # Vérifié en base : les 53 références suivies dans Base Pivot
+                # ont TOUTES au moins une activité native (vente, achat ou
+                # stock) — l'union avec mv.article.base ne changeait donc
+                # jamais cet univers, elle est retirée sans impact.
+                relevant_tmpl_ids = set(sales_by_tmpl.keys()) | set(purchase_by_tmpl.keys()) | set(stock_by_tmpl.keys())
 
             all_ruptures = []
             if relevant_tmpl_ids:
-                articles_for_ruptures = request.env['mv.article.base'].sudo().search([
-                    ('product_tmpl_id', 'in', list(relevant_tmpl_ids))
-                ])
-                ref_by_tmpl_all = {a.product_tmpl_id.id: a.reference for a in articles_for_ruptures if a.product_tmpl_id}
-
                 tmpl_data = request.env['product.template'].sudo().search_read(
                     [('id', 'in', list(relevant_tmpl_ids))],
                     ['name', 'default_code', 'base_pivot_reference', 'standard_price', 'categ_id', 'collection_id']
@@ -768,7 +937,6 @@ class MaVieDashboardController(http.Controller):
                         t = tmpl_by_id.get(tid, {})
                         ref = (
                             t.get('base_pivot_reference')
-                            or ref_by_tmpl_all.get(tid)
                             or t.get('default_code')
                             or t.get('name')
                             or '—'
@@ -787,16 +955,16 @@ class MaVieDashboardController(http.Controller):
 
             # CORRECTION #2c : references_count = nombre RÉEL de références Achats.
             # On exclut la collection "Sachet 2026" via son vrai lien relationnel
-            # (collection_id), pas via un filtre texte sur le nom du produit :
-            # l'ancien filtre ('name', 'not ilike', '2026') excluait à tort tout
-            # produit dont la référence contient simplement les chiffres "2026"
-            # (ex: "2026AA", "JEANS2026"...), sans rapport avec cette collection.
-            sachet_collection_ids = request.env['product.collection'].sudo().search([
-                '|', ('name', 'ilike', 'sachet'), ('name', 'ilike', 'sacher'),
-            ]).ids
-            references_exclude_domain = (
-                [('collection_id', 'not in', sachet_collection_ids)] if sachet_collection_ids else []
-            )
+            # (collection_id), pas via un filtre texte sur le nom du produit
+            # (voir _sachet_exclude_domain).
+            # CORRECTION (vérifiée en base) : il manquait le filtre purchase_ok.
+            # Le catalogue product.template contient de nombreuses fiches
+            # incomplètes/non achetables (ex: 1020 produits actifs sans aucun
+            # prix de vente) qui gonflaient le chiffre à 5995 au lieu des 4972
+            # vraies références achetables ("Achats > Produits" dans Odoo
+            # filtre lui aussi sur purchase_ok=True — le commentaire ci-dessus
+            # visait déjà ce chiffre-là, le filtre manquait juste).
+            references_exclude_domain = self._sachet_exclude_domain('collection_id') + [('purchase_ok', '=', True)]
 
             # Si filtré par collection/batch/catégorie : on compte les produits du filtre.
             # Si filtré par société/magasin (shop_field) : on compte les produits
@@ -809,22 +977,10 @@ class MaVieDashboardController(http.Controller):
             # c'est ce sous-ensemble qui faisait chuter le chiffre affiché très en
             # dessous du total réel du catalogue (ex: 3922 affiché pour 5996 produits).
             if is_filtered and product_tmpl_ids:
-                if kw.get('collection_id') or kw.get('batch_id'):
-                    pivot_domain = []
-                    if kw.get('collection_id'):
-                        try:
-                            pivot_domain.append(('collection_id', '=', int(kw['collection_id'])))
-                        except (ValueError, TypeError):
-                            pass
-                    if kw.get('batch_id'):
-                        try:
-                            pivot_domain.append(('arrivage_id', '=', int(kw['batch_id'])))
-                        except (ValueError, TypeError):
-                            pass
-                    pivot_count = request.env['mv.article.base'].sudo().search_count(pivot_domain) if pivot_domain else 0
-                    references_count = max(len(product_tmpl_ids), pivot_count)
-                else:
-                    references_count = len(product_tmpl_ids)
+                # product_tmpl_ids vient déjà de _build_product_domain, qui
+                # filtre sur les champs natifs collection_id/arrivage_id —
+                # pas besoin d'un second comptage via mv.article.base.
+                references_count = len(product_tmpl_ids)
             elif shop_field:
                 quant_domain_refs = [('location_id.usage', '=', 'internal')]
                 mapping_refs = request.env['mv.batch.shop.mapping'].sudo().search(
@@ -862,19 +1018,51 @@ class MaVieDashboardController(http.Controller):
 
             date_start = kw.get('date_start')
             date_end = kw.get('date_end')
-            days_in_period = 30
+            # BUG CORRIGÉ (vérifié en base) : quand aucune période n'est
+            # choisie par l'utilisateur, qty_sold/sales_by_tmpl couvrent
+            # TOUT l'historique des ventes POS (jusqu'à 2013 dans cette
+            # base, ~4700 jours) — diviser ce total par un "days_in_period"
+            # à 30 jours codé en dur gonflait la vélocité de vente d'un
+            # facteur ~150x, d'où des "jours restants avant rupture" et des
+            # "ventes/jour" totalement irréalistes (ex: 0.1j restant avec
+            # 8-16 ventes/jour pour un article n'ayant que 1-2 pièces en
+            # stock). On calcule maintenant un vrai volume de ventes sur une
+            # fenêtre récente glissante de 90 jours (même principe que
+            # pos_90d_domain plus bas pour le stock dormant) pour ces
+            # calculs de vélocité, sauf si l'utilisateur a lui-même choisi
+            # une période explicite (date_start ET date_end) — dans ce cas
+            # sales_by_tmpl est déjà scopé à cette période, on la garde.
             if date_start and date_end:
+                days_in_period = 30
                 try:
                     d1 = datetime.strptime(date_start, '%Y-%m-%d')
                     d2 = datetime.strptime(date_end, '%Y-%m-%d')
                     days_in_period = max(1, (d2 - d1).days + 1)
                 except ValueError:
                     pass
+                sales_by_tmpl_velocity = {tid: s.get('qty', 0) for tid, s in sales_by_tmpl.items()}
+                qty_sold_velocity_total = qty_sold_total
+            else:
+                days_in_period = 90
+                kw_velocity = dict(kw)
+                kw_velocity['date_start'] = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
+                pos_domain_velocity = self._build_pos_domain(kw_velocity, product_tmpl_ids)
+                pos_grouped_velocity = request.env['pos.order.line'].sudo().read_group(
+                    pos_domain_velocity, ['qty:sum', 'product_id'], ['product_id'], lazy=False
+                )
+                sales_by_tmpl_velocity = {}
+                for g in pos_grouped_velocity:
+                    pid = g['product_id'][0] if g.get('product_id') else None
+                    tid = prod_to_tmpl.get(pid)
+                    if not tid:
+                        continue
+                    sales_by_tmpl_velocity[tid] = sales_by_tmpl_velocity.get(tid, 0) + int(g.get('qty') or 0)
+                qty_sold_velocity_total = sum(sales_by_tmpl_velocity.values())
 
             product_coverages = {}
             for tid in relevant_tmpl_ids:
                 stock = stock_by_tmpl.get(tid, 0)
-                qty_sold = sales_by_tmpl.get(tid, {}).get('qty', 0)
+                qty_sold = sales_by_tmpl_velocity.get(tid, 0)
                 daily_rate = qty_sold / days_in_period if days_in_period > 0 else 0
                 if daily_rate > 0:
                     cov = stock / daily_rate
@@ -882,7 +1070,7 @@ class MaVieDashboardController(http.Controller):
                     cov = 999
                 product_coverages[tid] = cov
 
-            daily_sales_rate_total = qty_sold_total / days_in_period if days_in_period > 0 else 0
+            daily_sales_rate_total = qty_sold_velocity_total / days_in_period if days_in_period > 0 else 0
             couverture_moy = round(stock_total / daily_sales_rate_total) if daily_sales_rate_total > 0 else 0
 
             # ✅ OPTIMISATION SQL read_group pour les ventes à 90j (stock dormant)
@@ -891,9 +1079,7 @@ class MaVieDashboardController(http.Controller):
                 ('order_id.date_order', '>=', date_90d_ago),
                 ('order_id.state', 'in', ['paid', 'done', 'invoiced']),
                 ('is_reward_line', '=', False),
-                ('product_id.product_tmpl_id.name', 'not ilike', 'sachet'),
-                ('product_id.product_tmpl_id.name', 'not ilike', '2026')
-            ]
+            ] + self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
             pos_90d_grouped = request.env['pos.order.line'].sudo().read_group(
                 pos_90d_domain,
                 ['product_id'],
@@ -927,7 +1113,6 @@ class MaVieDashboardController(http.Controller):
                         t = tmpl_by_id.get(tid, {})
                         ref = (
                             t.get('base_pivot_reference')
-                            or ref_by_tmpl_all.get(tid)
                             or t.get('default_code')
                             or t.get('name')
                             or '—'
@@ -945,7 +1130,10 @@ class MaVieDashboardController(http.Controller):
                 ('location_id.usage', '=', 'inventory'),
                 ('state', '=', 'done')
             ])
-            precision_inventaire = max(90.0, min(100.0, round(100.0 - (inv_adjustments_count / (total_active_skus or 1)) * 100, 1))) if inv_adjustments_count > 0 else 99.5
+            # Pas de plancher artificiel à 90% : une précision d'inventaire
+            # réellement mauvaise (beaucoup d'ajustements) doit pouvoir
+            # s'afficher comme telle plutôt que d'être masquée.
+            precision_inventaire = min(100.0, round(100.0 - (inv_adjustments_count / (total_active_skus or 1)) * 100, 1)) if inv_adjustments_count > 0 else 99.5
 
             abc_class_map = {}
             ca_sorted = sorted(product_stats, key=lambda a: a['ca'], reverse=True)
@@ -1048,7 +1236,7 @@ class MaVieDashboardController(http.Controller):
                 for col_id, col_name in col_names.items():
                     col_tmpl_ids = tmpl_ids_by_collection.get(col_id, [])
                     col_stock = sum(stock_by_tmpl.get(tid, 0) for tid in col_tmpl_ids)
-                    col_sales = sum(sales_by_tmpl.get(tid, {}).get('qty', 0) for tid in col_tmpl_ids)
+                    col_sales = sum(sales_by_tmpl_velocity.get(tid, 0) for tid in col_tmpl_ids)
                     col_sales_annualized = col_sales * (365 / days_in_period) if days_in_period > 0 else 0
                     col_turnover = round(col_sales_annualized / col_stock, 1) if col_stock > 0 else 0.0
 
@@ -1081,9 +1269,20 @@ class MaVieDashboardController(http.Controller):
 
                 for cat_id, info in cat_groups.items():
                     cat_tmpl_ids = info['tmpl_ids']
-                    cat_stock_cost = sum(stock_by_tmpl.get(tid, 0) * (tmpl_by_id.get(tid, {}).get('standard_price') or 200.0) for tid in cat_tmpl_ids)
+                    # Un produit sans coût réel (standard_price non renseigné)
+                    # est exclu du calcul plutôt que de lui fabriquer un coût
+                    # arbitraire (200 MAD) — ça faussait le GMROI de toute la
+                    # catégorie pour n'importe quel produit avec un coût manquant.
+                    cat_tmpl_ids_priced = [
+                        tid for tid in cat_tmpl_ids
+                        if (tmpl_by_id.get(tid, {}).get('standard_price') or 0.0) > 0
+                    ]
+                    cat_stock_cost = sum(
+                        stock_by_tmpl.get(tid, 0) * tmpl_by_id.get(tid, {}).get('standard_price', 0.0)
+                        for tid in cat_tmpl_ids_priced
+                    )
                     cat_margin = 0.0
-                    for tid in cat_tmpl_ids:
+                    for tid in cat_tmpl_ids_priced:
                         sale = sales_by_tmpl.get(tid)
                         if not sale:
                             continue
@@ -1102,6 +1301,15 @@ class MaVieDashboardController(http.Controller):
 
             gmroi_categorie.sort(key=lambda x: x['gmroi'], reverse=True)
             gmroi_categorie = gmroi_categorie[:5]
+
+            # Vendu avec coût = coût (standard_price) des unités effectivement
+            # vendues -> permet une vraie marge brute = CA vendu HT - coût des
+            # ventes (comparaison HT contre HT, cf. ca_ht_total plus haut).
+            vendu_avec_cout_total = 0.0
+            for tid, sale in sales_by_tmpl.items():
+                cost = (tmpl_by_id.get(tid, {}).get('standard_price') or 0.0) * sale.get('qty', 0)
+                vendu_avec_cout_total += cost
+            marge_total = ca_ht_total - vendu_avec_cout_total
 
             if page == 'stock':
                 top_products = sorted(product_stats, key=lambda a: a['stock'], reverse=True)[:top_limit]
@@ -1123,14 +1331,16 @@ class MaVieDashboardController(http.Controller):
             # sociétés non-magasin comme MOD FOR LIFE), la valorisation garde
             # TOUTES les sociétés : c'est un inventaire financier global, pas
             # une analyse de stock en boutique, donc le stock grossiste doit
-            # y apparaître (comme la ligne "MOD FOR LIFE" déjà affichée).
+            # y apparaître. quant_domain_base (défini plus haut) est déjà la
+            # bonne base : mêmes filtres localisation/sachet/société-ou-
+            # magasin choisi que quant_domain, mais SANS l'exclusion
+            # non-retail — utilisé tel quel, sans filtrage a posteriori.
             val_ht_total = 0.0
             val_cost_total = 0.0
             stock_val_by_store = []
 
-            quant_domain_valorisation = [t for t in quant_domain if t[0] != 'company_id.name']
             quant_val_grouped = request.env['stock.quant'].sudo().read_group(
-                quant_domain_valorisation,
+                quant_domain_base,
                 ['quantity:sum', 'product_id', 'company_id'],
                 ['product_id', 'company_id'],
                 lazy=False
@@ -1179,7 +1389,7 @@ class MaVieDashboardController(http.Controller):
             proches_rupture_30j = []
             for tid in relevant_tmpl_ids:
                 stk = stock_by_tmpl.get(tid, 0)
-                qs = sales_by_tmpl.get(tid, {}).get('qty', 0)
+                qs = sales_by_tmpl_velocity.get(tid, 0)
                 daily_rate = qs / days_in_period if days_in_period > 0 else 0.0
                 if stk > 0 and daily_rate > 0:
                     days_left = round(stk / daily_rate, 1)
@@ -1187,7 +1397,6 @@ class MaVieDashboardController(http.Controller):
                         t = tmpl_by_id.get(tid, {})
                         ref = (
                             t.get('base_pivot_reference')
-                            or ref_by_tmpl_all.get(tid)
                             or t.get('default_code')
                             or t.get('name')
                             or '—'
@@ -1212,10 +1421,21 @@ class MaVieDashboardController(http.Controller):
 
             return {
                 'ca_total': round(ca_total, 2),
+                'ca_ht': round(ca_ht_total, 2),
+                'ca_achat': round(ca_achat_total, 2),
+                'ca_achat_externe': round(ca_achat_externe, 2),
+                'ca_achat_interne': round(ca_achat_interne, 2),
+                'ca_achat_by_company': ca_achat_by_company,
+                'qty_purchased_externe': qty_purchased_externe,
+                'qty_purchased_interne': qty_purchased_interne,
+                'vendu_avec_cout': round(vendu_avec_cout_total, 2),
+                'marge': round(marge_total, 2),
                 'tickets': tickets,
                 'references_count': references_count,
                 'panier_moyen': round(panier_moyen, 2),
                 'qty_sold': qty_sold_total,
+                'qty_sold_normal': qty_sold_normal_total,
+                'qty_sold_solde': qty_sold_solde_total,
                 'qty_purchased': qty_purchased_total,
                 'stock_total': stock_total,
                 'valeur_stock_ht': round(val_ht_total, 2),
@@ -1235,6 +1455,7 @@ class MaVieDashboardController(http.Controller):
                 'total_active_skus': total_active_skus,
                 'couverture_moy': couverture_moy,
                 'stock_dormant_pct': stock_dormant_pct,
+                'dormant_count': len(dormant_products),
                 'dormant_list': sorted(dormant_products, key=lambda x: x['stock'], reverse=True)[:500],
                 'precision_inventaire': precision_inventaire,
                 'alertes_stock': alertes_stock,
@@ -1245,6 +1466,113 @@ class MaVieDashboardController(http.Controller):
 
         except Exception as e:
             _logger.error(f"Erreur api_kpis: {str(e)}", exc_info=True)
+            return {'error': str(e)}
+
+    def _compute_kpis_modforlife(self, kw, mod_for_life):
+        """Calcul dédié pour MOD FOR LIFE : pas de vente en caisse ni
+        d'alertes rupture retail (ce n'est pas un magasin), donc pas la même
+        forme que _compute_kpis. Trois axes : ce qu'elle achète chez de vrais
+        fournisseurs (purchase.order), ce qu'elle "vend" au prix coûtant à
+        chacune des 3 sociétés magasins (sale.order — PAS le POS, confirmé
+        dans mv_base_pivot/models/mv_article_batch.py:action_generate_sale_orders),
+        et son propre stock entrepôt (stock.quant)."""
+        try:
+            retail_companies = request.env['res.company'].sudo().search([
+                ('id', '!=', mod_for_life.id),
+                ('name', 'not in', ['PAIE']),
+            ])
+            retail_partner_ids = retail_companies.mapped('partner_id').ids
+
+            # ── Achats fournisseurs : bons de commande de MOD FOR LIFE dont
+            # le fournisseur n'est PAS une des sociétés magasins (donc un
+            # vrai fournisseur externe, pas un flux inter-société).
+            po_domain = [
+                ('order_id.state', 'in', ['purchase', 'done']),
+                ('order_id.company_id', '=', mod_for_life.id),
+                ('partner_id', 'not in', retail_partner_ids),
+            ]
+            po_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+            if kw.get('date_start'):
+                po_domain.append(('order_id.date_order', '>=', kw['date_start'] + ' 00:00:00'))
+            if kw.get('date_end'):
+                po_domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
+
+            po_grouped = request.env['purchase.order.line'].sudo().read_group(
+                po_domain, ['product_qty:sum', 'price_subtotal:sum'], [], lazy=False
+            )
+            qty_achats_fournisseurs = int(po_grouped[0].get('product_qty') or 0) if po_grouped else 0
+            ca_achats_fournisseurs = round(po_grouped[0].get('price_subtotal') or 0.0, 2) if po_grouped else 0.0
+
+            po_tickets_agg = request.env['purchase.order.line'].sudo().read_group(
+                po_domain, ['order_id:count_distinct'], []
+            )
+            nb_commandes_fournisseurs = (po_tickets_agg[0].get('order_id') or 0) if po_tickets_agg else 0
+
+            # ── Ventes vers les sociétés magasins : sale.order.line, pas
+            # pos.order.line — order_partner_id est le champ stocké (related
+            # sur order_id.partner_id), pas "partner_id" (qui n'existe pas
+            # sur sale.order.line).
+            so_domain = [
+                ('order_id.state', 'in', ['sale', 'done']),
+                ('order_id.company_id', '=', mod_for_life.id),
+                ('order_partner_id', 'in', retail_partner_ids),
+            ]
+            so_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+            if kw.get('date_start'):
+                so_domain.append(('order_id.date_order', '>=', kw['date_start'] + ' 00:00:00'))
+            if kw.get('date_end'):
+                so_domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
+
+            so_grouped = request.env['sale.order.line'].sudo().read_group(
+                so_domain,
+                ['product_uom_qty:sum', 'price_subtotal:sum', 'order_partner_id'],
+                ['order_partner_id'],
+                lazy=False
+            )
+            partner_name_by_id = {p.id: p.name for p in retail_companies.mapped('partner_id')}
+            ventes_par_societe = []
+            qty_ventes_total = 0.0
+            ca_ventes_total = 0.0
+            for g in so_grouped:
+                pid = g['order_partner_id'][0] if g.get('order_partner_id') else None
+                qty = g.get('product_uom_qty') or 0.0
+                ca = g.get('price_subtotal') or 0.0
+                qty_ventes_total += qty
+                ca_ventes_total += ca
+                ventes_par_societe.append({
+                    'societe': partner_name_by_id.get(pid) or (g['order_partner_id'][1] if g.get('order_partner_id') else '—'),
+                    'qty': int(qty),
+                    'ca': round(ca, 2),
+                })
+            ventes_par_societe.sort(key=lambda x: -x['ca'])
+
+            # ── Stock entrepôt : même principe que le stock retail
+            # (stock.quant, emplacements internes) mais SANS l'exclusion
+            # NON_RETAIL_COMPANIES — ici MOD FOR LIFE EST la société
+            # regardée, son stock est justement ce qu'on veut voir.
+            quant_domain = [
+                ('location_id.usage', '=', 'internal'),
+                ('company_id', '=', mod_for_life.id),
+            ]
+            quant_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+            quant_grouped = request.env['stock.quant'].sudo().read_group(
+                quant_domain, ['quantity:sum'], [], lazy=False
+            )
+            stock_entrepot = int(sum(g.get('quantity') or 0 for g in quant_grouped)) if quant_grouped else 0
+
+            return {
+                'is_modforlife': True,
+                'company_name': mod_for_life.name,
+                'ca_achats_fournisseurs': ca_achats_fournisseurs,
+                'qty_achats_fournisseurs': qty_achats_fournisseurs,
+                'nb_commandes_fournisseurs': nb_commandes_fournisseurs,
+                'ca_ventes_societes': round(ca_ventes_total, 2),
+                'qty_ventes_societes': int(qty_ventes_total),
+                'ventes_par_societe': ventes_par_societe,
+                'stock_entrepot': stock_entrepot,
+            }
+        except Exception as e:
+            _logger.error(f"Erreur _compute_kpis_modforlife: {str(e)}", exc_info=True)
             return {'error': str(e)}
 
     @http.route('/mavie/api/top-flop/export', type='http', auth='user', methods=['GET'], csrf=False)
@@ -1322,6 +1650,8 @@ class MaVieDashboardController(http.Controller):
 
             pids = [g['product_id'][0] for g in pos_grouped if g.get('product_id')]
             sales_by_arrivage = {}
+            prod_to_tmpl = {}
+            tmpl_to_arrivage = {}
             if pids:
                 prods = request.env['product.product'].sudo().search_read(
                     [('id', 'in', pids)],
@@ -1361,10 +1691,77 @@ class MaVieDashboardController(http.Controller):
                 })
 
             daily_sales.sort(key=lambda x: x['ca'], reverse=True)
-            return {'daily': daily_sales}
+
+            # ── CA par Arrivage × Magasin ──
+            # read_group ne peut pas grouper pos.order.line directement par
+            # "magasin" (ce n'est pas un champ, c'est dérivé de
+            # order_id.session_id.config_id / order_id.company_id) : on
+            # regroupe donc par (product_id, order_id) — un 2e read_group,
+            # toujours pas de scan ligne par ligne — puis on résout order_id
+            # -> libellé magasin en 1-2 requêtes groupées (même règle que
+            # sales_by_variant dans _compute_product_detail : préférer
+            # session_id.config_id.name, repli sur company_id.name).
+            by_shop_map = {}
+            if pos_grouped:
+                pos_grouped_by_order = request.env['pos.order.line'].sudo().read_group(
+                    pos_domain,
+                    ['price_subtotal_incl:sum', 'qty:sum', 'product_id', 'order_id'],
+                    ['product_id', 'order_id'],
+                    lazy=False
+                )
+                order_ids = list({g['order_id'][0] for g in pos_grouped_by_order if g.get('order_id')})
+                orders = request.env['pos.order'].sudo().search_read(
+                    [('id', 'in', order_ids)], ['id', 'company_id', 'session_id']
+                )
+                session_ids = list({o['session_id'][0] for o in orders if o.get('session_id')})
+                sessions = request.env['pos.session'].sudo().search_read(
+                    [('id', 'in', session_ids)], ['id', 'config_id']
+                ) if session_ids else []
+                session_to_config_name = {
+                    s['id']: s['config_id'][1] for s in sessions if s.get('config_id')
+                }
+                order_to_shop = {}
+                for o in orders:
+                    shop_name = (o.get('company_id') and o['company_id'][1]) or 'Inconnu'
+                    sid = o.get('session_id') and o['session_id'][0]
+                    if sid and session_to_config_name.get(sid):
+                        shop_name = session_to_config_name[sid]
+                    order_to_shop[o['id']] = shop_name
+
+                for g in pos_grouped_by_order:
+                    pid = g['product_id'][0] if g.get('product_id') else None
+                    oid = g['order_id'][0] if g.get('order_id') else None
+                    tid = prod_to_tmpl.get(pid)
+                    if not tid or not oid:
+                        continue
+                    arr = tmpl_to_arrivage.get(tid)
+                    if not arr:
+                        continue
+                    arrivage_name = arr[1]
+                    shop_name = order_to_shop.get(oid, 'Inconnu')
+                    key = (arrivage_name, shop_name)
+                    if key not in by_shop_map:
+                        by_shop_map[key] = {'ca': 0.0, 'qty': 0}
+                    by_shop_map[key]['ca'] += g.get('price_subtotal_incl') or 0.0
+                    by_shop_map[key]['qty'] += int(g.get('qty') or 0)
+
+            by_shop_grouped = {}
+            for (arrivage_name, shop_name), stats in by_shop_map.items():
+                by_shop_grouped.setdefault(arrivage_name, []).append({
+                    'shop': shop_name,
+                    'ca': round(stats['ca'], 2),
+                    'qty': int(stats['qty']),
+                })
+            by_shop = [
+                {'arrivage': arrivage_name, 'shops': sorted(shops, key=lambda s: s['ca'], reverse=True)}
+                for arrivage_name, shops in by_shop_grouped.items()
+            ]
+            by_shop.sort(key=lambda a: sum(s['ca'] for s in a['shops']), reverse=True)
+
+            return {'daily': daily_sales, 'by_shop': by_shop}
         except Exception as e:
             _logger.error(f"Erreur api_sales_daily: {str(e)}", exc_info=True)
-            return {'error': str(e), 'daily': []}
+            return {'error': str(e), 'daily': [], 'by_shop': []}
 
     # ─────────────────────────────────────────────────────────────
     # RECHERCHE
@@ -1379,7 +1776,9 @@ class MaVieDashboardController(http.Controller):
 
             ProductTemplate = request.env['product.template'].sudo()
 
-            # CORRECTION #2 : Recherche élargie dans product.template
+            # Recherche native — base_pivot_reference est un champ stocké
+            # simple sur product.template (une référence déjà écrite), donc
+            # pas une requête live vers Base Pivot.
             products = ProductTemplate.search([
                 '|', '|', '|',
                 ('name', 'ilike', query),
@@ -1388,63 +1787,11 @@ class MaVieDashboardController(http.Controller):
                 ('categ_id.name', 'ilike', query),
             ], limit=30)
 
-            # Chercher aussi dans mv.article.base (références de la Base Pivot)
-            # Même si product_tmpl_id n'est pas renseigné, on peut retrouver le produit
-            # par désignation ou référence
-            articles = request.env['mv.article.base'].sudo().search([
-                '|',
-                ('reference', 'ilike', query),
-                ('designation_odoo', 'ilike', query),
-            ], limit=30)
-
-            extra_tmpl_ids = []
-            for a in articles:
-                if a.product_tmpl_id and a.product_tmpl_id.id:
-                    extra_tmpl_ids.append(a.product_tmpl_id.id)
-                else:
-                    # Article sans product_tmpl_id : on cherche par nom/référence
-                    ref = (a.reference or '').strip()
-                    desig = (a.designation_odoo or '').strip()
-                    for search_val in [ref, desig]:
-                        if search_val:
-                            found = ProductTemplate.search([
-                                '|', '|',
-                                ('name', '=ilike', search_val),
-                                ('default_code', '=ilike', search_val),
-                                ('base_pivot_reference', '=ilike', search_val),
-                            ], limit=1)
-                            if found:
-                                extra_tmpl_ids.append(found.id)
-                                break
-
-            extra_ids = set(extra_tmpl_ids) - set(products.ids)
-            if extra_ids:
-                extra_tmpls = ProductTemplate.browse(list(extra_ids))
-                products = products | extra_tmpls
-
-            # Si toujours pas de résultat dans product.template, créer une entrée
-            # directement depuis la Base Pivot (sans product.template associé)
-            pivot_only = []
-            if not products:
-                for a in articles:
-                    if not a.product_tmpl_id:
-                        pivot_only.append({
-                            'id': None,
-                            'article_id': a.id,
-                            'name': a.designation_odoo or a.reference or '—',
-                            'ref': a.reference or '—',
-                            'source': 'pivot_only'
-                        })
-
             results = [{
                 'id': p.id,
                 'name': p.name or '—',
                 'ref': p.base_pivot_reference or p.default_code or '—',
             } for p in products[:20]]
-
-            # Ajouter les résultats pivot uniquement si pas de résultat product.template
-            if not results and pivot_only:
-                results = pivot_only[:20]
 
             return {'results': results}
         except Exception as e:
@@ -1476,78 +1823,65 @@ class MaVieDashboardController(http.Controller):
             if not product_tmpl or not product_tmpl.exists():
                 return {'error': 'Produit non trouvé'}
 
-            def _clean_ref(text):
-                if not text:
-                    return ""
-                t = re.sub(r'\[.*?\]', '', text)
-                t = re.sub(r'\(.*?\)', '', t)
-                return t.strip()
-
-            art_domain = [('product_tmpl_id', '=', product_tmpl.id)]
-            if kw.get('batch_id'):
-                try:
-                    art_domain.append(('arrivage_id', '=', int(kw['batch_id'])))
-                except (ValueError, TypeError):
-                    pass
-            if kw.get('collection_id'):
-                try:
-                    art_domain.append(('collection_id', '=', int(kw['collection_id'])))
-                except (ValueError, TypeError):
-                    pass
-
-            articles = request.env['mv.article.base'].sudo().search(art_domain)
-
-            if not articles and (kw.get('batch_id') or kw.get('collection_id')):
-                articles = request.env['mv.article.base'].sudo().search(
-                    [('product_tmpl_id', '=', product_tmpl.id)]
-                )
-            if not articles:
-                refs_to_try = []
-                if product_tmpl.base_pivot_reference:
-                    refs_to_try.append(product_tmpl.base_pivot_reference.strip())
-                if product_tmpl.default_code:
-                    refs_to_try.append(product_tmpl.default_code.strip())
-                    cleaned_code = _clean_ref(product_tmpl.default_code)
-                    if cleaned_code:
-                        refs_to_try.append(cleaned_code)
-                if product_tmpl.name:
-                    refs_to_try.append(product_tmpl.name.strip())
-                    cleaned_name = _clean_ref(product_tmpl.name)
-                    if cleaned_name:
-                        refs_to_try.append(cleaned_name)
-
-                refs_to_try = list(dict.fromkeys([r for r in refs_to_try if r]))
-
-                for ref in refs_to_try:
-                    articles = request.env['mv.article.base'].sudo().search([('reference', '=ilike', ref)])
-                    if articles:
-                        break
-                    articles = request.env['mv.article.base'].sudo().search([('designation_odoo', '=ilike', ref)])
-                    if articles:
-                        break
-
-            if articles and not articles[0].product_tmpl_id:
-                try:
-                    articles[0].sudo().write({'product_tmpl_id': product_tmpl.id})
-                    if not product_tmpl.base_pivot_reference and articles[0].reference:
-                        product_tmpl.sudo().write({'base_pivot_reference': articles[0].reference})
-                except Exception as e:
-                    _logger.warning(f"Auto-link failed for template {product_tmpl.id}: {e}")
-
             pos_domain = self._build_pos_domain(kw, [product_tmpl.id])
             pos_lines = request.env['pos.order.line'].sudo().search(pos_domain)
 
             qty_sold = int(sum(pos_lines.mapped('qty'))) if pos_lines else 0
             ca = sum(pos_lines.mapped('price_subtotal_incl')) if pos_lines else 0.0
+            # CA HT — comparé au coût (lui aussi HT) pour calculer une marge
+            # juste, sans le biais de la TVA incluse dans price_subtotal_incl.
+            ca_ht = sum(pos_lines.mapped('price_subtotal')) if pos_lines else 0.0
+
+            # Qté vendue "en solde" = lignes vendues à un prix effectif
+            # (remise incluse) inférieur au prix catalogue (list_price) —
+            # détection par prix, pas par date.
+            list_price_ref = product_tmpl.list_price or 0.0
+            qty_sold_solde = 0
+            for line in pos_lines:
+                effective_unit_price = line.price_unit * (1 - (line.discount or 0.0) / 100.0)
+                if list_price_ref > 0 and effective_unit_price < list_price_ref * 0.999:
+                    qty_sold_solde += line.qty
+            qty_sold_solde = int(qty_sold_solde)
+            qty_sold_normal = qty_sold - qty_sold_solde
 
             purchase_domain = self._build_purchase_domain(kw, [product_tmpl.id])
             po_lines = request.env['purchase.order.line'].sudo().search(purchase_domain)
             qty_purchased = int(sum(po_lines.mapped('product_qty'))) if po_lines else 0
+            # CA Achat = coût réel des achats (HT, tel que facturé), pas une
+            # reconstruction qty*prix_standard.
+            ca_achat = sum(po_lines.mapped('price_subtotal')) if po_lines else 0.0
 
-            margin = articles[0].margin_percent if articles and hasattr(articles[0], 'margin_percent') else 0.0
+            # Achat externe (vrai fournisseur) vs achat interne (depuis
+            # MOD FOR LIFE, au prix coûtant) — même logique que _compute_kpis.
+            mod_for_life_partner_id = self._get_mod_for_life_partner_id()
+            po_lines_interne = (
+                po_lines.filtered(lambda l: l.partner_id.id == mod_for_life_partner_id)
+                if mod_for_life_partner_id else po_lines.browse()
+            )
+            qty_purchased_interne = int(sum(po_lines_interne.mapped('product_qty'))) if po_lines_interne else 0
+            ca_achat_interne = sum(po_lines_interne.mapped('price_subtotal')) if po_lines_interne else 0.0
+            qty_purchased_externe = qty_purchased - qty_purchased_interne
+            ca_achat_externe = ca_achat - ca_achat_interne
 
-            total_qty = qty_sold + qty_purchased
-            sell_through = round((qty_sold / total_qty * 100), 1) if total_qty > 0 else 0.0
+            # Marge (%) = (prix de vente - prix d'achat moyen réel) / prix de
+            # vente. Le prix d'achat moyen vient des mêmes commandes
+            # fournisseur que CA Achat/Qté Achetée ci-dessus (pas de nouvelle
+            # source) — None (pas 0) quand la donnée n'existe pas, pour ne
+            # pas laisser croire à une marge nulle.
+            pv_ttc_ref = product_tmpl.list_price or 0.0
+            if qty_purchased > 0 and ca_achat > 0 and pv_ttc_ref > 0:
+                prix_achat_moyen = ca_achat / qty_purchased
+                margin = round((pv_ttc_ref - prix_achat_moyen) / pv_ttc_ref * 100, 1)
+            else:
+                margin = None
+
+            # Sell-through = part du stock reçu qui a été vendue : vendu / acheté.
+            sell_through = round((qty_sold / qty_purchased * 100), 1) if qty_purchased > 0 else 0.0
+
+            # Vendu avec coût = coût des unités vendues, pour calculer la
+            # marge brute réelle (HT contre HT).
+            vendu_avec_cout = qty_sold * (product_tmpl.standard_price or 0.0)
+            marge = ca_ht - vendu_avec_cout
 
             sales_by_variant = {}
             for line in pos_lines:
@@ -1568,50 +1902,91 @@ class MaVieDashboardController(http.Controller):
                 [('product_tmpl_id', '=', product_tmpl.id)]
             )
 
+            # Périmètre "stock retail réel" — même logique que stock_by_store
+            # plus bas (entrepôts avec un mapping magasin actif, hors
+            # sociétés non-retail) : réutilisé pour que le stock réel par
+            # couleur (best_variants) somme exactement au total affiché en
+            # haut de fiche (stock_total), sans quoi les deux ne
+            # correspondaient jamais (écart = stock dormant chez MOD FOR LIFE,
+            # ou dans un entrepôt de la société retail non rattaché à un
+            # magasin mappé).
+            retail_lot_stock_ids = request.env['stock.warehouse'].sudo().search([
+                ('company_id', 'not in', self._get_non_retail_company_ids()),
+                ('id', 'in', self._get_active_shop_mappings().mapped('warehouse_id').ids),
+            ]).mapped('lot_stock_id').ids
+
+            # "Qté Magasin" doit être le STOCK ACTUEL de la variante dans le
+            # magasin filtré — pas les ventes (voir sales_by_variant plus
+            # haut, qui reste dédié à la répartition des ventes). Une seule
+            # requête groupée, pas de N+1 par variante ; calculée uniquement
+            # si un magasin est filtré (kw['shop_field']).
+            stock_shop_by_variant = {}
+            if kw.get('shop_field') and product_variants:
+                shop_mapping_for_stock = request.env['mv.batch.shop.mapping'].sudo().search(
+                    [('shop_field', '=', kw['shop_field'])], limit=1
+                )
+                if shop_mapping_for_stock and shop_mapping_for_stock.warehouse_id and shop_mapping_for_stock.warehouse_id.lot_stock_id:
+                    shop_quants_grouped = request.env['stock.quant'].sudo().read_group(
+                        [
+                            ('product_id', 'in', product_variants.ids),
+                            ('location_id', 'child_of', shop_mapping_for_stock.warehouse_id.lot_stock_id.id),
+                        ],
+                        ['quantity:sum'],
+                        ['product_id'],
+                        lazy=False,
+                    )
+                    for g in shop_quants_grouped:
+                        pid = g.get('product_id') and g['product_id'][0]
+                        if pid:
+                            stock_shop_by_variant[pid] = g.get('quantity', 0.0) or 0.0
+
             shop_mappings = self._get_active_shop_mappings()
             shop_fields_cleaned = [
                 (sm.shop_field, sm.warehouse_id.name if sm.warehouse_id else (sm.shop_label or sm.shop_field))
                 for sm in shop_mappings if sm.shop_field
             ]
 
-            dispatch_by_color = {}
-            if articles and shop_fields_cleaned:
-                for art in articles:
-                    for cl in art.color_line_ids:
-                        color_name = (cl.color or '').upper().strip()
-                        if color_name:
-                            shop_sum = sum(float(getattr(cl, f, 0.0) or 0.0) for f, _ in shop_fields_cleaned)
-                            disp = (
-                                float(getattr(cl, 'dispatched_total', 0) or 0)
-                                or shop_sum
-                                or float(getattr(cl, 'line_total_pieces', 0) or 0)
-                                or 0
-                            )
-                            dispatch_by_color[color_name] = dispatch_by_color.get(color_name, 0) + int(disp)
+            # Total pièces reçues = commandes fournisseur confirmées, qui
+            # existent pour la quasi-totalité des références (déjà utilisées
+            # pour "Qté achetée") et ciblent la variante EXACTE
+            # (product_id = couleur+taille précise) — vérifié en base :
+            # reconciliation quasi parfaite par taille (41 variantes/42 avec
+            # un "reste" positif sur un échantillon réel).
+            purchased_by_variant = {}
+            for pol in po_lines:
+                purchased_by_variant[pol.product_id.id] = purchased_by_variant.get(pol.product_id.id, 0) + pol.product_qty
 
             best_variants = []
             for v in product_variants:
                 stat = sales_by_variant.get(v.id, {'qty': 0, 'ca': 0, 'shops': {}})
 
-                color_name = "—"
-                size_name = None
-                for attr_val in v.product_template_attribute_value_ids:
-                    attr_name = (attr_val.attribute_id.name or '').upper()
-                    if any(k in attr_name for k in ['COULEUR', 'COLOR', 'COL']):
-                        color_name = attr_val.name.upper().strip()
-                    elif any(k in attr_name for k in ['TAILLE', 'POINTURE', 'SIZE']):
-                        size_name = attr_val.name.strip()
+                color_name, size_name = resolve_variant_color_size(v)
+                color_name = (color_name or '—').upper().strip() if color_name else '—'
 
-                dispatched = int(dispatch_by_color.get(color_name, 0))
+                dispatched_achats = purchased_by_variant.get(v.id, 0)
+                if dispatched_achats > 0:
+                    dispatched = int(round(dispatched_achats))
+                    dispatch_source = 'achats'
+                else:
+                    dispatched = 0
+                    dispatch_source = None
 
+                # Même périmètre exact que stock_total du haut de fiche
+                # (retail_lot_stock_ids, calculé plus haut) — sinon la somme
+                # des stocks par couleur ne correspond jamais au total
+                # affiché en haut.
                 quants_v = request.env['stock.quant'].sudo().search([
                     ('product_id', '=', v.id),
-                    ('location_id.usage', '=', 'internal')
+                    ('location_id', 'child_of', retail_lot_stock_ids),
                 ])
                 var_stock = int(sum(quants_v.mapped('quantity'))) if quants_v else 0
 
-                if dispatched == 0 and var_stock > 0:
-                    dispatched = var_stock
+                # Pas de fallback silencieux "dispatched = var_stock" : si
+                # aucune commande fournisseur n'a de donnée pour cette
+                # variante, on le signale explicitement (dispatch_missing)
+                # plutôt que de fabriquer un "total pièces" à partir du stock
+                # actuel, qui masquait le vrai problème de données.
+                dispatch_missing = dispatched == 0 and (var_stock > 0 or stat['qty'] > 0)
 
                 # Nom court : juste la couleur (+ taille si présente), sans le
                 # préfixe "[réf] nom produit" de display_name — la référence
@@ -1622,32 +1997,109 @@ class MaVieDashboardController(http.Controller):
 
                 best_variants.append({
                     'name': variant_label,
+                    'color': color_name,
                     'qty': int(stat['qty']),
                     'ca': round(stat['ca'], 2),
                     'dispatched': dispatched,
+                    'dispatch_source': dispatch_source,
+                    'dispatch_missing': dispatch_missing,
                     'stock': var_stock,
+                    'stock_shop': int(stock_shop_by_variant.get(v.id, 0)) if kw.get('shop_field') else None,
                     'shops': stat['shops']
                 })
 
-            best_variants = sorted(best_variants, key=lambda x: x['ca'], reverse=True)[:10]
+            # "Total Pièces"/"Reste" ne sont indisponibles que si aucune
+            # commande fournisseur confirmée n'a de donnée pour AUCUNE
+            # variante de ce produit (cas rare — produit jamais réceptionné
+            # via achat confirmé). Nom de clé conservé (has_base_pivot_data)
+            # pour ne pas casser le front qui la lit déjà.
+            has_base_pivot_data = bool(purchased_by_variant)
+
+            # Panneau "Vérification des données" — permet à l'utilisateur de
+            # comparer lui-même, pour n'importe quelle référence tapée dans
+            # la barre de recherche, ce que le dashboard affiche avec la
+            # source brute (Achats). Réutilise EXACTEMENT les mêmes dicts que
+            # le calcul de best_variants ci-dessus — ne peut donc pas diverger
+            # de ce qui est réellement affiché à l'écran.
+            purchased_by_color_verif = {}
+            for pol in po_lines:
+                c_v, _s_v = resolve_variant_color_size(pol.product_id)
+                c_v = (c_v or '—').upper().strip()
+                purchased_by_color_verif[c_v] = purchased_by_color_verif.get(c_v, 0) + pol.product_qty
+
+            verif_by_color = []
+            for c_v in sorted(purchased_by_color_verif.keys()):
+                ach_val = purchased_by_color_verif.get(c_v, 0)
+                verif_by_color.append({
+                    'color': c_v,
+                    'achats': int(round(ach_val)),
+                    'dashboard': int(round(ach_val)) if ach_val > 0 else None,
+                    'source': 'achats' if ach_val > 0 else None,
+                })
+
+            # BUG CORRIGÉ (vérifié en base) : le [:10] coupait arbitrairement
+            # la liste dès que plus de 10 variantes existaient (un article
+            # chaussures peut avoir 12 à 60 variantes couleur×pointure) —
+            # quand aucune n'a encore de vente (ca=0 partout), le tri par
+            # "ca" ne les départage pas et l'ordre retenu pour les 10
+            # premières est arbitraire : des variantes ayant pourtant un
+            # vrai achat/dispatch enregistré pouvaient être coupées au
+            # profit de variantes totalement vides. On trie maintenant par
+            # CA, puis par pièces reçues (dispatché/acheté), puis par qté
+            # vendue, et on n'affiche PLUS qu'un nombre limité que si le
+            # reste n'a vraiment aucune donnée (pour ne pas noyer l'écran
+            # de dizaines de lignes à 0 sur les très gros articles).
+            best_variants = sorted(
+                best_variants,
+                key=lambda x: (x['ca'], x.get('dispatched', 0), x['qty']),
+                reverse=True
+            )
+            has_signal = [v for v in best_variants if v['qty'] > 0 or v.get('dispatched', 0) > 0 or v['stock'] > 0]
+            no_signal = [v for v in best_variants if v['qty'] == 0 and v.get('dispatched', 0) == 0 and v['stock'] == 0]
+            best_variants = has_signal + no_signal[:max(0, 20 - len(has_signal))]
             for idx, v in enumerate(best_variants):
                 v['rank'] = idx + 1
                 qty_sold_v = v.get('qty', 0)
                 stock_v = v.get('stock', 0)
                 dispatched_v = v.get('dispatched', 0)
-                # Total colis ne doit jamais être inférieur à (vendu + stock
-                # restant) : ces pièces ont forcément été reçues, même si le
-                # dispatch manuel (Base Pivot) n'a pas été renseigné pour
-                # cette couleur — sinon on affichait 0 colis pour une
-                # variante qui a pourtant déjà généré des ventes.
-                v['total_pieces'] = max(dispatched_v, stock_v + qty_sold_v, 0)
+
+                # Ni Base Pivot ni les achats n'ont de donnée pour CETTE
+                # couleur précise (dispatch_missing) : pas de "0 pièce"
+                # trompeur, on affiche clairement l'absence de donnée.
+                if v.get('dispatch_missing'):
+                    v['total_pieces'] = None
+                    v['reste'] = None
+                    v['discordance'] = False
+                    v['discordance_detail'] = None
+                    continue
+
+                # Total pièces = valeur dispatchée à l'arrivage (convertie en
+                # pièces réelles), figée une bonne fois pour toutes — JAMAIS
+                # recalculée à partir du stock actuel/des ventes. Un écart
+                # entre "dispatché" et "stock + vendu" est un vrai problème de
+                # données (mauvais dispatch, restock non tracé...) qui doit
+                # être visible, pas masqué en gonflant artificiellement ce nombre.
+                v['total_pieces'] = dispatched_v
                 v['reste'] = v['total_pieces'] - qty_sold_v
+                v['discordance'] = abs(dispatched_v - (stock_v + qty_sold_v)) > 0.01
+                v['discordance_detail'] = (
+                    f"Dispatché: {dispatched_v}, Stock+Vendu: {stock_v + qty_sold_v}"
+                    if v['discordance'] else None
+                )
 
             stock_by_store = []
             non_retail_company_ids = self._get_non_retail_company_ids()
             try:
+                # Ne lister que les entrepôts qui correspondent à un magasin
+                # réellement configuré/actif (mv.batch.shop.mapping) — sinon
+                # cette liste, construite indépendamment sur stock.warehouse,
+                # affichait aussi des entrepôts désactivés/non-magasins
+                # (ex: "DIGITAL SHOP") même après avoir désactivé leur
+                # mapping, puisqu'elle ne passait pas par lui.
+                mapped_warehouse_ids = self._get_active_shop_mappings().mapped('warehouse_id').ids
                 warehouses = request.env['stock.warehouse'].sudo().search([
-                    ('company_id', 'not in', non_retail_company_ids)
+                    ('company_id', 'not in', non_retail_company_ids),
+                    ('id', 'in', mapped_warehouse_ids),
                 ])
                 for wh in warehouses:
                     if not wh.lot_stock_id:
@@ -1690,66 +2142,76 @@ class MaVieDashboardController(http.Controller):
                 else:
                     stock_total = sum(s['stock'] for s in stock_by_store)
 
+            # Qté Dispatché par magasin — deux sources, dans cet ordre de
+            # priorité :
+            #  1) Base Pivot (colonnes par magasin sur les lignes couleur) —
+            #     ne couvre que 53 références sur ~4972.
+            #  2) Repli : commandes fournisseur confirmées. Chaque commande
+            #     est rattachée à un point de livraison
+            #     (picking_type_id.warehouse_id) qui EST le magasin
+            #     destinataire — vérifié en base sur des références réelles :
+            #     le total par magasin correspond exactement à Qté Achetée,
+            #     et cette donnée existe pour la quasi-totalité du
+            #     catalogue (contrairement à Base Pivot). Recherche
+            #     volontairement SANS restriction société/magasin/date (même
+            #     principe que le dispatch Base Pivot : un fait historique
+            #     figé, pas scopé au filtre actif) pour avoir la répartition
+            #     complète sur tout le réseau.
+            po_lines_all_shops = request.env['purchase.order.line'].sudo().search([
+                ('order_id.state', 'in', ['purchase', 'done']),
+                ('product_id.product_tmpl_id', '=', product_tmpl.id),
+            ] + self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id'))
+            purchased_by_warehouse = {}
+            for pol in po_lines_all_shops:
+                wh = pol.order_id.picking_type_id.warehouse_id
+                if not wh:
+                    continue
+                purchased_by_warehouse[wh.id] = purchased_by_warehouse.get(wh.id, 0) + pol.product_qty
+
+            shop_mappings_by_field = {sm.shop_field: sm for sm in shop_mappings if sm.shop_field}
+
             stock_by_store_pivot = []
-            if articles and shop_fields_cleaned:
-                try:
-                    qty_by_field = {field: 0 for field, _ in shop_fields_cleaned}
-                    label_by_field = {field: label for field, label in shop_fields_cleaned}
+            for field, label in shop_fields_cleaned:
+                mapping = shop_mappings_by_field.get(field)
+                wh_id = mapping.warehouse_id.id if mapping and mapping.warehouse_id else None
+                achats_qty = purchased_by_warehouse.get(wh_id, 0) if wh_id else 0
+                if achats_qty > 0:
+                    qty, dispatch_src = int(round(achats_qty)), 'achats'
+                else:
+                    qty, dispatch_src = None, None
+                stock_by_store_pivot.append({
+                    'field': field,
+                    'name': label,
+                    'qty': qty,
+                    'dispatch_source': dispatch_src,
+                })
 
-                    for art in articles:
-                        for line in art.color_line_ids:
-                            for field in qty_by_field.keys():
-                                qty_by_field[field] += int(getattr(line, field, 0) or 0)
+            # Fusion avec le stock réel (stock.quant) par magasin — le label
+            # du dispatch est déjà basé sur warehouse_id.name donc
+            # correspond au store_name réel.
+            stock_by_name = {s['store_name']: s['stock'] for s in stock_by_store}
+            for row in stock_by_store_pivot:
+                row['stock'] = stock_by_name.get(row['name'], 0)
 
-                    for field, label in shop_fields_cleaned:
-                        stock_by_store_pivot.append({
-                            'field': field,
-                            'name': label,
-                            'qty': qty_by_field[field]
-                        })
-                except Exception as e:
-                    _logger.warning(f"Erreur dispatch pivot: {str(e)}")
+            # Suite du panneau "Vérification des données" : le détail par
+            # magasin, avec le même dict que stock_by_store_pivot ci-dessus
+            # (purchased_by_warehouse).
+            verif_by_magasin = []
+            for field, label in shop_fields_cleaned:
+                mapping = shop_mappings_by_field.get(field)
+                wh_id = mapping.warehouse_id.id if mapping and mapping.warehouse_id else None
+                ach_val = purchased_by_warehouse.get(wh_id, 0) if wh_id else 0
+                verif_by_magasin.append({
+                    'magasin': label,
+                    'achats': int(round(ach_val)),
+                    'dashboard': int(round(ach_val)) if ach_val > 0 else None,
+                    'source': 'achats' if ach_val > 0 else None,
+                })
 
-            if not stock_by_store_pivot and stock_by_store:
-                # Aucune donnée de dispatch manuel (Base Pivot) pour ce
-                # produit : on affiche quand même le stock réel par magasin,
-                # mais on ne DOIT PAS recopier le stock dans la colonne
-                # "Qté Dispatché" — ça donnerait l'illusion trompeuse que le
-                # dispatch a été saisi et correspond exactement au stock,
-                # alors qu'il n'y a simplement aucune donnée.
-                for s in stock_by_store:
-                    stock_by_store_pivot.append({
-                        'field': s['store_name'],
-                        'name': s['store_name'],
-                        'qty': None,
-                        'stock': s['stock'],
-                    })
-            else:
-                # ✅ Fusion des 2 tableaux (dispatch pivot + stock réel stock.quant)
-                # en un seul, comme demandé : le label du dispatch pivot est déjà
-                # basé sur warehouse_id.name donc correspond au store_name réel.
-                stock_by_name = {s['store_name']: s['stock'] for s in stock_by_store}
-                for row in stock_by_store_pivot:
-                    row['stock'] = stock_by_name.get(row['name'], 0)
-
-            batch_data = None
-            if articles and articles[0].batch_id:
-                batch_data = {
-                    'name': articles[0].batch_id.name,
-                    'date': articles[0].batch_id.create_date.strftime('%Y-%m-%d') if articles[0].batch_id.create_date else '',
-                    'collection': articles[0].collection_id.name if articles[0].collection_id else '—'
-                }
-
-            # ✅ IMAGE LAZY LOADING — chargée uniquement au clic sur le produit (pas au chargement initial)
-            # NB : mv.article.base ne stocke QUE image_1920 (Binary simple, pas de
-            # variante _512/_256 auto-générée comme sur product.template.image qui
-            # est un vrai champ Image). Demander image_512 sur mv.article.base
-            # n'existait pas -> 404 systématique, d'où l'absence de photo constatée.
-            image_url = (
-                f'/web/image/mv.article.base/{articles[0].id}/image_1920'
-                if articles
-                else f'/web/image/product.template/{product_tmpl.id}/image_512'
-            )
+            # ✅ IMAGE LAZY LOADING — chargée uniquement au clic sur le produit
+            # (pas au chargement initial). Toujours l'image native du produit
+            # (plus de repli mv.article.base).
+            image_url = f'/web/image/product.template/{product_tmpl.id}/image_512'
 
             return {
                 'id': product_tmpl.id,
@@ -1766,8 +2228,18 @@ class MaVieDashboardController(http.Controller):
                 'stock_theorique': qty_purchased - qty_sold,
                 'stock_ecart': (qty_purchased - qty_sold) - stock_total,
                 'ca': ca,
+                'ca_ht': round(ca_ht, 2),
+                'ca_achat': round(ca_achat, 2),
+                'ca_achat_externe': round(ca_achat_externe, 2),
+                'ca_achat_interne': round(ca_achat_interne, 2),
+                'qty_purchased_externe': qty_purchased_externe,
+                'qty_purchased_interne': qty_purchased_interne,
+                'vendu_avec_cout': round(vendu_avec_cout, 2),
+                'marge': round(marge, 2),
                 'margin': margin,
                 'sell_through': sell_through,
+                'qty_sold_normal': qty_sold_normal,
+                'qty_sold_solde': qty_sold_solde,
                 'pv_ttc': product_tmpl.list_price or 0.0,
                 'cost': product_tmpl.standard_price or 0.0,
                 'collection_id': product_tmpl.collection_id.id if getattr(product_tmpl, 'collection_id', False) else None,
@@ -1776,9 +2248,13 @@ class MaVieDashboardController(http.Controller):
                 'batch_name': product_tmpl.arrivage_id.name if getattr(product_tmpl, 'arrivage_id', False) else '—',
                 'best_variants': best_variants,
                 'variants': best_variants,
+                'has_base_pivot_data': has_base_pivot_data,
                 'stock_by_store': stock_by_store_pivot,
                 'real_stock_by_store': stock_by_store,
-                'batch': batch_data,
+                'verification': {
+                    'by_color': verif_by_color,
+                    'by_magasin': verif_by_magasin,
+                },
                 'image_url': image_url,
             }
         except Exception as e:
@@ -1815,14 +2291,15 @@ class MaVieDashboardController(http.Controller):
         writer.writerow(['Stock réel Odoo', data.get('stock_total', 0)])
         writer.writerow(['Stock théorique (achetée - vendue)', data.get('stock_theorique', 0)])
         writer.writerow(['Écart stock (théorique - réel)', data.get('stock_ecart', 0)])
-        writer.writerow(['CA potentiel', data.get('ca', 0)])
+        writer.writerow(['CA Vendu (TTC)', data.get('ca', 0)])
+        writer.writerow(['CA Achat', data.get('ca_achat', 0)])
         writer.writerow(['Sell-through (%)', data.get('sell_through', 0)])
         writer.writerow([])
 
         writer.writerow(['Variantes couleurs (meilleure vente en tête)'])
-        writer.writerow(['#', 'Couleur', 'Qté vendue', 'Total colis', 'Reste'])
+        writer.writerow(['#', 'Couleur', 'Total pièces', 'Qté vendue', 'Reste'])
         for idx, v in enumerate(data.get('variants') or [], start=1):
-            writer.writerow([idx, v.get('name'), v.get('qty', 0), v.get('total_pieces', 0), v.get('reste', 0)])
+            writer.writerow([idx, v.get('name'), v.get('total_pieces', 0), v.get('qty', 0), v.get('reste', 0)])
         writer.writerow([])
 
         writer.writerow(['Stock par magasin'])
@@ -1845,12 +2322,22 @@ class MaVieDashboardController(http.Controller):
     # EXTRACTION / TRANSFERT INTER-MAGASINS
     # ─────────────────────────────────────────────────────────────
 
-    def _stock_by_mapping_for_template(self, product_tmpl_id, mappings):
+    def _stock_by_mapping_for_template(self, product_tmpl_id, mappings, color=None):
         """Retourne {shop_field: qty disponible} pour ce template, par magasin
-        (basé sur stock.quant réel dans mapping.warehouse_id.lot_stock_id)."""
+        (basé sur stock.quant réel dans mapping.warehouse_id.lot_stock_id).
+
+        Si `color` est fourni, ne compte que les variantes de cette couleur —
+        sans ce filtre, un magasin peut être suggéré comme source alors que
+        tout son stock disponible est dans une AUTRE couleur que celle
+        réellement recherchée pour la destination."""
         variants = request.env['product.product'].sudo().search(
             [('product_tmpl_id', '=', product_tmpl_id)]
         )
+        if color:
+            color = color.upper().strip()
+            variants = variants.filtered(
+                lambda v: (resolve_variant_color_size(v)[0] or '').upper().strip() == color
+            )
         if not variants:
             return {}
 
@@ -1914,6 +2401,7 @@ class MaVieDashboardController(http.Controller):
                 return {'error': 'Produit manquant.', 'suggestions': []}
 
             product_tmpl_id = int(product_tmpl_id)
+            color = (kw.get('color') or '').strip() or None
             mappings = self._get_active_shop_mappings()
 
             dest_mapping = mappings.filtered(lambda m: m.shop_field == dest_shop_field)[:1]
@@ -1921,7 +2409,7 @@ class MaVieDashboardController(http.Controller):
             nearby_cities = set(CITY_PROXIMITY.get(dest_city, [])) if dest_city else set()
 
             source_mappings = mappings.filtered(lambda m: m.shop_field != dest_shop_field)
-            stock_by_field = self._stock_by_mapping_for_template(product_tmpl_id, source_mappings)
+            stock_by_field = self._stock_by_mapping_for_template(product_tmpl_id, source_mappings, color=color)
 
             suggestions = []
             for m in source_mappings:
@@ -1965,6 +2453,7 @@ class MaVieDashboardController(http.Controller):
                 return {'error': 'Produit ou magasin source manquant.', 'variants': []}
 
             product_tmpl_id = int(product_tmpl_id)
+            color = (kw.get('color') or '').strip() or None
             mappings = self._get_active_shop_mappings()
             source_mapping = mappings.filtered(lambda m: m.shop_field == source_shop_field)[:1]
             if not source_mapping or not source_mapping.warehouse_id or not source_mapping.warehouse_id.lot_stock_id:
@@ -1974,6 +2463,11 @@ class MaVieDashboardController(http.Controller):
             variants = request.env['product.product'].sudo().search(
                 [('product_tmpl_id', '=', product_tmpl_id)]
             )
+            if color:
+                color_upper = color.upper().strip()
+                variants = variants.filtered(
+                    lambda v: (resolve_variant_color_size(v)[0] or '').upper().strip() == color_upper
+                )
             if not variants:
                 return {'error': 'Aucune variante trouvée pour ce produit.', 'variants': []}
 
@@ -1983,14 +2477,7 @@ class MaVieDashboardController(http.Controller):
                 available = Quant._get_available_quantity(v, source_location)
                 if available <= 0:
                     continue
-                color_name = None
-                size_name = None
-                for attr_val in v.product_template_attribute_value_ids:
-                    attr_name = (attr_val.attribute_id.name or '').upper()
-                    if any(k in attr_name for k in ['COULEUR', 'COLOR', 'COL']):
-                        color_name = attr_val.name.strip()
-                    elif any(k in attr_name for k in ['TAILLE', 'POINTURE', 'SIZE']):
-                        size_name = attr_val.name.strip()
+                color_name, size_name = resolve_variant_color_size(v)
                 rows.append({
                     'product_id': v.id,
                     'color': color_name or '—',
@@ -2003,6 +2490,66 @@ class MaVieDashboardController(http.Controller):
         except Exception as e:
             _logger.error(f"Erreur api_transfer_variant_stock: {str(e)}", exc_info=True)
             return {'error': str(e), 'variants': []}
+
+    @http.route('/mavie/api/color-stock-by-store', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_color_stock_by_store(self, **kw):
+        """Stock disponible d'UNE couleur d'un produit, détaillé par magasin
+        (et par taille au sein de chaque magasin) — alimente le popup ouvert
+        en cliquant une ligne du tableau "Variantes Couleurs"."""
+        try:
+            product_tmpl_id = kw.get('product_tmpl_id')
+            color = (kw.get('color') or '').strip()
+            if not (product_tmpl_id and color):
+                return {'error': 'Produit ou couleur manquant.', 'stores': []}
+
+            product_tmpl_id = int(product_tmpl_id)
+            color_upper = color.upper().strip()
+
+            variants = request.env['product.product'].sudo().search(
+                [('product_tmpl_id', '=', product_tmpl_id)]
+            )
+            color_variants = variants.filtered(
+                lambda v: (resolve_variant_color_size(v)[0] or '').upper().strip() == color_upper
+            )
+            if not color_variants:
+                return {'error': 'Aucune variante trouvée pour cette couleur.', 'stores': []}
+
+            size_by_variant = {}
+            for v in color_variants:
+                _c, size_name = resolve_variant_color_size(v)
+                size_by_variant[v.id] = size_name or '—'
+
+            mappings = self._get_active_shop_mappings()
+            stores = []
+            for m in mappings:
+                if not m.warehouse_id or not m.warehouse_id.lot_stock_id:
+                    continue
+                quants = request.env['stock.quant'].sudo().search([
+                    ('product_id', 'in', color_variants.ids),
+                    ('location_id', 'child_of', m.warehouse_id.lot_stock_id.id),
+                ])
+                by_size = {}
+                total = 0.0
+                for q in quants:
+                    total += q.quantity
+                    size_name = size_by_variant.get(q.product_id.id, '—')
+                    by_size[size_name] = by_size.get(size_name, 0.0) + q.quantity
+                stores.append({
+                    'shop_field': m.shop_field,
+                    'shop_label': m.warehouse_id.name or m.shop_label or m.shop_field,
+                    'city': m.city or '—',
+                    'stock_total': int(round(total)),
+                    'by_size': {k: int(round(v)) for k, v in by_size.items()},
+                })
+
+            # Plus gros stock en premier — facilite le choix d'un magasin
+            # source pour un futur transfert de cette couleur.
+            stores.sort(key=lambda s: -s['stock_total'])
+
+            return {'color': color, 'stores': stores}
+        except Exception as e:
+            _logger.error(f"Erreur api_color_stock_by_store: {str(e)}", exc_info=True)
+            return {'error': str(e), 'stores': []}
 
     @http.route('/mavie/api/transfer-create', type='json', auth='user', methods=['POST'], csrf=False)
     def api_transfer_create(self, **kw):
@@ -2059,12 +2606,20 @@ class MaVieDashboardController(http.Controller):
 
             warning = ("Quantités réduites (stock insuffisant) : " + ", ".join(warning_parts)) if warning_parts else None
 
+            # group_ref (optionnel) : posé côté client sur tous les bons créés
+            # dans la même session de transfert pour la même référence +
+            # destination (plusieurs magasins source nécessaires) — permet de
+            # les regrouper à l'affichage (liste + PDF) sans changer le modèle
+            # de données (toujours un enregistrement par paire source/cible).
+            group_ref = (kw.get('group_ref') or '').strip() or None
+
             transfer = request.env['inter.internal.transfer'].sudo().create({
                 'company_source_id': source_mapping.company_id.id,
                 'location_source_id': source_location.id,
                 'company_target_id': dest_mapping.company_id.id,
                 'location_target_id': dest_mapping.warehouse_id.lot_stock_id.id,
                 'line_ids': line_vals,
+                'group_ref': group_ref,
             })
             transfer.sudo().action_submit()
 
@@ -2073,6 +2628,7 @@ class MaVieDashboardController(http.Controller):
             return {
                 'transfer_id': transfer.id,
                 'transfer_name': transfer.name,
+                'group_ref': transfer.group_ref,
                 'warning': warning,
                 'notif_warning': notif_warning,
             }

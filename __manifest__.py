@@ -26,6 +26,7 @@
         'views/dashboard_menu.xml',
         'views/dashboard_templates.xml',
         'views/mv_batch_shop_mapping_views_ext.xml',
+        'views/inter_internal_transfer_views_ext.xml',
         'report/mavie_transfer_report.xml',
     ],
     'assets': {

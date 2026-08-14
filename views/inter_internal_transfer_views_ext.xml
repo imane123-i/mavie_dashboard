@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- Affiche le magasin réel émetteur/récepteur (résolu via
+         mv.batch.shop.mapping) à la place de la société brute, qui peut
+         posséder plusieurs magasins (ex: SALMEDO en a 7) et ne permet donc
+         pas de savoir qui envoie à qui. Affiche aussi, quand plusieurs bons
+         ont été créés ensemble pour la même référence + destination
+         (group_ref), un indicateur "(+N autres magasins source)". -->
+    <record id="view_transfert_interne_tree_ext" model="ir.ui.view">
+        <field name="name">inter.internal.transfer.tree.ext.mavie</field>
+        <field name="model">inter.internal.transfer</field>
+        <field name="inherit_id" ref="transfert_interne.view_transfert_interne_tree"/>
+        <field name="arch" type="xml">
+            <field name="company_source_id" position="replace">
+                <field name="emetteur_display" string="Émetteur"/>
+            </field>
+            <field name="company_target_id" position="replace">
+                <field name="recepteur_display" string="Récepteur"/>
+            </field>
+            <field name="state" position="after">
+                <field name="group_size" invisible="1"/>
+                <field name="group_member_names" optional="show" string="Autres bons du groupe"/>
+            </field>
+        </field>
+    </record>
+
+</odoo>

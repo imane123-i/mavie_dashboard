@@ -459,6 +459,64 @@
                     text-overflow: ellipsis;
                 }
 
+                .chart-mode-toggle {
+                    display: flex;
+                    gap: 4px;
+                }
+                .chart-mode-btn {
+                    border: 1px solid var(--border);
+                    background: transparent;
+                    color: var(--text-muted);
+                    border-radius: var(--radius-sm);
+                    padding: 4px 10px;
+                    font-size: 0.75rem;
+                    cursor: pointer;
+                    transition: background var(--transition), color var(--transition);
+                }
+                .chart-mode-btn.active {
+                    background: var(--brand);
+                    color: #fff;
+                    border-color: var(--brand);
+                }
+
+                .chart-bar-stack {
+                    width: 28px;
+                    display: flex;
+                    flex-direction: column-reverse;
+                    border-radius: 4px 4px 0 0;
+                    overflow: hidden;
+                    cursor: pointer;
+                }
+                .chart-bar-segment {
+                    width: 100%;
+                    transition: filter var(--transition), opacity var(--transition);
+                }
+                .chart-bar-segment:hover {
+                    filter: brightness(1.3);
+                }
+
+                .chart-legend {
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 10px;
+                    margin-top: 10px;
+                    padding-top: 10px;
+                    border-top: 1px solid var(--border);
+                }
+                .chart-legend-item {
+                    display: flex;
+                    align-items: center;
+                    gap: 4px;
+                    font-size: 0.72rem;
+                    color: var(--text-muted);
+                }
+                .chart-legend-swatch {
+                    width: 10px;
+                    height: 10px;
+                    border-radius: 2px;
+                    flex-shrink: 0;
+                }
+
                 #chart-tooltip {
                     position: fixed;
                     background: rgba(255,255,255,0.95);
@@ -532,6 +590,23 @@
                 }
 
                 #transfer-overlay.active {
+                    display: flex;
+                    animation: fadeInOverlay 0.22s ease;
+                }
+
+                #color-detail-overlay {
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(15,23,42,0.4);
+                    z-index: 9600;
+                    display: none;
+                    align-items: center;
+                    justify-content: center;
+                    backdrop-filter: blur(3px);
+                    padding: 16px;
+                }
+
+                #color-detail-overlay.active {
                     display: flex;
                     animation: fadeInOverlay 0.22s ease;
                 }
@@ -776,6 +851,64 @@
                     align-items: center;
                     gap: 6px;
                 }
+
+                /* ── Panneau Vérification des données ── */
+                .verif-panel {
+                    border: 1px solid var(--border);
+                    border-radius: 10px;
+                    background: var(--surface2);
+                }
+                .verif-panel summary {
+                    cursor: pointer;
+                    padding: 12px 14px;
+                    font-size: 0.85rem;
+                    font-weight: 700;
+                    color: var(--brand-dark);
+                    list-style: none;
+                    user-select: none;
+                }
+                .verif-panel summary::-webkit-details-marker { display: none; }
+                .verif-panel[open] summary { border-bottom: 1px solid var(--border); }
+                .verif-body { padding: 14px; }
+                .verif-intro {
+                    font-size: 0.78rem;
+                    color: var(--text-muted);
+                    margin: 0 0 14px;
+                    line-height: 1.5;
+                }
+                .verif-subtitle {
+                    font-size: 0.75rem;
+                    font-weight: 700;
+                    text-transform: uppercase;
+                    letter-spacing: 0.05em;
+                    color: var(--text-muted);
+                    margin: 14px 0 6px;
+                }
+                .verif-subtitle:first-of-type { margin-top: 0; }
+                .verif-tbl-wrap { overflow-x: auto; }
+                table.verif-table {
+                    width: 100%;
+                    border-collapse: collapse;
+                    font-size: 0.82rem;
+                    background: var(--surface);
+                    border-radius: 8px;
+                    overflow: hidden;
+                }
+                table.verif-table th {
+                    text-align: left;
+                    font-size: 0.7rem;
+                    text-transform: uppercase;
+                    letter-spacing: 0.04em;
+                    color: var(--text-muted);
+                    padding: 7px 10px;
+                    border-bottom: 1px solid var(--border);
+                }
+                table.verif-table td {
+                    padding: 7px 10px;
+                    border-bottom: 1px solid var(--border);
+                    font-variant-numeric: tabular-nums;
+                }
+                table.verif-table tr:last-child td { border-bottom: none; }
 
                 /* ── Overlay ruptures ── */
                 #ruptures-overlay {
@@ -1056,9 +1189,17 @@
                 </div>
 
                 <div class="kpi-grid" id="main-kpi-grid">
+                    <div class="kpi-card kpi-blue" id="card-ca-achat">
+                        <span class="kpi-icon">🧾</span>
+                        <div class="kpi-label">CA Achat</div>
+                        <div class="kpi-value" id="kpi-ca-achat">—</div>
+                        <div class="kpi-subtext" id="kpi-ca-achat-note"></div>
+                        <div class="kpi-subtext" id="kpi-ca-achat-split"></div>
+                        <div class="kpi-subtext" id="kpi-ca-achat-by-company"></div>
+                    </div>
                     <div class="kpi-card" id="card-ca-total">
                         <span class="kpi-icon">💰</span>
-                        <div class="kpi-label">CA Potentiel</div>
+                        <div class="kpi-label">CA Vendu</div>
                         <div class="kpi-value" id="kpi-ca-total">—</div>
                     </div>
                     <div class="kpi-card kpi-blue" id="card-tickets">
@@ -1075,6 +1216,7 @@
                         <span class="kpi-icon">📤</span>
                         <div class="kpi-label">Qté Vendue</div>
                         <div class="kpi-value" id="kpi-qty-sold">—</div>
+                        <div class="kpi-subtext" id="kpi-qty-sold-solde"></div>
                     </div>
                     <div class="kpi-card kpi-blue" id="card-qty-purchased">
                         <span class="kpi-icon">📥</span>
@@ -1095,6 +1237,47 @@
                         <span class="kpi-icon">⚠️</span>
                         <div class="kpi-label">Ruptures</div>
                         <div class="kpi-value" id="kpi-ruptures">—</div>
+                    </div>
+                </div>
+
+                <!-- ══════════ VUE DÉDIÉE MOD FOR LIFE (société entrepôt/importateur, pas un magasin) ══════════ -->
+                <div id="modforlife-kpi-grid" style="display:none;">
+                    <div class="kpi-grid">
+                        <div class="kpi-card kpi-blue" id="card-mfl-achats">
+                            <span class="kpi-icon">🧾</span>
+                            <div class="kpi-label">Achats fournisseurs</div>
+                            <div class="kpi-value" id="mfl-ca-achats">—</div>
+                            <div class="kpi-subtext" id="mfl-qty-achats-sub"></div>
+                        </div>
+                        <div class="kpi-card" id="card-mfl-commandes">
+                            <span class="kpi-icon">📋</span>
+                            <div class="kpi-label">Commandes fournisseurs</div>
+                            <div class="kpi-value" id="mfl-nb-commandes">—</div>
+                        </div>
+                        <div class="kpi-card kpi-green" id="card-mfl-ventes">
+                            <span class="kpi-icon">💰</span>
+                            <div class="kpi-label">Envoyé aux sociétés magasins</div>
+                            <div class="kpi-value" id="mfl-ca-ventes">—</div>
+                            <div class="kpi-subtext" id="mfl-qty-ventes-sub"></div>
+                        </div>
+                        <div class="kpi-card kpi-amber" id="card-mfl-stock">
+                            <span class="kpi-icon">📦</span>
+                            <div class="kpi-label">Stock entrepôt</div>
+                            <div class="kpi-value" id="mfl-stock">—</div>
+                        </div>
+                    </div>
+                    <div class="detail-section">
+                        <h3>Envoyé vers chaque société (au prix coûtant)</h3>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Société</th>
+                                    <th>Qté</th>
+                                    <th>CA</th>
+                                </tr>
+                            </thead>
+                            <tbody id="modforlife-ventes-tbody"></tbody>
+                        </table>
                     </div>
                 </div>
 
@@ -1220,7 +1403,7 @@
                                     <th>Produit</th>
                                     <th>Réf</th>
                                     <th class="top-col-4">Qté vendue</th>
-                                    <th class="top-col-5">CA Potentiel</th>
+                                    <th class="top-col-5">CA Vendu</th>
                                 </tr>
                             </thead>
                             <tbody id="top-products-tbody"></tbody>
@@ -1241,7 +1424,7 @@
                                     <th>Produit</th>
                                     <th>Réf</th>
                                     <th class="flop-col-4">Qté vendue</th>
-                                    <th class="flop-col-5">CA Potentiel</th>
+                                    <th class="flop-col-5">CA Vendu</th>
                                 </tr>
                             </thead>
                             <tbody id="flop-products-tbody"></tbody>
@@ -1255,8 +1438,16 @@
                 </div>
 
                 <div class="section-card full-width" id="section-sales-chart">
-                    <div class="section-title">📦 CA par Arrivage / Batch<span class="title-line"></span></div>
+                    <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+                        <span>📦 CA par Arrivage / Batch</span>
+                        <div class="chart-mode-toggle">
+                            <button type="button" id="chart-mode-arrivage" class="chart-mode-btn active">Par Arrivage</button>
+                            <button type="button" id="chart-mode-shop" class="chart-mode-btn">Par Magasin</button>
+                        </div>
+                        <span class="title-line"></span>
+                    </div>
                     <div id="sales-daily-chart"></div>
+                    <div id="sales-daily-legend" class="chart-legend" style="display:none;"></div>
                 </div>
 
             </div><!-- /container -->
@@ -1305,6 +1496,7 @@
                         <div class="detail-kpi-card">
                             <div class="d-label">📤 Qté vendue</div>
                             <div class="d-value" id="detail-qty-sold">—</div>
+                            <div class="d-sublabel" id="detail-qty-sold-solde"></div>
                         </div>
                         <div class="detail-kpi-card">
                             <div class="d-label">📥 Qté achetée</div>
@@ -1316,7 +1508,13 @@
                             <div class="d-sublabel" id="detail-stock-ecart" style="display:none"></div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label">💰 CA Potentiel</div>
+                            <div class="d-label">🧾 CA Achat</div>
+                            <div class="d-value" id="detail-ca-achat">—</div>
+                            <div class="d-sublabel" id="detail-ca-achat-note"></div>
+                            <div class="d-sublabel" id="detail-ca-achat-split"></div>
+                        </div>
+                        <div class="detail-kpi-card">
+                            <div class="d-label">💰 CA Vendu</div>
                             <div class="d-value" id="detail-ca">—</div>
                         </div>
                         <div class="detail-kpi-card">
@@ -1332,8 +1530,8 @@
                                 <tr>
                                     <th>#</th>
                                     <th>Couleur</th>
-                                    <th>Qté (magasin)</th>
-                                    <th>Total colis</th>
+                                    <th>Total pièces</th>
+                                    <th>Qté vendue (stock magasin)</th>
                                     <th>Reste</th>
                                 </tr>
                             </thead>
@@ -1342,7 +1540,7 @@
                     </div>
 
                     <div class="detail-section">
-                        <h3>🏪 Stock par Magasin (Base Pivot)</h3>
+                        <h3>🏪 Stock par Magasin (Achats)</h3>
                         <table>
                             <thead>
                                 <tr>
@@ -1353,6 +1551,41 @@
                             </thead>
                             <tbody id="detail-stock-pivot-tbody"></tbody>
                         </table>
+                    </div>
+
+                    <div class="detail-section">
+                        <details class="verif-panel">
+                            <summary>🔍 Vérifier ces données (Achats vs Dashboard)</summary>
+                            <div class="verif-body">
+                                <p class="verif-intro">Pour retrouver ces mêmes chiffres vous-même : <strong>Achats → Commandes d'achat</strong> (filtrer par ce produit, magasin = colonne Entrepôt du bon). Colonne "Dashboard" = ce que cet écran affiche réellement.</p>
+                                <div class="verif-subtitle">Par couleur</div>
+                                <div class="verif-tbl-wrap">
+                                    <table class="verif-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Couleur</th>
+                                                <th>Achats (réel)</th>
+                                                <th>Dashboard affiche</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="detail-verif-color-tbody"></tbody>
+                                    </table>
+                                </div>
+                                <div class="verif-subtitle">Par magasin</div>
+                                <div class="verif-tbl-wrap">
+                                    <table class="verif-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Magasin</th>
+                                                <th>Achats (réel)</th>
+                                                <th>Dashboard affiche</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="detail-verif-magasin-tbody"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </details>
                     </div>
 
                 </div><!-- /detail-panel -->
@@ -1381,6 +1614,12 @@
                                 <option value="">— Choisir un magasin —</option>
                             </select>
                         </div>
+                        <div>
+                            <label>🎨 Couleur</label>
+                            <select id="transfer-color-filter">
+                                <option value="">— Toutes les couleurs —</option>
+                            </select>
+                        </div>
                     </div>
 
                     <div id="transfer-suggestions-msg" style="margin:12px 0; font-size:0.85rem; color:#64748B;"></div>
@@ -1407,6 +1646,7 @@
                             <a href="javascript:void(0)" id="transfer-matrix-back" class="td-link" style="margin-right:8px;">← Retour</a>
                             Quantités à transférer depuis <span id="transfer-matrix-source-name">—</span>
                         </h3>
+                        <div id="transfer-emetteur-recepteur" class="detail-meta" style="margin:6px 0 12px; font-size:0.9rem;"></div>
                         <div id="transfer-matrix-msg" style="margin:8px 0; font-size:0.85rem; color:#64748B;"></div>
                         <table>
                             <thead>
@@ -1427,6 +1667,68 @@
                     <div id="transfer-result" style="display:none; margin-top:16px; padding:16px; border-radius:8px; background:#F0FDF4; border:1px solid #86EFAC;"></div>
                 </div><!-- /detail-panel -->
             </div><!-- /transfer-overlay -->
+
+            <!-- ══════════════════════════════════════════════════════
+                 COLOR DETAIL OVERLAY — Stock d'une couleur, par magasin
+            ═══════════════════════════════════════════════════════ -->
+            <div id="color-detail-overlay">
+                <div class="detail-panel">
+                    <button class="close-detail-btn" id="close-color-detail-btn" title="Fermer">✕</button>
+
+                    <div class="detail-header">
+                        <div class="detail-title-block">
+                            <h2>🎨 <span id="color-detail-color-name">—</span></h2>
+                            <div class="detail-meta">
+                                <span id="color-detail-product-name" class="detail-badge">—</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="detail-kpi-grid">
+                        <div class="detail-kpi-card">
+                            <div class="d-label">📤 Qté vendue</div>
+                            <div class="d-value" id="color-detail-qty-sold">—</div>
+                        </div>
+                        <div class="detail-kpi-card">
+                            <div class="d-label">💰 CA Vendu</div>
+                            <div class="d-value" id="color-detail-ca">—</div>
+                        </div>
+                        <div class="detail-kpi-card">
+                            <div class="d-label">📦 Total pièces</div>
+                            <div class="d-value" id="color-detail-total-pieces">—</div>
+                        </div>
+                        <div class="detail-kpi-card">
+                            <div class="d-label">📊 Reste</div>
+                            <div class="d-value" id="color-detail-reste">—</div>
+                        </div>
+                        <div class="detail-kpi-card">
+                            <div class="d-label">🏬 Stock total (tous magasins)</div>
+                            <div class="d-value" id="color-detail-stock-total">—</div>
+                        </div>
+                    </div>
+
+                    <div id="color-detail-msg" style="margin:8px 0; font-size:0.85rem; color:#64748B;"></div>
+
+                    <div class="detail-section">
+                        <h3>Stock par magasin — cette couleur</h3>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Magasin</th>
+                                    <th>Ville</th>
+                                    <th>Stock disponible</th>
+                                    <th>Détail tailles</th>
+                                </tr>
+                            </thead>
+                            <tbody id="color-detail-stores-tbody"></tbody>
+                        </table>
+                    </div>
+
+                    <div style="margin-top:16px; text-align:right;">
+                        <button id="btn-color-detail-transfer" class="btn-transfer-create" style="padding:10px 20px; font-size:0.9rem;">🔄 Transférer cette couleur</button>
+                    </div>
+                </div><!-- /detail-panel -->
+            </div><!-- /color-detail-overlay -->
 
             <!-- ══════════════════════════════════════════════════════
                  OVERLAY — Liste des ruptures de stock

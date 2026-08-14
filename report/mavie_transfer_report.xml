@@ -20,12 +20,24 @@
     <template id="report_transfer_template">
         <t t-call="web.html_container">
             <t t-foreach="docs" t-as="doc">
+                <!-- Un seul bon par référence + destination : si ce transfert
+                     fait partie d'un groupe (group_ref posé par le dashboard
+                     quand plusieurs magasins source ont été nécessaires pour
+                     la même référence + destination), on imprime TOUS les
+                     transferts du groupe en une seule page (une section par
+                     magasin source), plutôt qu'un PDF séparé par bon.
+                     Si l'utilisateur sélectionne et imprime plusieurs bons du
+                     MÊME groupe à la fois (impression multi-sélection depuis
+                     la liste), on ne rend le groupe qu'une seule fois, sur le
+                     premier doc du groupe rencontré dans docs. -->
+                <t t-if="not doc.group_ref or doc.id == min(docs.filtered(lambda d: d.group_ref == doc.group_ref).ids)">
+                <t t-set="group_docs" t-value="doc.env['inter.internal.transfer'].sudo().search([('group_ref', '=', doc.group_ref)], order='id asc') if doc.group_ref else doc"/>
+                <t t-set="first_doc" t-value="group_docs[0]"/>
                 <!-- Une société peut posséder plusieurs magasins (ex: SALMEDO en a 7) :
                      on identifie le magasin exact par son emplacement de stock
                      (lot_stock_id), pas seulement par la société, sinon on affiche
                      le mauvais nom de magasin sur le bon. -->
-                <t t-set="src_mapping" t-value="env['mv.batch.shop.mapping'].sudo().search([('warehouse_id.lot_stock_id', '=', doc.location_source_id.id)], limit=1) or env['mv.batch.shop.mapping'].sudo().search([('company_id', '=', doc.company_source_id.id)], limit=1)"/>
-                <t t-set="dst_mapping" t-value="env['mv.batch.shop.mapping'].sudo().search([('warehouse_id.lot_stock_id', '=', doc.location_target_id.id)], limit=1) or env['mv.batch.shop.mapping'].sudo().search([('company_id', '=', doc.company_target_id.id)], limit=1)"/>
+                <t t-set="dst_mapping" t-value="env['mv.batch.shop.mapping'].sudo().search([('warehouse_id.lot_stock_id', '=', first_doc.location_target_id.id)], limit=1) or env['mv.batch.shop.mapping'].sudo().search([('company_id', '=', first_doc.company_target_id.id)], limit=1)"/>
                 <t t-call="web.external_layout">
                     <div class="page">
 
@@ -33,7 +45,7 @@
                             <div class="col-12 text-center">
                                 <h2 style="color:#1F497D; border-bottom:2px solid #1F497D; padding-bottom:6px;">
                                     Bon de transfert inter-magasins —
-                                    <span t-esc="doc.name"/>
+                                    <span t-esc="', '.join(group_docs.mapped('name'))"/>
                                 </h2>
                             </div>
                         </div>
@@ -43,22 +55,16 @@
                                 <table class="table table-sm table-borderless" style="font-size:13px;">
                                     <tbody>
                                         <tr>
-                                            <td class="fw-bold" style="width:130px;">Magasin source :</td>
+                                            <td class="fw-bold" style="width:130px;">Magasin(s) source :</td>
                                             <td>
-                                                <span t-esc="(src_mapping.warehouse_id.name or src_mapping.shop_label or doc.company_source_id.name) or '—'"/>
-                                                <span t-if="src_mapping.city"> (<t t-esc="src_mapping.city"/>)</span>
-                                            </td>
-                                        </tr>
-                                        <tr>
-                                            <td class="fw-bold">Emplacement source :</td>
-                                            <td>
-                                                <span t-esc="doc.location_source_id.display_name or '—'"/>
-                                            </td>
-                                        </tr>
-                                        <tr>
-                                            <td class="fw-bold">Responsable :</td>
-                                            <td>
-                                                <span t-esc="(src_mapping.responsible_user_id.name) or '—'"/>
+                                                <t t-foreach="group_docs" t-as="gdoc">
+                                                    <t t-set="gsrc_mapping" t-value="env['mv.batch.shop.mapping'].sudo().search([('warehouse_id.lot_stock_id', '=', gdoc.location_source_id.id)], limit=1) or env['mv.batch.shop.mapping'].sudo().search([('company_id', '=', gdoc.company_source_id.id)], limit=1)"/>
+                                                    <div>
+                                                        <span t-esc="(gsrc_mapping.warehouse_id.name or gsrc_mapping.shop_label or gdoc.company_source_id.name) or '—'"/>
+                                                        <span t-if="gsrc_mapping.city"> (<t t-esc="gsrc_mapping.city"/>)</span>
+                                                        <span class="text-muted"> — <t t-esc="gdoc.name"/></span>
+                                                    </div>
+                                                </t>
                                             </td>
                                         </tr>
                                     </tbody>
@@ -70,20 +76,14 @@
                                         <tr>
                                             <td class="fw-bold" style="width:130px;">Magasin cible :</td>
                                             <td>
-                                                <span t-esc="(dst_mapping.warehouse_id.name or dst_mapping.shop_label or doc.company_target_id.name) or '—'"/>
+                                                <span t-esc="(dst_mapping.warehouse_id.name or dst_mapping.shop_label or first_doc.company_target_id.name) or '—'"/>
                                                 <span t-if="dst_mapping.city"> (<t t-esc="dst_mapping.city"/>)</span>
                                             </td>
                                         </tr>
                                         <tr>
                                             <td class="fw-bold">Emplacement cible :</td>
                                             <td>
-                                                <span t-esc="doc.location_target_id.display_name or '—'"/>
-                                            </td>
-                                        </tr>
-                                        <tr>
-                                            <td class="fw-bold">Statut :</td>
-                                            <td>
-                                                <span t-esc="dict(doc._fields['state'].selection).get(doc.state)"/>
+                                                <span t-esc="first_doc.location_target_id.display_name or '—'"/>
                                             </td>
                                         </tr>
                                     </tbody>
@@ -91,48 +91,70 @@
                             </div>
                         </div>
 
-                        <!-- Tableau des lignes -->
-                        <table class="table table-sm table-bordered" style="font-size:12px;">
-                            <thead style="background-color:#1F497D; color:#FFFFFF;">
-                                <tr>
-                                    <th class="text-center" style="width:18%;">Référence</th>
-                                    <th class="text-center">Produit</th>
-                                    <th class="text-center" style="width:15%;">Couleur</th>
-                                    <th class="text-center" style="width:15%;">Taille</th>
-                                    <th class="text-center" style="width:12%;">Quantité</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <t t-foreach="doc.line_ids" t-as="line">
+                        <!-- Une section par magasin source du groupe -->
+                        <t t-foreach="group_docs" t-as="gdoc">
+                            <t t-set="gsrc_mapping" t-value="env['mv.batch.shop.mapping'].sudo().search([('warehouse_id.lot_stock_id', '=', gdoc.location_source_id.id)], limit=1) or env['mv.batch.shop.mapping'].sudo().search([('company_id', '=', gdoc.company_source_id.id)], limit=1)"/>
+                            <h5 style="margin-top:16px;">
+                                Depuis :
+                                <span t-esc="(gsrc_mapping.warehouse_id.name or gsrc_mapping.shop_label or gdoc.company_source_id.name) or '—'"/>
+                                (<span t-esc="gdoc.name"/> — <span t-esc="dict(gdoc._fields['state'].selection).get(gdoc.state)"/>)
+                            </h5>
+                            <table class="table table-sm table-bordered" style="font-size:12px;">
+                                <thead style="background-color:#1F497D; color:#FFFFFF;">
                                     <tr>
-                                        <td t-esc="line.reference or ''"/>
-                                        <td t-esc="line.product_id.display_name or ''"/>
-                                        <td t-esc="line.color_name or ''"/>
-                                        <td t-esc="line.size_name or ''"/>
+                                        <th class="text-center" style="width:18%;">Référence</th>
+                                        <th class="text-center">Produit</th>
+                                        <th class="text-center" style="width:15%;">Couleur</th>
+                                        <th class="text-center" style="width:15%;">Taille</th>
+                                        <th class="text-center" style="width:12%;">Quantité</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <t t-foreach="gdoc.line_ids" t-as="line">
+                                        <tr>
+                                            <td t-esc="line.reference or ''"/>
+                                            <td t-esc="line.product_id.display_name or ''"/>
+                                            <td t-esc="line.color_name or ''"/>
+                                            <td t-esc="line.size_name or ''"/>
+                                            <td class="text-center">
+                                                <span t-esc="'%.0f' % (line.quantity or 0)"/>
+                                            </td>
+                                        </tr>
+                                    </t>
+                                </tbody>
+                                <tfoot>
+                                    <tr style="background-color:#F2F2F2; font-weight:bold;">
+                                        <td colspan="4" class="text-end">Sous-total</td>
                                         <td class="text-center">
-                                            <span t-esc="'%.0f' % (line.quantity or 0)"/>
+                                            <span t-esc="'%.0f' % sum(gdoc.line_ids.mapped('quantity'))"/>
                                         </td>
                                     </tr>
-                                </t>
-                            </tbody>
+                                </tfoot>
+                            </table>
+                            <!-- Signature par magasin source -->
+                            <div class="row mb-4">
+                                <div class="col-6 text-center">
+                                    <p style="border-top:1px solid #ccc; padding-top:4px; font-size:11px;">
+                                        Signature expéditeur —
+                                        <span t-esc="gsrc_mapping.warehouse_id.name or gsrc_mapping.shop_label or ''"/>
+                                    </p>
+                                </div>
+                            </div>
+                        </t>
+
+                        <table class="table table-sm" style="font-size:12px;">
                             <tfoot>
-                                <tr style="background-color:#F2F2F2; font-weight:bold;">
-                                    <td colspan="4" class="text-end">Total</td>
-                                    <td class="text-center">
-                                        <span t-esc="'%.0f' % sum(doc.line_ids.mapped('quantity'))"/>
+                                <tr style="background-color:#E5E7EB; font-weight:bold;">
+                                    <td class="text-end">Total groupe</td>
+                                    <td class="text-center" style="width:12%;">
+                                        <span t-esc="'%.0f' % sum(group_docs.mapped(lambda d: sum(d.line_ids.mapped('quantity'))))"/>
                                     </td>
                                 </tr>
                             </tfoot>
                         </table>
 
-                        <!-- Signature -->
-                        <div class="row mt-5">
-                            <div class="col-6 text-center">
-                                <p style="border-top:1px solid #ccc; padding-top:4px; font-size:11px;">
-                                    Signature expéditeur —
-                                    <span t-esc="src_mapping.warehouse_id.name or src_mapping.shop_label or ''"/>
-                                </p>
-                            </div>
+                        <!-- Signature récepteur (unique, côté destination) -->
+                        <div class="row mt-3">
                             <div class="col-6 text-center">
                                 <p style="border-top:1px solid #ccc; padding-top:4px; font-size:11px;">
                                     Signature récepteur —
@@ -142,6 +164,7 @@
                         </div>
 
                     </div>
+                </t>
                 </t>
             </t>
         </t>

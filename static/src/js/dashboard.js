@@ -1723,6 +1723,37 @@ function openColorDetail(articleId, productName, color) {
             : 'Compte physique réel (stock.quant), tous magasins mappés confondus.';
     }
 
+    // Signale le même écart Total pièces/Stock que le tableau Variantes
+    // Couleurs (v.discordance, déjà calculé côté serveur) — ici agrégé sur
+    // toutes les tailles de cette couleur. Cause la plus fréquente : du
+    // stock entré par ajustement d'inventaire manuel plutôt que par une
+    // commande fournisseur, donc invisible pour "Total pièces" par
+    // construction (ce champ ne compte QUE les achats).
+    var kpiGrid = document.querySelector('#color-detail-overlay .detail-kpi-grid');
+    var discordanceNote = el('color-detail-discordance-note');
+    var anyDiscordance = matching.some(function(v) { return v.discordance; });
+    if (anyDiscordance) {
+        if (!discordanceNote && kpiGrid) {
+            discordanceNote = document.createElement('div');
+            discordanceNote.id = 'color-detail-discordance-note';
+            discordanceNote.style.margin = '10px 0';
+            discordanceNote.style.padding = '8px 12px';
+            discordanceNote.style.fontSize = '0.85rem';
+            discordanceNote.style.color = '#B45309';
+            discordanceNote.style.background = '#FFFBEB';
+            discordanceNote.style.borderRadius = '6px';
+            kpiGrid.insertAdjacentElement('afterend', discordanceNote);
+        }
+        if (discordanceNote) {
+            discordanceNote.textContent = '⚠️ Écart entre Total pièces (' + formatNumber(totalPieces) + ') et Stock total (' +
+                formatNumber(stockTotal) + ') : une partie du stock de cette couleur n\'est pas passée par une commande ' +
+                'fournisseur suivie (ajustement d\'inventaire, stock initial…) — Total pièces ne peut pas la voir par construction.';
+            discordanceNote.style.display = '';
+        }
+    } else if (discordanceNote) {
+        discordanceNote.style.display = 'none';
+    }
+
     var msgEl = el('color-detail-msg');
     if (msgEl) msgEl.textContent = 'Chargement du stock par magasin…';
     var tbody = el('color-detail-stores-tbody');

@@ -814,7 +814,25 @@ class MaVieDashboardController(http.Controller):
                 )
                 quant_domain_base.append(('product_id', 'in', [v['id'] for v in q_variants]))
 
+            # DÉCISION UTILISATEUR (2026-08-15) : les entrepôts hors des
+            # magasins actifs configurés (DIGITAL SHOP, MAGASIN ORANGER
+            # désactivé) ne doivent compter dans AUCUN total réseau retail —
+            # jusqu'ici seule la fiche produit appliquait cette règle
+            # (stock_by_store/retail_lot_stock_ids), le dashboard principal
+            # comptait ces 2 entrepôts via le seul filtre société, créant un
+            # écart vérifié de 568 pièces sur "Stock Réel Odoo" à l'échelle
+            # du réseau. Même restriction que _compute_product_detail :
+            # limiter aux lot_stock_id des entrepôts réellement mappés.
+            # N'affecte PAS quant_domain_base (valorisation), qui doit
+            # rester "toutes sociétés, tout entrepôt" par design (cf. plus haut).
+            retail_lot_stock_ids = request.env['stock.warehouse'].sudo().search([
+                ('company_id', 'not in', self._get_non_retail_company_ids()),
+                ('id', 'in', self._get_active_shop_mappings().mapped('warehouse_id').ids),
+            ]).mapped('lot_stock_id').ids
+
             quant_domain = quant_domain_base + [('company_id', 'not in', self._get_non_retail_company_ids())]
+            if retail_lot_stock_ids:
+                quant_domain = quant_domain + [('location_id', 'child_of', retail_lot_stock_ids)]
 
             quant_grouped = request.env['stock.quant'].sudo().read_group(
                 quant_domain,
@@ -1002,10 +1020,19 @@ class MaVieDashboardController(http.Controller):
             else:
                 context_company_ids = self._get_context_company_ids()
                 if context_company_ids:
-                    tmpl_ids_ctx = request.env['stock.quant'].sudo().search([
+                    # Même règle que stock_total : un entrepôt hors magasins
+                    # actifs mappés (retail_lot_stock_ids, calculé plus haut)
+                    # ne doit pas suffire à compter une référence comme
+                    # "présente" dans le réseau.
+                    refs_domain = [
                         ('location_id.usage', '=', 'internal'),
                         ('company_id', 'in', context_company_ids),
-                    ]).mapped('product_id.product_tmpl_id').ids
+                    ]
+                    if retail_lot_stock_ids:
+                        refs_domain.append(('location_id', 'child_of', retail_lot_stock_ids))
+                    tmpl_ids_ctx = request.env['stock.quant'].sudo().search(refs_domain).mapped(
+                        'product_id.product_tmpl_id'
+                    ).ids
                     references_count = (
                         ProductTemplate.search_count(references_exclude_domain + [('id', 'in', tmpl_ids_ctx)])
                         if tmpl_ids_ctx else 0

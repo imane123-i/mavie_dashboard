@@ -1100,6 +1100,23 @@ function _renderStockByStore(tbodyId, stores, activeShop) {
         return;
     }
 
+    // Ce tableau montre TOUJOURS tout le réseau, même quand "Filtrer par
+    // magasin" ci-dessus cible un seul magasin (utile pour voir où
+    // transférer depuis) — contrairement aux cartes KPI en haut, qui elles
+    // respectent ce filtre. Sans ce rappel, "0" en haut et un stock non-nul
+    // plus bas pour un AUTRE magasin semble contradictoire alors que les
+    // deux chiffres sont corrects, juste sur des périmètres différents.
+    if (activeShop) {
+        var scopeRow = document.createElement('tr');
+        var scopeTd = document.createElement('td');
+        scopeTd.colSpan = 3;
+        scopeTd.innerHTML = '<span style="font-size:0.78rem;color:#3730A3;background:#EEF2FF;border:1px solid #E0E7FF;border-radius:6px;padding:4px 10px;display:block;margin-bottom:4px;">'
+            + 'ℹ️ Ce tableau affiche tout le réseau, indépendamment du magasin filtré ci-dessus (⭐ = magasin filtré) — les cartes en haut de fiche, elles, ne montrent que ce magasin.'
+            + '</span>';
+        scopeRow.appendChild(scopeTd);
+        tbody.appendChild(scopeRow);
+    }
+
     var hasNegative = stores.some(function(s) { return (s.stock || 0) < 0; });
     if (hasNegative) {
         var noteRow = document.createElement('tr');

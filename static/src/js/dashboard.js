@@ -544,9 +544,13 @@ async function loadKPIs() {
         if (caAchatSplitEl) {
             // Achat externe (vrai fournisseur) vs achat interne (depuis
             // MOD FOR LIFE, au prix coûtant) — voir _get_mod_for_life_partner_id.
-            caAchatSplitEl.textContent = (data.qty_purchased > 0)
-                ? ('Externe : ' + formatMAD(data.ca_achat_externe) + ' · Interne (MOD FOR LIFE) : ' + formatMAD(data.ca_achat_interne))
-                : '';
+            // N'affiche que les parts réellement non nulles (pas de "Externe :
+            // 0,00 MAD" trompeur quand une société n'a que de l'achat interne,
+            // ou inversement).
+            var caSplitParts = [];
+            if (data.ca_achat_externe > 0) caSplitParts.push('Externe : ' + formatMAD(data.ca_achat_externe));
+            if (data.ca_achat_interne > 0) caSplitParts.push('Interne (MOD FOR LIFE) : ' + formatMAD(data.ca_achat_interne));
+            caAchatSplitEl.textContent = caSplitParts.join(' · ');
         }
         var caAchatByCompanyEl = el('kpi-ca-achat-by-company');
         if (caAchatByCompanyEl) {
@@ -1000,9 +1004,10 @@ async function _fetchAndRenderDetail() {
     }
     var detailCaAchatSplitEl = el('detail-ca-achat-split');
     if (detailCaAchatSplitEl) {
-        detailCaAchatSplitEl.textContent = (data.qty_purchased > 0)
-            ? ('Externe : ' + formatMAD(data.ca_achat_externe) + ' · Interne (MOD FOR LIFE) : ' + formatMAD(data.ca_achat_interne))
-            : '';
+        var detailCaSplitParts = [];
+        if (data.ca_achat_externe > 0) detailCaSplitParts.push('Externe : ' + formatMAD(data.ca_achat_externe));
+        if (data.ca_achat_interne > 0) detailCaSplitParts.push('Interne (MOD FOR LIFE) : ' + formatMAD(data.ca_achat_interne));
+        detailCaAchatSplitEl.textContent = detailCaSplitParts.join(' · ');
     }
 
     var stEl = el('detail-sell-through');

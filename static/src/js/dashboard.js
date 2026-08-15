@@ -522,6 +522,14 @@ async function loadKPIs() {
         if (stEl) {
             var st = data.sell_through || 0;
             stEl.style.color = st >= 70 ? '#10B981' : (st >= 40 ? '#F59E0B' : '#EF4444');
+            // Peut légitimement dépasser 100% : Qté vendue vient du POS,
+            // Qté achetée des commandes fournisseur — une partie du stock
+            // vendu peut provenir d'un stock initial/ajustement jamais
+            // passé par une commande fournisseur tracée (vendu > acheté
+            // dans les seules données suivies, sans que ce soit une erreur).
+            stEl.title = st > 100
+                ? 'Peut dépasser 100% : une partie du stock vendu provient d\'un stock initial ou d\'un ajustement jamais enregistré comme commande fournisseur suivie.'
+                : '';
         }
 
         var stockTotalKpiEl = el('kpi-stock-total');
@@ -1014,6 +1022,9 @@ async function _fetchAndRenderDetail() {
     if (stEl) {
         var st = data.sell_through || 0;
         stEl.style.color = st >= 70 ? '#10B981' : (st >= 40 ? '#F59E0B' : '#EF4444');
+        stEl.title = st > 100
+            ? 'Peut dépasser 100% : une partie du stock vendu provient d\'un stock initial ou d\'un ajustement jamais enregistré comme commande fournisseur suivie.'
+            : '';
     }
 
     var ecartEl = el('detail-stock-ecart');
@@ -1692,10 +1703,25 @@ function openColorDetail(articleId, productName, color) {
     if (caEl) caEl.textContent = formatMAD(ca);
     var totalPiecesEl = el('color-detail-total-pieces');
     if (totalPiecesEl) totalPiecesEl.textContent = hasTotalPieces ? formatNumber(totalPieces) : '—';
+    // Reste (achats - vendu, "papier") et Stock total (compte physique réel
+    // stock.quant) mesurent deux choses différentes et ne sont PAS censés
+    // être égaux — un écart signale un mouvement de stock hors achats/ventes
+    // suivis (stock initial, transfert, ajustement), pas une erreur de calcul.
     var resteEl = el('color-detail-reste');
-    if (resteEl) resteEl.textContent = (reste === null) ? '—' : formatNumber(reste);
+    if (resteEl) {
+        resteEl.textContent = (reste === null) ? '—' : formatNumber(reste);
+        resteEl.title = (reste !== null)
+            ? 'Reste = Total pièces (commandes fournisseur) − Qté vendue (POS). Estimation "papier", à comparer au Stock total physique ci-contre — un écart entre les deux est normal s\'il y a eu un mouvement hors achats/ventes suivis.'
+            : '';
+    }
     var stockTotalEl = el('color-detail-stock-total');
-    if (stockTotalEl) stockTotalEl.textContent = formatNumber(stockTotal);
+    if (stockTotalEl) {
+        stockTotalEl.textContent = formatNumber(stockTotal);
+        stockTotalEl.style.color = stockTotal < 0 ? '#EF4444' : '';
+        stockTotalEl.title = stockTotal < 0
+            ? 'Stock négatif : selon Odoo, plus de pièces sont sorties (ventes/transferts) de cet emplacement qu\'il n\'en a jamais été reçu — écart d\'inventaire réel à vérifier physiquement en magasin.'
+            : 'Compte physique réel (stock.quant), tous magasins mappés confondus.';
+    }
 
     var msgEl = el('color-detail-msg');
     if (msgEl) msgEl.textContent = 'Chargement du stock par magasin…';

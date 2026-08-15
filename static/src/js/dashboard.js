@@ -1061,6 +1061,37 @@ async function _fetchAndRenderDetail() {
 
     state.detail.variants = data.variants || [];
 
+    // Le tableau Variantes Couleurs ne liste que les couleurs ACTIVES —
+    // si des couleurs ont été discontinuées, leur historique achats/ventes
+    // reste compté dans les cartes KPI (Qté vendue/achetée, qui filtrent
+    // par produit entier, pas par variante) mais n'apparaît dans AUCUNE
+    // ligne du tableau ci-dessous. Sans ce rappel, la somme des lignes ne
+    // colle jamais aux cartes et ça ressemble à une erreur de calcul.
+    var visibleQtySold = (data.variants || []).reduce(function(s, v) { return s + (v.qty || 0); }, 0);
+    var archivedGapNote = document.querySelector('#detail-variants-archived-note');
+    var variantsSection = document.querySelector('#detail-variants-tbody') && document.querySelector('#detail-variants-tbody').closest('.detail-section');
+    var archivedGap = (data.qty_sold || 0) - visibleQtySold;
+    if (archivedGap > 0 && variantsSection) {
+        if (!archivedGapNote) {
+            archivedGapNote = document.createElement('div');
+            archivedGapNote.id = 'detail-variants-archived-note';
+            archivedGapNote.style.margin = '4px 0 10px';
+            archivedGapNote.style.padding = '6px 10px';
+            archivedGapNote.style.fontSize = '0.8rem';
+            archivedGapNote.style.color = '#3730A3';
+            archivedGapNote.style.background = '#EEF2FF';
+            archivedGapNote.style.borderRadius = '6px';
+            var h3 = variantsSection.querySelector('h3');
+            if (h3) h3.insertAdjacentElement('afterend', archivedGapNote);
+        }
+        archivedGapNote.textContent = 'ℹ️ ' + formatNumber(archivedGap) + ' vente(s) supplémentaire(s) sur des couleurs aujourd\'hui '
+            + 'désactivées/discontinuées (non listées ci-dessous) sont comptées dans les cartes en haut de fiche — '
+            + 'la somme du tableau ne peut donc pas toujours égaler "Qté vendue".';
+        archivedGapNote.style.display = '';
+    } else if (archivedGapNote) {
+        archivedGapNote.style.display = 'none';
+    }
+
     _renderStockByStore('detail-stock-pivot-tbody', data.stock_by_store, state.detail.shop_field);
     _renderVariants('detail-variants-tbody', data.variants, state.detail.shop_field, data.has_base_pivot_data);
     _renderVerification(data.verification);

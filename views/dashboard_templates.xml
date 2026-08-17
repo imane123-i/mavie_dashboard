@@ -1191,7 +1191,7 @@
                 <div class="kpi-grid" id="main-kpi-grid">
                     <div class="kpi-card kpi-blue" id="card-ca-achat">
                         <span class="kpi-icon">🧾</span>
-                        <div class="kpi-label">CA Achat</div>
+                        <div class="kpi-label" title="Montant hors taxes facturé sur les commandes fournisseur (purchase.order.line.price_subtotal) — même base que la colonne « Montant HT » dans Achats → Commandes d'achat.">CA Achat (HT)</div>
                         <div class="kpi-value" id="kpi-ca-achat">—</div>
                         <div class="kpi-subtext" id="kpi-ca-achat-note"></div>
                         <div class="kpi-subtext" id="kpi-ca-achat-split"></div>
@@ -1199,7 +1199,7 @@
                     </div>
                     <div class="kpi-card" id="card-ca-total">
                         <span class="kpi-icon">💰</span>
-                        <div class="kpi-label">CA Vendu</div>
+                        <div class="kpi-label" title="Montant toutes taxes comprises réellement encaissé en caisse (pos.order.line.price_subtotal_incl) — c'est ce que le client a payé. Attention : CA Achat est affiché HT, les deux ne sont donc pas directement comparables.">CA Vendu (TTC)</div>
                         <div class="kpi-value" id="kpi-ca-total">—</div>
                     </div>
                     <div class="kpi-card kpi-blue" id="card-tickets">
@@ -1508,14 +1508,15 @@
                             <div class="d-sublabel" id="detail-stock-ecart" style="display:none"></div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label">🧾 CA Achat</div>
+                            <div class="d-label" title="Montant hors taxes facturé sur les commandes fournisseur — même base que la colonne « Montant HT » dans Achats → Commandes d'achat.">🧾 CA Achat (HT)</div>
                             <div class="d-value" id="detail-ca-achat">—</div>
                             <div class="d-sublabel" id="detail-ca-achat-note"></div>
                             <div class="d-sublabel" id="detail-ca-achat-split"></div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label">💰 CA Vendu</div>
+                            <div class="d-label" title="Montant toutes taxes comprises réellement encaissé en caisse — c'est ce que le client a payé. Attention : CA Achat est affiché HT, les deux ne sont donc pas directement comparables.">💰 CA Vendu (TTC)</div>
                             <div class="d-value" id="detail-ca">—</div>
+                            <div class="d-sublabel" id="detail-ca-ht"></div>
                         </div>
                         <div class="detail-kpi-card">
                             <div class="d-label">📊 Sell-Through</div>

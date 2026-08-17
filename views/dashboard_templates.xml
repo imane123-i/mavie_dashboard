@@ -1494,16 +1494,16 @@
 
                     <div class="detail-kpi-grid">
                         <div class="detail-kpi-card">
-                            <div class="d-label">📤 Qté vendue</div>
+                            <div class="d-label" title="Ventes en caisse au client final uniquement (pos.order.line). Les transferts MOD FOR LIFE vers une société magasin (sale.order) ne sont PAS des ventes et sont exclus — c'est pourquoi ce chiffre est inférieur au bouton « Vendu » de la fiche produit Odoo, qui additionne les deux.">📤 Qté vendue <span style="opacity:.6;font-weight:400">(caisse)</span></div>
                             <div class="d-value" id="detail-qty-sold">—</div>
                             <div class="d-sublabel" id="detail-qty-sold-solde"></div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label">📥 Qté achetée</div>
+                            <div class="d-label" title="Achats des sociétés magasins uniquement. Les achats de MOD FOR LIFE chez le fournisseur externe sont exclus pour ne pas compter deux fois la même marchandise (une fois à l'import, une fois à la revente interne) — c'est pourquoi ce chiffre vaut environ la moitié du bouton « Acheté » de la fiche produit Odoo.">📥 Qté achetée <span style="opacity:.6;font-weight:400">(magasins)</span></div>
                             <div class="d-value" id="detail-qty-purchased">—</div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label">📦 Stock Réel Odoo</div>
+                            <div class="d-label" title="Stock physique présent dans les magasins actifs configurés. Le stock restant dans l'entrepôt MOD FOR LIFE, à DIGITAL SHOP ou dans un entrepôt non rattaché à un magasin actif est exclu — c'est pourquoi ce chiffre peut être inférieur au stock total affiché dans Inventaire.">📦 Stock Réel Odoo <span style="opacity:.6;font-weight:400">(magasins)</span></div>
                             <div class="d-value" id="detail-stock-total">—</div>
                             <div class="d-sublabel" id="detail-stock-ecart" style="display:none"></div>
                         </div>

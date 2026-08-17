@@ -548,29 +548,6 @@ async function loadKPIs() {
                 ? '⚠️ prix d\'achat non renseigné sur les commandes'
                 : '';
         }
-        var caAchatSplitEl = el('kpi-ca-achat-split');
-        if (caAchatSplitEl) {
-            // Achat externe (vrai fournisseur) vs achat interne (depuis
-            // MOD FOR LIFE, au prix coûtant) — voir _get_mod_for_life_partner_id.
-            // N'affiche que les parts réellement non nulles (pas de "Externe :
-            // 0,00 MAD" trompeur quand une société n'a que de l'achat interne,
-            // ou inversement).
-            var caSplitParts = [];
-            if (data.ca_achat_externe > 0) caSplitParts.push('Externe : ' + formatMAD(data.ca_achat_externe));
-            if (data.ca_achat_interne > 0) caSplitParts.push('Interne (MOD FOR LIFE) : ' + formatMAD(data.ca_achat_interne));
-            caAchatSplitEl.textContent = caSplitParts.join(' · ');
-        }
-        var caAchatByCompanyEl = el('kpi-ca-achat-by-company');
-        if (caAchatByCompanyEl) {
-            // Détail par société magasin (SALMEDO / BLACK AND GOLD /
-            // DELTA-GOLD) — la somme égale toujours le total ci-dessus ;
-            // n'affiche rien quand une seule société/magasin est déjà
-            // sélectionnée (le détail n'apporterait rien de plus).
-            var byCompany = data.ca_achat_by_company || [];
-            caAchatByCompanyEl.textContent = (byCompany.length > 1)
-                ? byCompany.map(function(c) { return c.societe + ' : ' + formatMAD(c.ca_achat); }).join(' · ')
-                : '';
-        }
         // Le backend renvoie toujours jusqu'à 100 lignes (voir dashboard.py) ;
         // on garde la liste complète en cache pour pouvoir changer le nombre
         // affiché (10/20/50...) sans refaire tout l'appel KPI (coûteux).
@@ -1020,13 +997,6 @@ async function _fetchAndRenderDetail() {
         detailCaAchatNoteEl.textContent = (data.ca_achat === 0 && data.qty_purchased > 0)
             ? '⚠️ prix d\'achat non renseigné'
             : '';
-    }
-    var detailCaAchatSplitEl = el('detail-ca-achat-split');
-    if (detailCaAchatSplitEl) {
-        var detailCaSplitParts = [];
-        if (data.ca_achat_externe > 0) detailCaSplitParts.push('Externe : ' + formatMAD(data.ca_achat_externe));
-        if (data.ca_achat_interne > 0) detailCaSplitParts.push('Interne (MOD FOR LIFE) : ' + formatMAD(data.ca_achat_interne));
-        detailCaAchatSplitEl.textContent = detailCaSplitParts.join(' · ');
     }
 
     var stEl = el('detail-sell-through');

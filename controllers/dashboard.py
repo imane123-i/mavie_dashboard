@@ -606,8 +606,6 @@ class MaVieDashboardController(http.Controller):
                 if not products:
                     return {
                         'ca_total': 0, 'ca_ht': 0, 'ca_achat': 0,
-                        'ca_achat_externe': 0, 'ca_achat_interne': 0, 'ca_achat_by_company': [],
-                        'qty_purchased_externe': 0, 'qty_purchased_interne': 0,
                         'vendu_avec_cout': 0, 'marge': 0,
                         'tickets': 0, 'panier_moyen': 0,
                         'qty_sold': 0, 'qty_sold_normal': 0, 'qty_sold_solde': 0,
@@ -717,41 +715,12 @@ class MaVieDashboardController(http.Controller):
             # qty*prix_standard.
             ca_achat_total = sum(g.get('price_subtotal') or 0.0 for g in po_grouped)
 
-            # Achat externe (vrai fournisseur) vs achat interne (depuis
-            # MOD FOR LIFE, au prix coûtant) — une requête supplémentaire sur
-            # le même domaine + filtre fournisseur, pas un nouveau scan
-            # complet (externe se déduit par soustraction du total déjà
-            # calculé ci-dessus).
-            mod_for_life_partner_id = self._get_mod_for_life_partner_id()
-            qty_purchased_interne = 0
-            ca_achat_interne = 0.0
-            if mod_for_life_partner_id:
-                po_grouped_interne = request.env['purchase.order.line'].sudo().read_group(
-                    purchase_domain + [('partner_id', '=', mod_for_life_partner_id)],
-                    ['product_qty:sum', 'price_subtotal:sum'], [], lazy=False
-                )
-                if po_grouped_interne:
-                    qty_purchased_interne = int(po_grouped_interne[0].get('product_qty') or 0)
-                    ca_achat_interne = po_grouped_interne[0].get('price_subtotal') or 0.0
-            qty_purchased_externe = qty_purchased_total - qty_purchased_interne
-            ca_achat_externe = ca_achat_total - ca_achat_interne
-
-            # Répartition CA Achat par société magasin (SALMEDO / BLACK AND
-            # GOLD / DELTA-GOLD) — le total ci-dessus combine déjà les 3
-            # (vérifié en base : somme des 3 = total non filtré), mais on
-            # veut aussi voir la contribution de chacune, pas seulement le
-            # combiné, surtout quand aucun filtre société précis n'est actif.
-            ca_achat_by_company = []
-            po_grouped_by_company = request.env['purchase.order.line'].sudo().read_group(
-                purchase_domain, ['price_subtotal:sum', 'company_id'], ['company_id'], lazy=False
-            )
-            for g in po_grouped_by_company:
-                if g.get('company_id'):
-                    ca_achat_by_company.append({
-                        'societe': g['company_id'][1],
-                        'ca_achat': round(g.get('price_subtotal') or 0.0, 2),
-                    })
-            ca_achat_by_company.sort(key=lambda x: -x['ca_achat'])
+            # NB (décision utilisateur 2026-08-17) : la répartition du CA Achat
+            # en externe/interne (MOD FOR LIFE) et par société magasin a été
+            # retirée — le sélecteur de société standard permet déjà de voir
+            # chaque société séparément, la carte doit rester un total général.
+            # Les 2 read_group supplémentaires que ça demandait ont été
+            # supprimés avec, pas seulement masqués côté affichage.
 
             # Sell-through = part du stock reçu qui a été vendue : vendu / acheté.
             # (PAS vendu / (vendu + acheté), qui donnait un chiffre bien trop bas.)
@@ -1450,11 +1419,6 @@ class MaVieDashboardController(http.Controller):
                 'ca_total': round(ca_total, 2),
                 'ca_ht': round(ca_ht_total, 2),
                 'ca_achat': round(ca_achat_total, 2),
-                'ca_achat_externe': round(ca_achat_externe, 2),
-                'ca_achat_interne': round(ca_achat_interne, 2),
-                'ca_achat_by_company': ca_achat_by_company,
-                'qty_purchased_externe': qty_purchased_externe,
-                'qty_purchased_interne': qty_purchased_interne,
                 'vendu_avec_cout': round(vendu_avec_cout_total, 2),
                 'marge': round(marge_total, 2),
                 'tickets': tickets,
@@ -1878,17 +1842,9 @@ class MaVieDashboardController(http.Controller):
             # reconstruction qty*prix_standard.
             ca_achat = sum(po_lines.mapped('price_subtotal')) if po_lines else 0.0
 
-            # Achat externe (vrai fournisseur) vs achat interne (depuis
-            # MOD FOR LIFE, au prix coûtant) — même logique que _compute_kpis.
-            mod_for_life_partner_id = self._get_mod_for_life_partner_id()
-            po_lines_interne = (
-                po_lines.filtered(lambda l: l.partner_id.id == mod_for_life_partner_id)
-                if mod_for_life_partner_id else po_lines.browse()
-            )
-            qty_purchased_interne = int(sum(po_lines_interne.mapped('product_qty'))) if po_lines_interne else 0
-            ca_achat_interne = sum(po_lines_interne.mapped('price_subtotal')) if po_lines_interne else 0.0
-            qty_purchased_externe = qty_purchased - qty_purchased_interne
-            ca_achat_externe = ca_achat - ca_achat_interne
+            # NB : la répartition externe/interne (MOD FOR LIFE) du CA Achat a
+            # été retirée ici aussi (voir _compute_kpis) — le sélecteur de
+            # société joue déjà ce rôle, la carte reste un total général.
 
             # Marge (%) = (prix de vente - prix d'achat moyen réel) / prix de
             # vente. Le prix d'achat moyen vient des mêmes commandes
@@ -2257,10 +2213,6 @@ class MaVieDashboardController(http.Controller):
                 'ca': ca,
                 'ca_ht': round(ca_ht, 2),
                 'ca_achat': round(ca_achat, 2),
-                'ca_achat_externe': round(ca_achat_externe, 2),
-                'ca_achat_interne': round(ca_achat_interne, 2),
-                'qty_purchased_externe': qty_purchased_externe,
-                'qty_purchased_interne': qty_purchased_interne,
                 'vendu_avec_cout': round(vendu_avec_cout, 2),
                 'marge': round(marge, 2),
                 'margin': margin,

@@ -1207,13 +1207,13 @@
                 <div class="kpi-grid" id="main-kpi-grid">
                     <div class="kpi-card kpi-blue" id="card-ca-achat">
                         <span class="kpi-icon">🧾</span>
-                        <div class="kpi-label" title="Montant hors taxes facturé sur les commandes fournisseur (purchase.order.line.price_subtotal) — même base que la colonne « Montant HT » dans Achats → Commandes d'achat.">CA Achat (HT)</div>
+                        <div class="kpi-label" title="Montant TTC facturé sur les commandes fournisseur — colonne « Total » dans Achats → Analyse.">CA Achat (TTC)</div>
                         <div class="kpi-value" id="kpi-ca-achat">—</div>
                         <div class="kpi-subtext" id="kpi-ca-achat-note"></div>
                     </div>
                     <div class="kpi-card" id="card-ca-total">
                         <span class="kpi-icon">💰</span>
-                        <div class="kpi-label" title="Montant toutes taxes comprises réellement encaissé en caisse (pos.order.line.price_subtotal_incl) — c'est ce que le client a payé. Attention : CA Achat est affiché HT, les deux ne sont donc pas directement comparables.">CA Vendu (TTC)</div>
+                        <div class="kpi-label" title="Montant toutes taxes comprises réellement encaissé en caisse (pos.order.line.price_subtotal_incl) — c'est ce que le client a payé. CA Achat est lui aussi en TTC, les deux sont donc directement comparables.">CA Vendu (TTC)</div>
                         <div class="kpi-value" id="kpi-ca-total">—</div>
                     </div>
                     <div class="kpi-card kpi-blue" id="card-tickets">
@@ -1259,7 +1259,7 @@
                     <div class="kpi-grid">
                         <div class="kpi-card kpi-blue" id="card-mfl-achats">
                             <span class="kpi-icon">🧾</span>
-                            <div class="kpi-label" title="Montant hors taxes des commandes fournisseur confirmées de MOD FOR LIFE chez de vrais fournisseurs externes (hors flux inter-sociétés). Vérifiable dans Achats → Analyse, société MOD FOR LIFE.">Achats fournisseurs (HT)</div>
+                            <div class="kpi-label" title="Montant TTC des commandes fournisseur confirmées de MOD FOR LIFE chez de vrais fournisseurs externes (hors flux inter-sociétés). Vérifiable dans Achats → Analyse, société MOD FOR LIFE.">Achats fournisseurs (TTC)</div>
                             <div class="kpi-value" id="mfl-ca-achats">—</div>
                             <div class="kpi-subtext" id="mfl-qty-achats-sub"></div>
                         </div>
@@ -1270,7 +1270,7 @@
                         </div>
                         <div class="kpi-card kpi-green" id="card-mfl-ventes">
                             <span class="kpi-icon">💰</span>
-                            <div class="kpi-label" title="Montant hors taxes des commandes de vente confirmées de MOD FOR LIFE vers les 3 sociétés magasins, au prix coûtant. Vérifiable dans Ventes → Analyse → Ventes, filtre « Bons de commande », société MOD FOR LIFE.">Envoyé aux sociétés magasins (HT)</div>
+                            <div class="kpi-label" title="Montant TTC des commandes de vente confirmées de MOD FOR LIFE vers les 3 sociétés magasins, au prix coûtant. Vérifiable dans Ventes → Analyse → Ventes, filtre « Bons de commande », société MOD FOR LIFE.">Envoyé aux sociétés magasins (TTC)</div>
                             <div class="kpi-value" id="mfl-ca-ventes">—</div>
                             <div class="kpi-subtext" id="mfl-qty-ventes-sub"></div>
                         </div>
@@ -1416,7 +1416,7 @@
                                     <th>#</th>
                                     <th>Produit</th>
                                     <th>Réf</th>
-                                    <th title="Montant hors taxes des commandes fournisseur confirmées pour cette référence.">CA Achat (HT)</th>
+                                    <th title="Montant TTC des commandes fournisseur confirmées pour cette référence.">CA Achat (TTC)</th>
                                     <th title="Montant toutes taxes comprises encaissé en caisse pour cette référence.">CA Vendu (TTC)</th>
                                     <th title="Quantité achetée par les magasins (commandes fournisseur confirmées).">Qté achetée</th>
                                     <th title="Quantité vendue en caisse (POS).">Qté vendue</th>
@@ -1440,7 +1440,7 @@
                                     <th>#</th>
                                     <th>Produit</th>
                                     <th>Réf</th>
-                                    <th title="Montant hors taxes des commandes fournisseur confirmées pour cette référence.">CA Achat (HT)</th>
+                                    <th title="Montant TTC des commandes fournisseur confirmées pour cette référence.">CA Achat (TTC)</th>
                                     <th title="Montant toutes taxes comprises encaissé en caisse pour cette référence.">CA Vendu (TTC)</th>
                                     <th title="Quantité achetée par les magasins (commandes fournisseur confirmées).">Qté achetée</th>
                                     <th title="Quantité vendue en caisse (POS).">Qté vendue</th>
@@ -1528,12 +1528,12 @@
                             <div class="d-sublabel" id="detail-stock-ecart" style="display:none"></div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label" title="Montant hors taxes facturé sur les commandes fournisseur — même base que la colonne « Montant HT » dans Achats → Commandes d'achat.">🧾 CA Achat (HT)</div>
+                            <div class="d-label" title="Montant TTC facturé sur les commandes fournisseur — colonne « Total » dans Achats → Analyse.">🧾 CA Achat (TTC)</div>
                             <div class="d-value" id="detail-ca-achat">—</div>
                             <div class="d-sublabel" id="detail-ca-achat-note"></div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label" title="Montant toutes taxes comprises réellement encaissé en caisse — c'est ce que le client a payé. Attention : CA Achat est affiché HT, les deux ne sont donc pas directement comparables.">💰 CA Vendu (TTC)</div>
+                            <div class="d-label" title="Montant toutes taxes comprises réellement encaissé en caisse — c'est ce que le client a payé. CA Achat est lui aussi en TTC, les deux sont donc directement comparables.">💰 CA Vendu (TTC)</div>
                             <div class="d-value" id="detail-ca">—</div>
                             <div class="d-sublabel" id="detail-ca-ht"></div>
                         </div>

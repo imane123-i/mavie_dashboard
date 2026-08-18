@@ -1008,16 +1008,11 @@ async function _fetchAndRenderDetail() {
         detailQtySoldSoldeEl.textContent = data.qty_sold_solde ? ('dont ' + formatNumber(data.qty_sold_solde) + ' en solde') : '';
     }
 
-    // CA Vendu est affiché TTC (ce que le client a payé) alors que CA Achat
-    // est HT (ce qui est facturé par le fournisseur) — deux bases fiscales
-    // différentes côte à côte. On affiche l'équivalent HT du CA Vendu pour
-    // permettre une comparaison HT contre HT sans calcul mental.
+    // Tous les CA du dashboard sont désormais en TTC (décision utilisateur
+    // 2026-08-18) : la ligne "soit X HT", qui servait à comparer avec un
+    // CA Achat en HT, n'a plus lieu d'être.
     var detailCaHtEl = el('detail-ca-ht');
-    if (detailCaHtEl) {
-        detailCaHtEl.textContent = (data.ca_ht && data.ca_ht !== data.ca)
-            ? ('soit ' + formatMAD(data.ca_ht) + ' HT')
-            : '';
-    }
+    if (detailCaHtEl) detailCaHtEl.textContent = '';
 
     var detailCaAchatNoteEl = el('detail-ca-achat-note');
     if (detailCaAchatNoteEl) {

@@ -1036,13 +1036,16 @@ class MaVieDashboardController(http.Controller):
             purchase_domain = self._build_purchase_domain(kw, product_tmpl_ids)
             po_grouped = self._group_sums(
                 'purchase.order.line', purchase_domain,
-                ['product_qty', 'price_subtotal'],
+                ['product_qty', 'price_total', 'price_subtotal'],
             )
             qty_purchased_total = int(sum(g.get('product_qty') or 0 for g in po_grouped))
-            # CA Achat = coût réel des marchandises achetées (HT, tel que
-            # facturé sur les bons de commande), pas une reconstruction
-            # qty*prix_standard.
-            ca_achat_total = sum(g.get('price_subtotal') or 0.0 for g in po_grouped)
+            # CA Achat = coût réel des marchandises achetées, tel que facturé
+            # sur les bons de commande (pas une reconstruction
+            # qty*prix_standard). DÉCISION UTILISATEUR (2026-08-18) : affiché
+            # en TTC comme tous les autres CA du dashboard. La version HT
+            # reste calculée à côté car la marge doit comparer du HT à du HT.
+            ca_achat_total = sum(g.get('price_total') or 0.0 for g in po_grouped)
+            ca_achat_ht_total = sum(g.get('price_subtotal') or 0.0 for g in po_grouped)
 
             # NB (décision utilisateur 2026-08-17) : la répartition du CA Achat
             # en externe/interne (MOD FOR LIFE) et par société magasin a été
@@ -1061,6 +1064,7 @@ class MaVieDashboardController(http.Controller):
             # (price_subtotal), il suffit de l'accumuler comme les quantités
             # pour pouvoir l'afficher dans les tableaux Top/Flop.
             ca_achat_by_tmpl = {}
+            ca_achat_ht_by_tmpl = {}
             if po_pids:
                 po_prods = request.env['product.product'].sudo().search_read(
                     [('id', 'in', po_pids)],
@@ -1073,7 +1077,11 @@ class MaVieDashboardController(http.Controller):
                     if not tid:
                         continue
                     purchase_by_tmpl[tid] = purchase_by_tmpl.get(tid, 0) + int(g.get('product_qty') or 0)
-                    ca_achat_by_tmpl[tid] = ca_achat_by_tmpl.get(tid, 0.0) + (g.get('price_subtotal') or 0.0)
+                    # TTC pour l'affichage (colonne CA Achat du Top/Flop)
+                    ca_achat_by_tmpl[tid] = ca_achat_by_tmpl.get(tid, 0.0) + (g.get('price_total') or 0.0)
+                    # HT pour l'estimation du coût unitaire (valorisation) :
+                    # un coût de stock se raisonne hors taxes.
+                    ca_achat_ht_by_tmpl[tid] = ca_achat_ht_by_tmpl.get(tid, 0.0) + (g.get('price_subtotal') or 0.0)
 
             # ✅ Groupement Stock Quant (SQL GROUP BY product_id) — même
             # principe : stock_total se déduit de quant_grouped (quant_agg
@@ -1737,7 +1745,7 @@ class MaVieDashboardController(http.Controller):
                 # pas la confondre avec un coût réellement saisi.
                 prix_achat_moyen_by_tmpl = {}
                 for tid, qte in purchase_by_tmpl.items():
-                    montant = ca_achat_by_tmpl.get(tid) or 0.0
+                    montant = ca_achat_ht_by_tmpl.get(tid) or 0.0
                     if qte and montant > 0:
                         prix_achat_moyen_by_tmpl[tid] = montant / qte
 
@@ -1910,10 +1918,11 @@ class MaVieDashboardController(http.Controller):
                 po_domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
 
             po_grouped = request.env['purchase.order.line'].sudo().read_group(
-                po_domain, ['product_qty:sum', 'price_subtotal:sum'], [], lazy=False
+                po_domain, ['product_qty:sum', 'price_total:sum'], [], lazy=False
             )
             qty_achats_fournisseurs = int(po_grouped[0].get('product_qty') or 0) if po_grouped else 0
-            ca_achats_fournisseurs = round(po_grouped[0].get('price_subtotal') or 0.0, 2) if po_grouped else 0.0
+            # TTC, comme tous les CA du dashboard (décision 2026-08-18).
+            ca_achats_fournisseurs = round(po_grouped[0].get('price_total') or 0.0, 2) if po_grouped else 0.0
 
             po_tickets_agg = request.env['purchase.order.line'].sudo().read_group(
                 po_domain, ['order_id:count_distinct'], []
@@ -1939,7 +1948,7 @@ class MaVieDashboardController(http.Controller):
 
             so_grouped = request.env['sale.order.line'].sudo().read_group(
                 so_domain,
-                ['product_uom_qty:sum', 'price_subtotal:sum', 'order_partner_id'],
+                ['product_uom_qty:sum', 'price_total:sum', 'order_partner_id'],
                 ['order_partner_id'],
                 lazy=False
             )
@@ -1950,7 +1959,7 @@ class MaVieDashboardController(http.Controller):
             for g in so_grouped:
                 pid = g['order_partner_id'][0] if g.get('order_partner_id') else None
                 qty = g.get('product_uom_qty') or 0.0
-                ca = g.get('price_subtotal') or 0.0
+                ca = g.get('price_total') or 0.0
                 qty_ventes_total += qty
                 ca_ventes_total += ca
                 ventes_par_societe.append({
@@ -2021,7 +2030,7 @@ class MaVieDashboardController(http.Controller):
         writer.writerow(['Top Produits' if kind != 'flop' else 'Flop Produits'])
         # Mêmes colonnes et même ordre qu'à l'écran.
         writer.writerow([
-            '#', 'Produit', 'Réf', 'CA Achat (HT)', 'CA Vendu (TTC)',
+            '#', 'Produit', 'Réf', 'CA Achat (TTC)', 'CA Vendu (TTC)',
             'Qté achetée', 'Qté vendue', 'Reste', 'Stock',
         ])
         for row in rows or []:
@@ -2288,9 +2297,11 @@ class MaVieDashboardController(http.Controller):
             purchase_domain = self._build_purchase_domain(kw, [product_tmpl.id])
             po_lines = request.env['purchase.order.line'].sudo().search(purchase_domain)
             qty_purchased = int(sum(po_lines.mapped('product_qty'))) if po_lines else 0
-            # CA Achat = coût réel des achats (HT, tel que facturé), pas une
-            # reconstruction qty*prix_standard.
-            ca_achat = sum(po_lines.mapped('price_subtotal')) if po_lines else 0.0
+            # CA Achat = coût réel des achats tel que facturé, affiché en TTC
+            # comme tous les CA (décision utilisateur 2026-08-18). La version
+            # HT sert à la marge, qui doit comparer du HT à du HT.
+            ca_achat = sum(po_lines.mapped('price_total')) if po_lines else 0.0
+            ca_achat_ht = sum(po_lines.mapped('price_subtotal')) if po_lines else 0.0
 
             # NB : la répartition externe/interne (MOD FOR LIFE) du CA Achat a
             # été retirée ici aussi (voir _compute_kpis) — le sélecteur de
@@ -2301,9 +2312,10 @@ class MaVieDashboardController(http.Controller):
             # fournisseur que CA Achat/Qté Achetée ci-dessus (pas de nouvelle
             # source) — None (pas 0) quand la donnée n'existe pas, pour ne
             # pas laisser croire à une marge nulle.
+            # list_price est HT, donc on compare avec le prix d'achat HT.
             pv_ttc_ref = product_tmpl.list_price or 0.0
-            if qty_purchased > 0 and ca_achat > 0 and pv_ttc_ref > 0:
-                prix_achat_moyen = ca_achat / qty_purchased
+            if qty_purchased > 0 and ca_achat_ht > 0 and pv_ttc_ref > 0:
+                prix_achat_moyen = ca_achat_ht / qty_purchased
                 margin = round((pv_ttc_ref - prix_achat_moyen) / pv_ttc_ref * 100, 1)
             else:
                 margin = None

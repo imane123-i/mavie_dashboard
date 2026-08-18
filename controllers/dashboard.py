@@ -1774,14 +1774,18 @@ class MaVieDashboardController(http.Controller):
         writer = csv.writer(buffer, delimiter=';')
         writer.writerow(['Top Produits' if kind != 'flop' else 'Flop Produits'])
         # Mêmes colonnes et même ordre qu'à l'écran.
-        writer.writerow(['#', 'Produit', 'Réf', 'CA Achat (HT)', 'Qté achetée', 'Qté vendue', 'Reste', 'Stock'])
+        writer.writerow([
+            '#', 'Produit', 'Réf', 'CA Achat (HT)', 'CA Vendu (TTC)',
+            'Qté achetée', 'Qté vendue', 'Reste', 'Stock',
+        ])
         for row in rows or []:
             # Reste = acheté − vendu, même définition qu'à l'écran.
             qty_sold_row = row.get('qty_sold', row.get('qty', 0)) or 0
             qty_purchased_row = row.get('qty_purchased', 0) or 0
             writer.writerow([
                 row.get('rank'), row.get('name'), row.get('ref'),
-                row.get('ca_achat', 0), qty_purchased_row, qty_sold_row,
+                row.get('ca_achat', 0), row.get('ca', 0),
+                qty_purchased_row, qty_sold_row,
                 qty_purchased_row - qty_sold_row, row.get('stock', 0),
             ])
 

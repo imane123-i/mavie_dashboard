@@ -639,7 +639,7 @@ function _renderProductTable(tbodyId, products, isFlop) {
     if (!products || products.length === 0) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 7;
+        td.colSpan = 8;
         td.textContent = 'Aucun produit';
         td.style.textAlign = 'center';
         td.style.color = '#999';
@@ -680,6 +680,10 @@ function _renderProductTable(tbodyId, products, isFlop) {
             tdCaAchat.title = 'Prix d\'achat non renseigné sur les commandes de cette référence.';
         }
         tr.appendChild(tdCaAchat);
+
+        var tdCaVendu = document.createElement('td');
+        tdCaVendu.textContent = formatMAD(p.ca || 0);
+        tr.appendChild(tdCaVendu);
 
         var tdAchat = document.createElement('td');
         tdAchat.textContent = formatNumber(p.qty_purchased || 0);

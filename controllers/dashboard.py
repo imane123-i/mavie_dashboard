@@ -198,13 +198,103 @@ class MaVieDashboardController(http.Controller):
             '|', ('name', 'ilike', 'sachet'), ('name', 'ilike', 'sacher'),
         ]).ids
 
+    def _group_sums(self, model_name, domain, sum_fields, group_fields=('product_id',), agg='SUM'):
+        """read_group par product_id (et éventuellement company_id) SANS le
+        surcoût de libellé d'Odoo.
+
+        ⚡ PERF : read_group groupé sur un many2one fait ensuite un name_get
+        sur CHAQUE groupe pour renvoyer (id, "nom affiché"). Sur
+        pos.order.line ça représente 38 394 produits à nommer : mesuré à
+        12-15 s, alors que l'agrégation SQL seule prend 0,56 s (EXPLAIN
+        ANALYZE). Le dashboard n'utilise QUE les ids (g['product_id'][0]),
+        jamais le libellé — on exécute donc l'agrégation directement et on
+        renvoie la même forme, avec un libellé vide.
+
+        Le domaine passe par _where_calc + _apply_ir_rules : les filtres et
+        les règles de sécurité restent rigoureusement identiques à ceux de
+        read_group.
+        """
+        Model = request.env[model_name].sudo()
+        query = Model._where_calc(domain)
+        Model._apply_ir_rules(query, 'read')
+        from_clause, where_clause, params = query.get_sql()
+        table = Model._table
+        cols = ', '.join('"%s"."%s"' % (table, f) for f in group_fields)
+        sums = ', '.join('%s("%s"."%s")' % (agg, table, f) for f in sum_fields)
+        request.env.cr.execute(
+            'SELECT %s, %s FROM %s WHERE %s GROUP BY %s' % (
+                cols, sums, from_clause, where_clause or 'TRUE', cols),
+            params,
+        )
+        rows = request.env.cr.fetchall()
+        n_group = len(group_fields)
+        out = []
+        for row in rows:
+            rec = {}
+            for i, f in enumerate(group_fields):
+                # Même forme que read_group : (id, libellé). Le libellé n'est
+                # pas utilisé par le dashboard, on évite donc de le calculer.
+                rec[f] = (row[i], '') if row[i] is not None else False
+            for j, f in enumerate(sum_fields):
+                val = row[n_group + j]
+                # Les agrégats non numériques (MAX sur une date) doivent
+                # rester tels quels ; seul un total absent vaut 0.
+                rec[f] = val if val is not None else (None if agg != 'SUM' else 0.0)
+            out.append(rec)
+        return out
+
+    def _get_sachet_variant_ids(self):
+        """Variantes (product.product) de la collection Sachet.
+
+        ⚡ PERF : c'est LA optimisation la plus rentable du dashboard. Écrire
+        ('product_id.product_tmpl_id.collection_id', 'not in', [...]) oblige
+        Postgres à rejoindre product_product + product_template pour CHAQUE
+        ligne scannée — mesuré à 15,1 s sur les 417 000 lignes de
+        pos_order_line. La même exclusion exprimée en IDs de variantes
+        ('product_id', 'not in', [...]) tombe à 1,8 s, soit 13 s gagnées sur
+        un seul écran. La collection Sachet ne contient qu'une poignée de
+        variantes, donc la liste d'IDs reste minuscule.
+        """
+        # Mémorisé pour la durée de la requête HTTP : _sachet_exclude_domain
+        # est appelé une dizaine de fois par chargement du dashboard.
+        cached = getattr(request, '_mavie_sachet_variant_ids', None)
+        if cached is not None:
+            return cached
+        collection_ids = self._get_sachet_collection_ids()
+        variant_ids = []
+        if collection_ids:
+            # active_test=False des DEUX côtés : le template "SACHET A" est
+            # archivé mais ses ventes historiques existent toujours. Sans ça
+            # l'exclusion le laissait passer et Qté Vendue gonflait de
+            # ~24 000 pièces par rapport à l'ancien filtre relationnel, qui
+            # lui ignorait le flag actif.
+            tmpl_ids = request.env['product.template'].sudo().with_context(
+                active_test=False
+            ).search([('collection_id', 'in', collection_ids)]).ids
+            if tmpl_ids:
+                variant_ids = request.env['product.product'].sudo().with_context(
+                    active_test=False
+                ).search([('product_tmpl_id', 'in', tmpl_ids)]).ids
+        try:
+            request._mavie_sachet_variant_ids = variant_ids
+        except AttributeError:
+            pass
+        return variant_ids
+
     def _sachet_exclude_domain(self, path='collection_id'):
-        """Domaine d'exclusion de la collection Sachet, via un chemin relationnel
-        (ex: 'collection_id' sur product.template, ou
-        'product_id.product_tmpl_id.collection_id' sur pos.order.line /
-        purchase.order.line / stock.quant)."""
-        ids = self._get_sachet_collection_ids()
-        return [(path, 'not in', ids)] if ids else []
+        """Domaine d'exclusion de la collection Sachet.
+
+        Sur product.template on filtre directement collection_id. Sur les
+        modèles de lignes (pos.order.line, purchase.order.line, stock.quant,
+        sale.order.line...), on passe par les IDs de variantes plutôt que par
+        le chemin relationnel, pour la raison de performance détaillée dans
+        _get_sachet_variant_ids.
+        """
+        if path == 'collection_id':
+            ids = self._get_sachet_collection_ids()
+            return [(path, 'not in', ids)] if ids else []
+        variant_ids = self._get_sachet_variant_ids()
+        return [('product_id', 'not in', variant_ids)] if variant_ids else []
 
     # ─────────────────────────────────────────────────────────────
     # DOMAINS
@@ -537,13 +627,10 @@ class MaVieDashboardController(http.Controller):
             for sm in shop_mappings:
                 if not sm.warehouse_id or not sm.warehouse_id.lot_stock_id:
                     continue
-                q_grouped = request.env['stock.quant'].sudo().read_group(
-                    [
-                        ('product_id', 'in', all_variant_ids),
-                        ('location_id', 'child_of', sm.warehouse_id.lot_stock_id.id),
-                    ],
-                    ['quantity:sum', 'product_id'], ['product_id'], lazy=False
-                )
+                q_grouped = self._group_sums('stock.quant', [
+                    ('product_id', 'in', all_variant_ids),
+                    ('location_id', 'child_of', sm.warehouse_id.lot_stock_id.id),
+                ], ['quantity'])
                 qty_by_variant = {g['product_id'][0]: g.get('quantity') or 0.0 for g in q_grouped if g.get('product_id')}
                 label = sm.warehouse_id.name if sm.warehouse_id else (sm.shop_label or sm.shop_field)
                 for tid, vids in variant_ids_by_tid.items():
@@ -609,14 +696,11 @@ class MaVieDashboardController(http.Controller):
                 continue
             label = sm.warehouse_id.name or sm.shop_label or sm.shop_field
             loc_id = sm.warehouse_id.lot_stock_id.id
-            grouped = request.env['stock.move.line'].sudo().read_group(
-                [
-                    ('product_id', 'in', all_variant_ids),
-                    ('state', '=', 'done'),
-                    '|', ('location_id', 'child_of', loc_id), ('location_dest_id', 'child_of', loc_id),
-                ],
-                ['date:max', 'product_id'], ['product_id'], lazy=False
-            )
+            grouped = self._group_sums('stock.move.line', [
+                ('product_id', 'in', all_variant_ids),
+                ('state', '=', 'done'),
+                '|', ('location_id', 'child_of', loc_id), ('location_dest_id', 'child_of', loc_id),
+            ], ['date'], agg='MAX')
             for g in grouped:
                 pid = g['product_id'][0] if g.get('product_id') else None
                 tid = tmpl_by_variant.get(pid)
@@ -792,11 +876,9 @@ class MaVieDashboardController(http.Controller):
             # peut pas se déduire d'un regroupement par produit (une commande
             # multi-produits serait comptée plusieurs fois) : c'est la seule
             # requête encore séparée.
-            pos_grouped = request.env['pos.order.line'].sudo().read_group(
-                pos_domain,
-                ['price_subtotal_incl:sum', 'price_subtotal:sum', 'qty:sum', 'product_id'],
-                ['product_id'],
-                lazy=False
+            pos_grouped = self._group_sums(
+                'pos.order.line', pos_domain,
+                ['price_subtotal_incl', 'price_subtotal', 'qty'],
             )
             ca_total = sum(g.get('price_subtotal_incl') or 0.0 for g in pos_grouped)
             # CA hors taxe — utilisé pour comparer à un coût (HT lui aussi),
@@ -952,11 +1034,9 @@ class MaVieDashboardController(http.Controller):
             # s'obtient en sommant les groupes au lieu d'un 2e scan complet
             # (po_agg supprimé).
             purchase_domain = self._build_purchase_domain(kw, product_tmpl_ids)
-            po_grouped = request.env['purchase.order.line'].sudo().read_group(
-                purchase_domain,
-                ['product_qty:sum', 'price_subtotal:sum', 'product_id'],
-                ['product_id'],
-                lazy=False
+            po_grouped = self._group_sums(
+                'purchase.order.line', purchase_domain,
+                ['product_qty', 'price_subtotal'],
             )
             qty_purchased_total = int(sum(g.get('product_qty') or 0 for g in po_grouped))
             # CA Achat = coût réel des marchandises achetées (HT, tel que
@@ -1074,12 +1154,7 @@ class MaVieDashboardController(http.Controller):
             if retail_lot_stock_ids:
                 quant_domain = quant_domain + [('location_id', 'child_of', retail_lot_stock_ids)]
 
-            quant_grouped = request.env['stock.quant'].sudo().read_group(
-                quant_domain,
-                ['quantity:sum', 'product_id'],
-                ['product_id'],
-                lazy=False
-            )
+            quant_grouped = self._group_sums('stock.quant', quant_domain, ['quantity'])
             stock_total = int(sum(g.get('quantity') or 0 for g in quant_grouped))
             quant_pids = [g['product_id'][0] for g in quant_grouped if g.get('product_id')]
             stock_by_tmpl = {}
@@ -1634,11 +1709,9 @@ class MaVieDashboardController(http.Controller):
                     ('company_id', 'not in', excluded_non_retail_ids)
                 ]
 
-            quant_val_grouped = request.env['stock.quant'].sudo().read_group(
-                quant_domain_valorisation,
-                ['quantity:sum', 'product_id', 'company_id'],
-                ['product_id', 'company_id'],
-                lazy=False
+            quant_val_grouped = self._group_sums(
+                'stock.quant', quant_domain_valorisation, ['quantity'],
+                group_fields=('product_id', 'company_id'),
             )
 
             val_pids = [g['product_id'][0] for g in quant_val_grouped if g.get('product_id')]
@@ -1649,6 +1722,10 @@ class MaVieDashboardController(http.Controller):
                     ['id', 'list_price', 'standard_price', 'product_tmpl_id']
                 )
                 val_prod_map = {p['id']: p for p in val_prods}
+                company_name_by_id = {
+                    c.id: c.name
+                    for c in request.env['res.company'].sudo().search([])
+                }
 
                 # DÉCISION UTILISATEUR (2026-08-18) : le champ "Coût" n'est
                 # renseigné que sur 12 références sur 4972, d'où une "Valeur
@@ -1667,7 +1744,12 @@ class MaVieDashboardController(http.Controller):
                 val_by_company = {}
                 for g in quant_val_grouped:
                     pid = g['product_id'][0] if g.get('product_id') else None
-                    cid = g['company_id'][1] if g.get('company_id') else 'Société'
+                    # _group_sums ne renvoie pas les libellés (voir son
+                    # docstring) : on résout les noms de sociétés à part,
+                    # il n'y en a qu'une poignée.
+                    cid = company_name_by_id.get(
+                        g['company_id'][0] if g.get('company_id') else None, 'Société'
+                    )
                     qty = g.get('quantity') or 0.0
                     if qty <= 0 or not pid or pid not in val_prod_map:
                         continue

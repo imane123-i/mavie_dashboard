@@ -435,32 +435,18 @@ function adjustUIForPage() {
     var topTitleText = el('top-title-text');
     var flopTitleText = el('flop-title-text');
 
-    var topCol4 = document.querySelector('.top-col-4');
-    var topCol5 = document.querySelector('.top-col-5');
-    var flopCol4 = document.querySelector('.flop-col-4');
-    var flopCol5 = document.querySelector('.flop-col-5');
-
+    // Les colonnes des tableaux Top/Flop sont désormais FIXES (CA Achat HT,
+    // Qté achetée, Qté vendue, Reste) — seuls les titres changent selon la
+    // page, le critère de tri restant géré côté serveur.
     if (currentPage === 'ventes') {
         if (topTitleText) topTitleText.textContent = '🏆 Top Produits (par Ventes)';
         if (flopTitleText) flopTitleText.textContent = '📉 Flop Produits (par Ventes)';
-        if (topCol4) topCol4.textContent = 'Qté vendue';
-        if (topCol5) topCol5.textContent = 'CA Potentiel';
-        if (flopCol4) flopCol4.textContent = 'Qté vendue';
-        if (flopCol5) flopCol5.textContent = 'CA Potentiel';
     } else if (currentPage === 'stock') {
         if (topTitleText) topTitleText.textContent = '📦 Top Stocks (Quantités Elevées)';
         if (flopTitleText) flopTitleText.textContent = '⚠️ Alertes Stock / Ruptures';
-        if (topCol4) topCol4.textContent = 'Stock';
-        if (topCol5) topCol5.textContent = 'Qté vendue';
-        if (flopCol4) flopCol4.textContent = 'Stock';
-        if (flopCol5) flopCol5.textContent = 'Qté vendue';
     } else if (currentPage === 'commandes') {
         if (topTitleText) topTitleText.textContent = '📥 Top Commandes (Achats)';
         if (flopTitleText) flopTitleText.textContent = '📉 Flop Commandes (Achats)';
-        if (topCol4) topCol4.textContent = 'Qté Achetée';
-        if (topCol5) topCol5.textContent = 'Stock';
-        if (flopCol4) flopCol4.textContent = 'Qté Achetée';
-        if (flopCol5) flopCol5.textContent = 'Stock';
     }
 }
 
@@ -682,28 +668,26 @@ function _renderProductTable(tbodyId, products, isFlop) {
         tdRef.style.color = '#64748B';
         tr.appendChild(tdRef);
 
-        var tdCol4 = document.createElement('td');
-        var tdCol5 = document.createElement('td');
-
-        if (currentPage === 'ventes') {
-            tdCol4.textContent = formatNumber(p.qty_sold);
-            tdCol5.textContent = formatMAD(p.ca);
-        } else if (currentPage === 'stock') {
-            tdCol4.textContent = formatNumber(p.stock);
-            tdCol5.textContent = formatNumber(p.qty_sold);
-        } else if (currentPage === 'commandes') {
-            tdCol4.textContent = formatNumber(p.qty_purchased);
-            tdCol5.textContent = formatNumber(p.stock);
+        // Ordre demandé : CA Achat (HT), Qté achetée, Qté vendue, Reste.
+        // Colonnes fixes quelle que soit la page — le tri, lui, continue de
+        // dépendre de la page (voir sorted_top/sorted_flop côté serveur).
+        var tdCaAchat = document.createElement('td');
+        tdCaAchat.textContent = formatMAD(p.ca_achat || 0);
+        if (!p.ca_achat && p.qty_purchased) {
+            // Acheté mais sans prix renseigné sur les commandes : on le
+            // signale plutôt que de laisser croire à un achat gratuit.
+            tdCaAchat.style.color = '#B45309';
+            tdCaAchat.title = 'Prix d\'achat non renseigné sur les commandes de cette référence.';
         }
+        tr.appendChild(tdCaAchat);
 
-        tr.appendChild(tdCol4);
-        tr.appendChild(tdCol5);
-
-        // Qté achetée + Reste affichés directement dans le tableau : avant,
-        // il fallait ouvrir la fiche produit pour les connaître.
         var tdAchat = document.createElement('td');
         tdAchat.textContent = formatNumber(p.qty_purchased || 0);
         tr.appendChild(tdAchat);
+
+        var tdVendu = document.createElement('td');
+        tdVendu.textContent = formatNumber(p.qty_sold || 0);
+        tr.appendChild(tdVendu);
 
         var tdReste = document.createElement('td');
         // Reste = acheté − vendu (même définition que la fiche produit :

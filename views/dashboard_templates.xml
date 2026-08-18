@@ -1416,9 +1416,9 @@
                                     <th>#</th>
                                     <th>Produit</th>
                                     <th>Réf</th>
-                                    <th class="top-col-4">Qté vendue</th>
-                                    <th class="top-col-5">CA Vendu</th>
+                                    <th title="Montant hors taxes des commandes fournisseur confirmées pour cette référence.">CA Achat (HT)</th>
                                     <th title="Quantité achetée par les magasins (commandes fournisseur confirmées).">Qté achetée</th>
+                                    <th title="Quantité vendue en caisse (POS).">Qté vendue</th>
                                     <th title="Reste = Qté achetée − Qté vendue. Estimation « papier » de ce qui devrait rester ; à comparer au stock physique réel.">Reste</th>
                                 </tr>
                             </thead>
@@ -1439,9 +1439,9 @@
                                     <th>#</th>
                                     <th>Produit</th>
                                     <th>Réf</th>
-                                    <th class="flop-col-4">Qté vendue</th>
-                                    <th class="flop-col-5">CA Vendu</th>
+                                    <th title="Montant hors taxes des commandes fournisseur confirmées pour cette référence.">CA Achat (HT)</th>
                                     <th title="Quantité achetée par les magasins (commandes fournisseur confirmées).">Qté achetée</th>
+                                    <th title="Quantité vendue en caisse (POS).">Qté vendue</th>
                                     <th title="Reste = Qté achetée − Qté vendue. Estimation « papier » de ce qui devrait rester ; à comparer au stock physique réel.">Reste</th>
                                 </tr>
                             </thead>

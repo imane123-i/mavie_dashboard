@@ -882,6 +882,10 @@ class MaVieDashboardController(http.Controller):
 
             po_pids = [g['product_id'][0] for g in po_grouped if g.get('product_id')]
             purchase_by_tmpl = {}
+            # CA Achat par référence — déjà présent dans po_grouped
+            # (price_subtotal), il suffit de l'accumuler comme les quantités
+            # pour pouvoir l'afficher dans les tableaux Top/Flop.
+            ca_achat_by_tmpl = {}
             if po_pids:
                 po_prods = request.env['product.product'].sudo().search_read(
                     [('id', 'in', po_pids)],
@@ -894,6 +898,7 @@ class MaVieDashboardController(http.Controller):
                     if not tid:
                         continue
                     purchase_by_tmpl[tid] = purchase_by_tmpl.get(tid, 0) + int(g.get('product_qty') or 0)
+                    ca_achat_by_tmpl[tid] = ca_achat_by_tmpl.get(tid, 0.0) + (g.get('price_subtotal') or 0.0)
 
             # ✅ Groupement Stock Quant (SQL GROUP BY product_id) — même
             # principe : stock_total se déduit de quant_grouped (quant_agg
@@ -1070,6 +1075,7 @@ class MaVieDashboardController(http.Controller):
                     'qty_sold': int(stat['qty']),
                     'stock': int(stock_by_tmpl.get(tmpl.id, 0)),
                     'qty_purchased': int(purchase_by_tmpl.get(tmpl.id, 0)),
+                    'ca_achat': round(ca_achat_by_tmpl.get(tmpl.id, 0.0), 2),
                 })
 
             if is_filtered:
@@ -1767,16 +1773,16 @@ class MaVieDashboardController(http.Controller):
         buffer.write('﻿')  # BOM pour qu'Excel détecte l'UTF-8
         writer = csv.writer(buffer, delimiter=';')
         writer.writerow(['Top Produits' if kind != 'flop' else 'Flop Produits'])
-        writer.writerow(['#', 'Produit', 'Réf', 'Qté vendue', 'CA Potentiel', 'Stock', 'Qté achetée', 'Reste'])
+        # Mêmes colonnes et même ordre qu'à l'écran.
+        writer.writerow(['#', 'Produit', 'Réf', 'CA Achat (HT)', 'Qté achetée', 'Qté vendue', 'Reste', 'Stock'])
         for row in rows or []:
             # Reste = acheté − vendu, même définition qu'à l'écran.
             qty_sold_row = row.get('qty_sold', row.get('qty', 0)) or 0
             qty_purchased_row = row.get('qty_purchased', 0) or 0
             writer.writerow([
                 row.get('rank'), row.get('name'), row.get('ref'),
-                qty_sold_row, row.get('ca', 0),
-                row.get('stock', 0), qty_purchased_row,
-                qty_purchased_row - qty_sold_row,
+                row.get('ca_achat', 0), qty_purchased_row, qty_sold_row,
+                qty_purchased_row - qty_sold_row, row.get('stock', 0),
             ])
 
         filename = 'mavie_export_{}.csv'.format('flop_produits' if kind == 'flop' else 'top_produits')

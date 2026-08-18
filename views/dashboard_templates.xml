@@ -1259,7 +1259,7 @@
                     <div class="kpi-grid">
                         <div class="kpi-card kpi-blue" id="card-mfl-achats">
                             <span class="kpi-icon">🧾</span>
-                            <div class="kpi-label">Achats fournisseurs</div>
+                            <div class="kpi-label" title="Montant hors taxes des commandes fournisseur confirmées de MOD FOR LIFE chez de vrais fournisseurs externes (hors flux inter-sociétés). Vérifiable dans Achats → Analyse, société MOD FOR LIFE.">Achats fournisseurs (HT)</div>
                             <div class="kpi-value" id="mfl-ca-achats">—</div>
                             <div class="kpi-subtext" id="mfl-qty-achats-sub"></div>
                         </div>
@@ -1270,7 +1270,7 @@
                         </div>
                         <div class="kpi-card kpi-green" id="card-mfl-ventes">
                             <span class="kpi-icon">💰</span>
-                            <div class="kpi-label">Envoyé aux sociétés magasins</div>
+                            <div class="kpi-label" title="Montant hors taxes des commandes de vente confirmées de MOD FOR LIFE vers les 3 sociétés magasins, au prix coûtant. Vérifiable dans Ventes → Analyse → Ventes, filtre « Bons de commande », société MOD FOR LIFE.">Envoyé aux sociétés magasins (HT)</div>
                             <div class="kpi-value" id="mfl-ca-ventes">—</div>
                             <div class="kpi-subtext" id="mfl-qty-ventes-sub"></div>
                         </div>

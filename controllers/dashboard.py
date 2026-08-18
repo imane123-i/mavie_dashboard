@@ -1653,6 +1653,19 @@ class MaVieDashboardController(http.Controller):
             ])
             retail_partner_ids = retail_companies.mapped('partner_id').ids
 
+            # BUG CORRIGÉ (2026-08-18) : cette vue ignorait complètement les
+            # filtres Collection / Batch / Catégorie de la barre du haut —
+            # sélectionner une collection laissait les 4 cartes afficher le
+            # catalogue entier, sans que rien ne l'indique à l'écran. On
+            # applique désormais le même filtre produit que la vue retail.
+            product_tmpl_ids = None
+            if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
+                product_tmpl_ids = request.env['product.template'].sudo().search(
+                    self._build_product_domain(kw)
+                ).ids
+                if not product_tmpl_ids:
+                    product_tmpl_ids = [-1]
+
             # ── Achats fournisseurs : bons de commande de MOD FOR LIFE dont
             # le fournisseur n'est PAS une des sociétés magasins (donc un
             # vrai fournisseur externe, pas un flux inter-société).
@@ -1662,6 +1675,8 @@ class MaVieDashboardController(http.Controller):
                 ('partner_id', 'not in', retail_partner_ids),
             ]
             po_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+            if product_tmpl_ids is not None:
+                po_domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
             if kw.get('date_start'):
                 po_domain.append(('order_id.date_order', '>=', kw['date_start'] + ' 00:00:00'))
             if kw.get('date_end'):
@@ -1688,6 +1703,8 @@ class MaVieDashboardController(http.Controller):
                 ('order_partner_id', 'in', retail_partner_ids),
             ]
             so_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+            if product_tmpl_ids is not None:
+                so_domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
             if kw.get('date_start'):
                 so_domain.append(('order_id.date_order', '>=', kw['date_start'] + ' 00:00:00'))
             if kw.get('date_end'):
@@ -1725,6 +1742,8 @@ class MaVieDashboardController(http.Controller):
                 ('company_id', '=', mod_for_life.id),
             ]
             quant_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+            if product_tmpl_ids is not None:
+                quant_domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
             quant_grouped = request.env['stock.quant'].sudo().read_group(
                 quant_domain, ['quantity:sum'], [], lazy=False
             )

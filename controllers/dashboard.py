@@ -495,7 +495,8 @@ class MaVieDashboardController(http.Controller):
         field_min = min(stock_by_shop, key=lambda f: stock_by_shop[f][0])
         return stock_by_shop[field_min][1]
 
-    def _resolve_magasin_batch(self, product_tmpl_ids, shop_mappings, shop_field_filter=None, mode='min'):
+    def _resolve_magasin_batch(self, product_tmpl_ids, shop_mappings, shop_field_filter=None,
+                               mode='min', qty_by_tid=None):
         """
         Version "en masse" de _resolve_exact_magasin : résout le magasin pour
         une LISTE de templates en (nombre de magasins) requêtes au lieu de
@@ -557,6 +558,12 @@ class MaVieDashboardController(http.Controller):
             else:
                 field_pick = picker(shop_data, key=lambda f: shop_data[f][0])
                 magasin_by_tid[tid] = shop_data[field_pick][1]
+                # Quantité réellement présente DANS ce magasin — sans elle,
+                # l'écran affiche un magasin à côté d'un stock TOTAL réseau
+                # et on croit que tout le stock y est (ex: 68 pièces
+                # affichées face à "ARRIBAT CENTER" qui n'en a que 16).
+                if qty_by_tid is not None:
+                    qty_by_tid[tid] = int(shop_data[field_pick][0])
 
         return magasin_by_tid
 
@@ -1338,11 +1345,16 @@ class MaVieDashboardController(http.Controller):
 
             # Magasin où le stock dormant est réellement immobilisé (le plus
             # de stock, pas le moins — contraire de la résolution "rupture").
+            qty_in_magasin_dormant = {}
             magasin_by_tid_dormant = self._resolve_magasin_batch(
-                [d['id'] for d in dormant_products], shop_mappings, kw.get('shop_field'), mode='max'
+                [d['id'] for d in dormant_products], shop_mappings, kw.get('shop_field'), mode='max',
+                qty_by_tid=qty_in_magasin_dormant
             )
             for d in dormant_products:
                 d['magasin'] = magasin_by_tid_dormant.get(d['id'], 'Réseau')
+                # Quantité dans CE magasin précis — 'stock' reste le total
+                # réseau, les deux sont affichés séparément à l'écran.
+                d['magasin_qty'] = qty_in_magasin_dormant.get(d['id'])
 
             alertes_stock = []
 

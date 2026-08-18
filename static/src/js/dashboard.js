@@ -2097,10 +2097,20 @@ function _renderDormantList(searchFilter) {
         tr.appendChild(tdName);
 
         var tdMagasin = document.createElement('td');
-        tdMagasin.textContent = p.magasin || '—';
+        // On précise la quantité DANS ce magasin : sans elle, le magasin
+        // s'affichait à côté du stock total réseau et laissait croire que
+        // tout le stock s'y trouvait (ex: 68 face à ARRIBAT CENTER qui n'en
+        // détient que 16).
+        tdMagasin.textContent = (p.magasin || '—')
+            + ((p.magasin_qty !== null && p.magasin_qty !== undefined)
+                ? ' (' + formatNumber(p.magasin_qty) + ')' : '');
         tdMagasin.style.padding = '10px';
         tdMagasin.style.color = '#334155';
         tdMagasin.style.fontSize = '0.85rem';
+        tdMagasin.title = (p.magasin_qty !== null && p.magasin_qty !== undefined)
+            ? 'Ce magasin détient ' + formatNumber(p.magasin_qty) + ' des ' + formatNumber(p.stock || 0)
+              + ' pièces ; le reste est réparti dans les autres magasins.'
+            : '';
         tr.appendChild(tdMagasin);
 
         var tdStock = document.createElement('td');

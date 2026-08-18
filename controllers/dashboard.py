@@ -95,6 +95,31 @@ class MaVieDashboardController(http.Controller):
         companies = request.env['res.company'].sudo().search([('name', 'in', NON_RETAIL_COMPANIES)])
         return companies.ids
 
+    def _get_excluded_non_retail_ids(self, kw=None):
+        """Sociétés non-retail à RÉELLEMENT exclure des KPIs.
+
+        DÉCISION UTILISATEUR (2026-08-18) : cocher une société dans le
+        sélecteur standard doit toujours avoir un effet visible. Une société
+        non-retail (MOD FOR LIFE) explicitement cochée n'est donc plus
+        exclue — ses achats, ventes et stock s'ajoutent, exactement comme le
+        ferait Odoo avec son propre filtre société.
+
+        Conséquence assumée : quand MOD FOR LIFE est cochée EN MÊME TEMPS
+        que les sociétés magasins, la même marchandise est comptée deux fois
+        (une fois à l'import chez le fournisseur externe, une fois à la
+        revente interne vers le magasin) — c'est aussi ce que fait l'écran
+        "Analyse des achats" d'Odoo. Décocher MOD FOR LIFE redonne la vision
+        retail pure, sans double comptage.
+
+        Si un magasin précis est filtré (shop_field), l'exclusion reste
+        totale : un magasin appartient forcément à une société retail.
+        """
+        non_retail_ids = self._get_non_retail_company_ids()
+        if kw and kw.get('shop_field'):
+            return non_retail_ids
+        context_company_ids = self._get_context_company_ids()
+        return [cid for cid in non_retail_ids if cid not in context_company_ids]
+
     def _get_mod_for_life_partner_id(self):
         """Résout le partner_id de la société MOD FOR LIFE — c'est le
         fournisseur sur les bons de commande des 3 sociétés magasins quand
@@ -221,9 +246,11 @@ class MaVieDashboardController(http.Controller):
         # vente POS société non-retail vérifiée en base actuellement, mais
         # on exclut quand même par sécurité pour ne jamais reproduire
         # l'incohérence achats/stock corrigée ci-dessous.
-        non_retail_company_ids = self._get_non_retail_company_ids()
-        if non_retail_company_ids:
-            domain.append(('order_id.company_id', 'not in', non_retail_company_ids))
+        # (voir _get_excluded_non_retail_ids : une société non-retail
+        # explicitement cochée par l'utilisateur n'est plus exclue)
+        excluded_non_retail_ids = self._get_excluded_non_retail_ids(kw)
+        if excluded_non_retail_ids:
+            domain.append(('order_id.company_id', 'not in', excluded_non_retail_ids))
 
         if product_tmpl_ids is not None:
             domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
@@ -276,9 +303,11 @@ class MaVieDashboardController(http.Controller):
         # artificiellement l'écart "achats - vendu vs stock réel" affiché
         # avec ⚠️ (ex: +233 sur une référence, exactement le volume reçu
         # chez MOD FOR LIFE pour cette référence).
-        non_retail_company_ids = self._get_non_retail_company_ids()
-        if non_retail_company_ids:
-            domain.append(('order_id.company_id', 'not in', non_retail_company_ids))
+        # (voir _get_excluded_non_retail_ids : une société non-retail
+        # explicitement cochée par l'utilisateur n'est plus exclue)
+        excluded_non_retail_ids = self._get_excluded_non_retail_ids(kw)
+        if excluded_non_retail_ids:
+            domain.append(('order_id.company_id', 'not in', excluded_non_retail_ids))
         if product_tmpl_ids is not None:
             domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
 
@@ -794,12 +823,29 @@ class MaVieDashboardController(http.Controller):
             # limiter aux lot_stock_id des entrepôts réellement mappés.
             # N'affecte PAS quant_domain_base (valorisation), qui doit
             # rester "toutes sociétés, tout entrepôt" par design (cf. plus haut).
-            retail_lot_stock_ids = request.env['stock.warehouse'].sudo().search([
+            #
+            # Même règle qu'en fiche produit (décision 2026-08-18) : une
+            # société non-retail explicitement cochée voit son entrepôt
+            # compté, sinon cocher la société n'aurait aucun effet visible.
+            Warehouse = request.env['stock.warehouse'].sudo()
+            excluded_non_retail_ids = self._get_excluded_non_retail_ids(kw)
+            scoped_warehouses = Warehouse.search([
                 ('company_id', 'not in', self._get_non_retail_company_ids()),
                 ('id', 'in', self._get_active_shop_mappings().mapped('warehouse_id').ids),
-            ]).mapped('lot_stock_id').ids
+            ])
+            explicit_non_retail_ids = [
+                cid for cid in self._get_non_retail_company_ids()
+                if cid not in excluded_non_retail_ids
+            ]
+            if explicit_non_retail_ids:
+                scoped_warehouses |= Warehouse.search([
+                    ('company_id', 'in', explicit_non_retail_ids),
+                ])
+            retail_lot_stock_ids = scoped_warehouses.mapped('lot_stock_id').ids
 
-            quant_domain = quant_domain_base + [('company_id', 'not in', self._get_non_retail_company_ids())]
+            quant_domain = quant_domain_base
+            if excluded_non_retail_ids:
+                quant_domain = quant_domain + [('company_id', 'not in', excluded_non_retail_ids)]
             if retail_lot_stock_ids:
                 quant_domain = quant_domain + [('location_id', 'child_of', retail_lot_stock_ids)]
 
@@ -1900,10 +1946,12 @@ class MaVieDashboardController(http.Controller):
             # cocher la société n'a aucun effet à l'écran, ce qui est
             # trompeur. Par défaut (seules des sociétés magasins cochées, ou
             # aucun filtre), on garde le périmètre retail pur.
+            # Même règle unique que partout ailleurs (_get_excluded_non_retail_ids).
             non_retail_company_ids = self._get_non_retail_company_ids()
             context_company_ids = self._get_context_company_ids()
+            excluded_non_retail_ids = self._get_excluded_non_retail_ids(kw)
             explicit_non_retail_ids = [
-                cid for cid in context_company_ids if cid in non_retail_company_ids
+                cid for cid in non_retail_company_ids if cid not in excluded_non_retail_ids
             ]
             Warehouse = request.env['stock.warehouse'].sudo()
             scoped_warehouses = Warehouse.search([

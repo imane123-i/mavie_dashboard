@@ -496,7 +496,7 @@ class MaVieDashboardController(http.Controller):
         return stock_by_shop[field_min][1]
 
     def _resolve_magasin_batch(self, product_tmpl_ids, shop_mappings, shop_field_filter=None,
-                               mode='min', qty_by_tid=None):
+                               mode='min', qty_by_tid=None, breakdown_by_tid=None):
         """
         Version "en masse" de _resolve_exact_magasin : résout le magasin pour
         une LISTE de templates en (nombre de magasins) requêtes au lieu de
@@ -564,6 +564,16 @@ class MaVieDashboardController(http.Controller):
                 # affichées face à "ARRIBAT CENTER" qui n'en a que 16).
                 if qty_by_tid is not None:
                     qty_by_tid[tid] = int(shop_data[field_pick][0])
+                # Répartition complète (magasins non vides, du plus gros au
+                # plus petit) — shop_data est déjà calculé, donc aucune
+                # requête supplémentaire. Permet d'afficher où se trouve le
+                # reste du stock, pas seulement le magasin principal.
+                if breakdown_by_tid is not None:
+                    breakdown_by_tid[tid] = [
+                        {'magasin': lbl, 'qty': int(q)}
+                        for q, lbl in sorted(shop_data.values(), key=lambda x: -x[0])
+                        if q
+                    ]
 
         return magasin_by_tid
 
@@ -1346,15 +1356,19 @@ class MaVieDashboardController(http.Controller):
             # Magasin où le stock dormant est réellement immobilisé (le plus
             # de stock, pas le moins — contraire de la résolution "rupture").
             qty_in_magasin_dormant = {}
+            breakdown_dormant = {}
             magasin_by_tid_dormant = self._resolve_magasin_batch(
                 [d['id'] for d in dormant_products], shop_mappings, kw.get('shop_field'), mode='max',
-                qty_by_tid=qty_in_magasin_dormant
+                qty_by_tid=qty_in_magasin_dormant, breakdown_by_tid=breakdown_dormant
             )
             for d in dormant_products:
                 d['magasin'] = magasin_by_tid_dormant.get(d['id'], 'Réseau')
                 # Quantité dans CE magasin précis — 'stock' reste le total
                 # réseau, les deux sont affichés séparément à l'écran.
                 d['magasin_qty'] = qty_in_magasin_dormant.get(d['id'])
+                # Répartition complète, pour montrer où dort le reste du
+                # stock et pas seulement le magasin le plus chargé.
+                d['magasin_breakdown'] = breakdown_dormant.get(d['id']) or []
 
             alertes_stock = []
 

@@ -2097,20 +2097,28 @@ function _renderDormantList(searchFilter) {
         tr.appendChild(tdName);
 
         var tdMagasin = document.createElement('td');
-        // On précise la quantité DANS ce magasin : sans elle, le magasin
-        // s'affichait à côté du stock total réseau et laissait croire que
-        // tout le stock s'y trouvait (ex: 68 face à ARRIBAT CENTER qui n'en
-        // détient que 16).
-        tdMagasin.textContent = (p.magasin || '—')
-            + ((p.magasin_qty !== null && p.magasin_qty !== undefined)
-                ? ' (' + formatNumber(p.magasin_qty) + ')' : '');
         tdMagasin.style.padding = '10px';
         tdMagasin.style.color = '#334155';
         tdMagasin.style.fontSize = '0.85rem';
-        tdMagasin.title = (p.magasin_qty !== null && p.magasin_qty !== undefined)
-            ? 'Ce magasin détient ' + formatNumber(p.magasin_qty) + ' des ' + formatNumber(p.stock || 0)
-              + ' pièces ; le reste est réparti dans les autres magasins.'
-            : '';
+        // Le stock dormant est presque toujours réparti sur plusieurs
+        // magasins : n'en afficher qu'un laissait croire que tout y était.
+        // On liste donc les 3 premiers, avec le nombre de magasins restants,
+        // et l'infobulle donne la répartition complète.
+        var br = p.magasin_breakdown || [];
+        if (br.length) {
+            var top = br.slice(0, 3).map(function(x) {
+                return x.magasin + ' (' + formatNumber(x.qty) + ')';
+            }).join(', ');
+            if (br.length > 3) top += ' + ' + (br.length - 3) + ' autre' + (br.length - 3 > 1 ? 's' : '');
+            tdMagasin.textContent = top;
+            tdMagasin.title = 'Répartition complète :\n' + br.map(function(x) {
+                return '• ' + x.magasin + ' : ' + formatNumber(x.qty);
+            }).join('\n');
+        } else {
+            tdMagasin.textContent = (p.magasin || '—')
+                + ((p.magasin_qty !== null && p.magasin_qty !== undefined)
+                    ? ' (' + formatNumber(p.magasin_qty) + ')' : '');
+        }
         tr.appendChild(tdMagasin);
 
         var tdStock = document.createElement('td');

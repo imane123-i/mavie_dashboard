@@ -1700,7 +1700,7 @@
                             <div class="d-value" id="color-detail-reste">—</div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label">🏬 Stock total (tous magasins)</div>
+                            <div class="d-label" title="Stock physique de cette couleur sur le périmètre actuellement filtré (sociétés cochées dans le sélecteur Odoo). Le tableau ci-dessous liste, lui, tout le réseau — utile pour repérer d'où faire venir la marchandise.">🏬 Stock total</div>
                             <div class="d-value" id="color-detail-stock-total">—</div>
                         </div>
                     </div>

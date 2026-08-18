@@ -1893,10 +1893,43 @@ class MaVieDashboardController(http.Controller):
             # correspondaient jamais (écart = stock dormant chez MOD FOR LIFE,
             # ou dans un entrepôt de la société retail non rattaché à un
             # magasin mappé).
-            retail_lot_stock_ids = request.env['stock.warehouse'].sudo().search([
-                ('company_id', 'not in', self._get_non_retail_company_ids()),
+            #
+            # DÉCISION UTILISATEUR (2026-08-17) : si l'utilisateur coche
+            # explicitement une société non-retail (MOD FOR LIFE) dans le
+            # sélecteur, son stock entrepôt DOIT devenir visible — sinon
+            # cocher la société n'a aucun effet à l'écran, ce qui est
+            # trompeur. Par défaut (seules des sociétés magasins cochées, ou
+            # aucun filtre), on garde le périmètre retail pur.
+            non_retail_company_ids = self._get_non_retail_company_ids()
+            context_company_ids = self._get_context_company_ids()
+            explicit_non_retail_ids = [
+                cid for cid in context_company_ids if cid in non_retail_company_ids
+            ]
+            Warehouse = request.env['stock.warehouse'].sudo()
+            scoped_warehouses = Warehouse.search([
+                ('company_id', 'not in', non_retail_company_ids),
                 ('id', 'in', self._get_active_shop_mappings().mapped('warehouse_id').ids),
-            ]).mapped('lot_stock_id').ids
+            ])
+            if explicit_non_retail_ids:
+                scoped_warehouses |= Warehouse.search([
+                    ('company_id', 'in', explicit_non_retail_ids),
+                ])
+
+            # BUG CORRIGÉ (2026-08-17) : le stock PAR COULEUR doit suivre le
+            # filtre société actif, exactement comme stock_total en haut de
+            # fiche. Sans ça, filtrer sur SALMEDO affichait 13 en carte mais
+            # 25 en sommant les couleurs (le périmètre réseau complet), ce
+            # qui rendait la fiche incohérente avec elle-même dès qu'une
+            # société était sélectionnée. scoped_warehouses reste, lui, non
+            # filtré : le tableau "Stock par Magasin" montre volontairement
+            # tout le réseau (utile pour décider d'un transfert), et
+            # stock_total applique le filtre société de son côté.
+            variant_warehouses = scoped_warehouses
+            if context_company_ids:
+                variant_warehouses = scoped_warehouses.filtered(
+                    lambda w: w.company_id.id in context_company_ids
+                )
+            retail_lot_stock_ids = variant_warehouses.mapped('lot_stock_id').ids
 
             # "Qté Magasin" doit être le STOCK ACTUEL de la variante dans le
             # magasin filtré — pas les ventes (voir sales_by_variant plus
@@ -2071,7 +2104,6 @@ class MaVieDashboardController(http.Controller):
                 )
 
             stock_by_store = []
-            non_retail_company_ids = self._get_non_retail_company_ids()
             try:
                 # Ne lister que les entrepôts qui correspondent à un magasin
                 # réellement configuré/actif (mv.batch.shop.mapping) — sinon
@@ -2079,12 +2111,12 @@ class MaVieDashboardController(http.Controller):
                 # affichait aussi des entrepôts désactivés/non-magasins
                 # (ex: "DIGITAL SHOP") même après avoir désactivé leur
                 # mapping, puisqu'elle ne passait pas par lui.
-                mapped_warehouse_ids = self._get_active_shop_mappings().mapped('warehouse_id').ids
-                warehouses = request.env['stock.warehouse'].sudo().search([
-                    ('company_id', 'not in', non_retail_company_ids),
-                    ('id', 'in', mapped_warehouse_ids),
-                ])
-                for wh in warehouses:
+                # scoped_warehouses (calculé plus haut) applique déjà cette
+                # règle ET y ajoute l'entrepôt d'une société non-retail
+                # explicitement cochée par l'utilisateur — même périmètre que
+                # retail_lot_stock_ids, donc la somme par magasin correspond
+                # toujours exactement à stock_total.
+                for wh in scoped_warehouses:
                     if not wh.lot_stock_id:
                         continue
                     quants = request.env['stock.quant'].sudo().search([
@@ -2116,8 +2148,8 @@ class MaVieDashboardController(http.Controller):
                     stock_total = sum(s['stock'] for s in stock_by_store)
             else:
                 # Pas de magasin précis choisi : on retombe sur la/les
-                # société(s) cochée(s) dans le sélecteur standard Odoo.
-                context_company_ids = self._get_context_company_ids()
+                # société(s) cochée(s) dans le sélecteur standard Odoo
+                # (context_company_ids, déjà résolu plus haut).
                 if context_company_ids:
                     stock_total = sum(
                         s['stock'] for s in stock_by_store if s['company_id'] in context_company_ids

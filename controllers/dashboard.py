@@ -715,16 +715,27 @@ class MaVieDashboardController(http.Controller):
             # passent par sale.order, pas par le POS (voir
             # _build_non_retail_sale_domain). Ajoutées au CA Vendu pour que
             # cocher MOD FOR LIFE ait le même effet que sur le CA Achat.
+            # Regroupé par produit (pas seulement en total) : ces ventes
+            # doivent aussi remonter dans le détail par référence
+            # (sales_by_tmpl -> Top/Flop, ABC, ruptures), sinon les cartes
+            # afficheraient MOD FOR LIFE mais pas les tableaux en dessous.
+            so_by_product = {}
             if self._get_explicit_non_retail_ids(kw):
                 so_grouped = request.env['sale.order.line'].sudo().read_group(
                     self._build_non_retail_sale_domain(kw, product_tmpl_ids),
-                    ['product_uom_qty:sum', 'price_total:sum', 'price_subtotal:sum'],
-                    [], lazy=False
+                    ['product_uom_qty:sum', 'price_total:sum', 'price_subtotal:sum', 'product_id'],
+                    ['product_id'], lazy=False
                 )
-                if so_grouped:
-                    ca_total += so_grouped[0].get('price_total') or 0.0
-                    ca_ht_total += so_grouped[0].get('price_subtotal') or 0.0
-                    qty_sold_total += int(so_grouped[0].get('product_uom_qty') or 0)
+                for g in so_grouped:
+                    ca_total += g.get('price_total') or 0.0
+                    ca_ht_total += g.get('price_subtotal') or 0.0
+                    qty_sold_total += int(g.get('product_uom_qty') or 0)
+                    pid = g['product_id'][0] if g.get('product_id') else None
+                    if pid:
+                        so_by_product[pid] = {
+                            'qty': g.get('product_uom_qty') or 0.0,
+                            'ca': g.get('price_total') or 0.0,
+                        }
 
             # Qté vendue "en solde" = lignes vendues à un prix effectif
             # (remise incluse) inférieur au prix catalogue (list_price) du
@@ -820,6 +831,27 @@ class MaVieDashboardController(http.Controller):
                         sales_by_tmpl[tid] = {'qty': 0, 'ca': 0.0}
                     sales_by_tmpl[tid]['qty'] += g.get('qty') or 0
                     sales_by_tmpl[tid]['ca'] += g.get('price_subtotal_incl') or 0.0
+
+            # Ventes inter-sociétés de la société non-retail cochée, injectées
+            # dans le MÊME dictionnaire par référence que les ventes POS —
+            # sans ça, les cartes du haut incluaient MOD FOR LIFE mais les
+            # tableaux Top/Flop, ABC et ruptures affichaient encore les seules
+            # ventes magasins, ce qui était contradictoire à l'écran.
+            if so_by_product:
+                so_prods = request.env['product.product'].sudo().search_read(
+                    [('id', 'in', list(so_by_product.keys()))],
+                    ['id', 'product_tmpl_id']
+                )
+                for p in so_prods:
+                    tid = p['product_tmpl_id'][0] if p.get('product_tmpl_id') else None
+                    if not tid:
+                        continue
+                    prod_to_tmpl.setdefault(p['id'], tid)
+                    data_so = so_by_product.get(p['id']) or {}
+                    if tid not in sales_by_tmpl:
+                        sales_by_tmpl[tid] = {'qty': 0, 'ca': 0.0}
+                    sales_by_tmpl[tid]['qty'] += data_so.get('qty') or 0
+                    sales_by_tmpl[tid]['ca'] += data_so.get('ca') or 0.0
 
             # ✅ Idem achats : un seul scan groupé par produit, le total
             # s'obtient en sommant les groupes au lieu d'un 2e scan complet

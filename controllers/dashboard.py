@@ -1499,21 +1499,28 @@ class MaVieDashboardController(http.Controller):
                     flop_products = sorted(product_stats, key=lambda a: a['ca'])[:flop_limit]
 
             # ✅ VALORISATION DU STOCK (Société & Par Magasin)
-            # NB : contrairement à stock_total/stock_by_tmpl (KPIs "retail" —
-            # dormant, rupture, couverture — qui excluent volontairement les
-            # sociétés non-magasin comme MOD FOR LIFE), la valorisation garde
-            # TOUTES les sociétés : c'est un inventaire financier global, pas
-            # une analyse de stock en boutique, donc le stock grossiste doit
-            # y apparaître. quant_domain_base (défini plus haut) est déjà la
-            # bonne base : mêmes filtres localisation/sachet/société-ou-
-            # magasin choisi que quant_domain, mais SANS l'exclusion
-            # non-retail — utilisé tel quel, sans filtrage a posteriori.
+            # BUG CORRIGÉ (2026-08-18) : la valorisation gardait TOUTES les
+            # sociétés en permanence, y compris MOD FOR LIFE. Résultat, sans
+            # filtre société, le même écran affichait "Stock Réel Odoo"
+            # = 20 841 pièces (retail seul) mais une valorisation incluant
+            # les 8 361 pièces de l'entrepôt MOD FOR LIFE, avec une ligne
+            # "MOD FOR LIFE" dans le tableau par magasin — deux périmètres
+            # différents côte à côte, sans rien pour le signaler.
+            # Elle suit désormais la même règle que partout ailleurs
+            # (_get_excluded_non_retail_ids) : MOD FOR LIFE n'est comptée que
+            # si l'utilisateur la coche explicitement.
             val_ht_total = 0.0
             val_cost_total = 0.0
             stock_val_by_store = []
 
+            quant_domain_valorisation = quant_domain_base
+            if excluded_non_retail_ids:
+                quant_domain_valorisation = quant_domain_base + [
+                    ('company_id', 'not in', excluded_non_retail_ids)
+                ]
+
             quant_val_grouped = request.env['stock.quant'].sudo().read_group(
-                quant_domain_base,
+                quant_domain_valorisation,
                 ['quantity:sum', 'product_id', 'company_id'],
                 ['product_id', 'company_id'],
                 lazy=False

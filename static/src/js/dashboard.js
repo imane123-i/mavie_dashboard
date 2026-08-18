@@ -73,6 +73,8 @@ var lastDormantList = [];
 // total, pas la longueur de la liste tronquée.
 var lastRupturesCount = 0;
 var lastDormantCount = 0;
+var lastSoldesList = [];
+var lastSoldesCount = 0;
 var _searchDebounce = null;
 
 function el(id) { return document.getElementById(id); }
@@ -511,8 +513,24 @@ async function loadKPIs() {
         }
 
         var qtySoldSoldeEl = el('kpi-qty-sold-solde');
+        lastSoldesList = data.soldes_list || [];
+        lastSoldesCount = data.soldes_count || 0;
+
         if (qtySoldSoldeEl) {
-            qtySoldSoldeEl.textContent = data.qty_sold_solde ? ('dont ' + formatNumber(data.qty_sold_solde) + ' en solde') : '';
+            // Cliquable : ouvre la liste des articles concernés (même
+            // principe que les cartes Ruptures / Stock dormant).
+            if (data.qty_sold_solde) {
+                qtySoldSoldeEl.textContent = 'dont ' + formatNumber(data.qty_sold_solde) + ' en solde'
+                    + (lastSoldesCount ? ' — voir les ' + formatNumber(lastSoldesCount) + ' articles' : '');
+                qtySoldSoldeEl.style.cursor = lastSoldesCount ? 'pointer' : '';
+                qtySoldSoldeEl.style.textDecoration = lastSoldesCount ? 'underline' : '';
+                qtySoldSoldeEl.title = lastSoldesCount ? 'Cliquer pour voir les articles vendus en solde' : '';
+            } else {
+                qtySoldSoldeEl.textContent = '';
+                qtySoldSoldeEl.style.cursor = '';
+                qtySoldSoldeEl.style.textDecoration = '';
+                qtySoldSoldeEl.title = '';
+            }
         }
 
         lastRupturesList = data.ruptures_list || [];
@@ -635,7 +653,7 @@ function _renderProductTable(tbodyId, products, isFlop) {
     if (!products || products.length === 0) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 5;
+        td.colSpan = 7;
         td.textContent = 'Aucun produit';
         td.style.textAlign = 'center';
         td.style.color = '#999';
@@ -680,6 +698,27 @@ function _renderProductTable(tbodyId, products, isFlop) {
 
         tr.appendChild(tdCol4);
         tr.appendChild(tdCol5);
+
+        // Qté achetée + Reste affichés directement dans le tableau : avant,
+        // il fallait ouvrir la fiche produit pour les connaître.
+        var tdAchat = document.createElement('td');
+        tdAchat.textContent = formatNumber(p.qty_purchased || 0);
+        tr.appendChild(tdAchat);
+
+        var tdReste = document.createElement('td');
+        // Reste = acheté − vendu (même définition que la fiche produit :
+        // une estimation à partir des mouvements suivis, pas le stock
+        // physique, d'où la couleur rouge quand elle passe négative).
+        var reste = (p.qty_purchased || 0) - (p.qty_sold || 0);
+        tdReste.textContent = formatNumber(reste);
+        if (reste < 0) {
+            tdReste.style.color = '#EF4444';
+            tdReste.title = 'Plus vendu qu\'acheté sur les commandes suivies — stock initial ou ajustement non tracé par un achat.';
+        } else if (reste === 0) {
+            tdReste.style.color = '#10B981';
+        }
+        tr.appendChild(tdReste);
+
         tbody.appendChild(tr);
     });
 }
@@ -2101,6 +2140,85 @@ function closeDormant() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// ARTICLES VENDUS EN SOLDE
+// ═══════════════════════════════════════════════════════════
+function _renderSoldesList(searchFilter) {
+    var tbody = el('soldes-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    var badge = el('soldes-count-badge');
+    if (badge) {
+        badge.textContent = formatNumber(lastSoldesCount) + ' articles'
+            + (lastSoldesCount > lastSoldesList.length ? ' (' + formatNumber(lastSoldesList.length) + ' affichés)' : '');
+    }
+
+    var list = lastSoldesList;
+    if (searchFilter) {
+        var q = searchFilter.toLowerCase().trim();
+        list = list.filter(function(p) {
+            return (p.name && p.name.toLowerCase().includes(q)) ||
+                   (p.ref && p.ref.toLowerCase().includes(q));
+        });
+    }
+
+    if (!list || list.length === 0) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 7;
+        td.textContent = searchFilter ? 'Aucun article ne correspond à votre recherche.' : 'Aucune vente en solde sur ce périmètre.';
+        td.style.textAlign = 'center';
+        td.style.padding = '24px';
+        td.style.color = '#94A3B8';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    list.forEach(function(p) {
+        var tr = document.createElement('tr');
+        tr.style.cursor = 'pointer';
+        tr.style.borderBottom = '1px solid #F1F5F9';
+        tr.onclick = function() {
+            closeSoldes();
+            openDetail(p.id, p.name);
+        };
+
+        function cell(text, align, color, weight) {
+            var td = document.createElement('td');
+            td.textContent = text;
+            td.style.padding = '10px';
+            if (align) td.style.textAlign = align;
+            if (color) td.style.color = color;
+            if (weight) td.style.fontWeight = weight;
+            return td;
+        }
+
+        tr.appendChild(cell(p.ref || '—', null, '#64748B', '600'));
+        tr.appendChild(cell(p.name || '—'));
+        tr.appendChild(cell(formatNumber(p.qty_solde), 'center', null, '700'));
+        tr.appendChild(cell(formatMAD(p.prix_catalogue), 'right', '#64748B'));
+        tr.appendChild(cell(formatMAD(p.prix_moyen_paye), 'right', '#0F172A', '600'));
+        tr.appendChild(cell('-' + (p.remise_pct || 0).toFixed(1).replace('.', ',') + ' %', 'center', '#DC2626', '700'));
+        tr.appendChild(cell(formatMAD(p.ca_solde), 'right'));
+
+        tbody.appendChild(tr);
+    });
+}
+
+function openSoldes() {
+    if (!lastSoldesCount) return;
+    _renderSoldesList();
+    var overlay = el('soldes-overlay');
+    if (overlay) overlay.classList.add('active');
+}
+
+function closeSoldes() {
+    var overlay = el('soldes-overlay');
+    if (overlay) overlay.classList.remove('active');
+}
+
+// ═══════════════════════════════════════════════════════════
 // DASHBOARD STOCK & RUPTURE (nouvelle vue)
 // ═══════════════════════════════════════════════════════════
 
@@ -2658,6 +2776,32 @@ document.addEventListener('DOMContentLoaded', function() {
     if (dormantOverlay) {
         dormantOverlay.addEventListener('click', function(e) {
             if (e.target === dormantOverlay) closeDormant();
+        });
+    }
+
+    // ── Articles vendus en solde (sous-texte cliquable de la carte Qté vendue) ──
+    var soldeSubtext = el('kpi-qty-sold-solde');
+    if (soldeSubtext) {
+        soldeSubtext.addEventListener('click', function(e) {
+            e.stopPropagation();
+            openSoldes();
+        });
+    }
+
+    var searchSoldesInput = el('search-soldes-input');
+    if (searchSoldesInput) {
+        searchSoldesInput.addEventListener('input', function(e) {
+            _renderSoldesList(e.target.value);
+        });
+    }
+
+    var closeSoldesBtn = el('close-soldes-btn');
+    if (closeSoldesBtn) closeSoldesBtn.addEventListener('click', closeSoldes);
+
+    var soldesOverlay = el('soldes-overlay');
+    if (soldesOverlay) {
+        soldesOverlay.addEventListener('click', function(e) {
+            if (e.target === soldesOverlay) closeSoldes();
         });
     }
 

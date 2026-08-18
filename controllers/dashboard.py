@@ -120,6 +120,37 @@ class MaVieDashboardController(http.Controller):
         context_company_ids = self._get_context_company_ids()
         return [cid for cid in non_retail_ids if cid not in context_company_ids]
 
+    def _get_explicit_non_retail_ids(self, kw=None):
+        """Sociétés non-retail que l'utilisateur a explicitement cochées —
+        complément de _get_excluded_non_retail_ids (liste vide dans le cas
+        normal où seules des sociétés magasins sont sélectionnées)."""
+        excluded = self._get_excluded_non_retail_ids(kw)
+        return [cid for cid in self._get_non_retail_company_ids() if cid not in excluded]
+
+    def _build_non_retail_sale_domain(self, kw, product_tmpl_ids=None):
+        """Ventes inter-sociétés d'une société non-retail cochée.
+
+        MOD FOR LIFE ne vend pas en caisse : son chiffre d'affaires vient de
+        `sale.order` vers les 3 sociétés magasins (créé par
+        mv_article_batch.action_generate_sale_orders). C'est le pendant, côté
+        ventes, de ce que `purchase.order.line` couvre déjà côté achats.
+        """
+        explicit_ids = self._get_explicit_non_retail_ids(kw)
+        if not explicit_ids:
+            return [('id', '=', -1)]
+        domain = [
+            ('order_id.state', 'in', ['sale', 'done']),
+            ('order_id.company_id', 'in', explicit_ids),
+        ]
+        domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+        if product_tmpl_ids is not None:
+            domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
+        if kw.get('date_start'):
+            domain.append(('order_id.date_order', '>=', kw['date_start'] + ' 00:00:00'))
+        if kw.get('date_end'):
+            domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
+        return domain
+
     def _get_mod_for_life_partner_id(self):
         """Résout le partner_id de la société MOD FOR LIFE — c'est le
         fournisseur sur les bons de commande des 3 sociétés magasins quand
@@ -638,6 +669,7 @@ class MaVieDashboardController(http.Controller):
                         'vendu_avec_cout': 0, 'marge': 0,
                         'tickets': 0, 'panier_moyen': 0,
                         'qty_sold': 0, 'qty_sold_normal': 0, 'qty_sold_solde': 0,
+                        'soldes_count': 0, 'soldes_list': [],
                         'qty_purchased': 0, 'stock_total': 0,
                         'sell_through': 0, 'ruptures_count': 0, 'ruptures_list': [],
                         'top_products': [], 'flop_products': [],
@@ -679,6 +711,21 @@ class MaVieDashboardController(http.Controller):
             ca_ht_total = sum(g.get('price_subtotal') or 0.0 for g in pos_grouped)
             qty_sold_total = int(sum(g.get('qty') or 0 for g in pos_grouped))
 
+            # Ventes d'une société non-retail explicitement cochée : elles
+            # passent par sale.order, pas par le POS (voir
+            # _build_non_retail_sale_domain). Ajoutées au CA Vendu pour que
+            # cocher MOD FOR LIFE ait le même effet que sur le CA Achat.
+            if self._get_explicit_non_retail_ids(kw):
+                so_grouped = request.env['sale.order.line'].sudo().read_group(
+                    self._build_non_retail_sale_domain(kw, product_tmpl_ids),
+                    ['product_uom_qty:sum', 'price_total:sum', 'price_subtotal:sum'],
+                    [], lazy=False
+                )
+                if so_grouped:
+                    ca_total += so_grouped[0].get('price_total') or 0.0
+                    ca_ht_total += so_grouped[0].get('price_subtotal') or 0.0
+                    qty_sold_total += int(so_grouped[0].get('product_uom_qty') or 0)
+
             # Qté vendue "en solde" = lignes vendues à un prix effectif
             # (remise incluse) inférieur au prix catalogue (list_price) du
             # produit — détection par prix, pas par date. read_group ne peut
@@ -687,6 +734,7 @@ class MaVieDashboardController(http.Controller):
             # restreinte aux IDs déjà filtrés par pos_domain (pas de 2e scan
             # complet de pos.order.line).
             qty_sold_solde_total = 0
+            soldes_products = []
             pos_line_ids_for_solde = request.env['pos.order.line'].sudo().search(pos_domain).ids
             if pos_line_ids_for_solde:
                 request.env.cr.execute("""
@@ -700,6 +748,51 @@ class MaVieDashboardController(http.Controller):
                     WHERE pol.id IN %s AND pt.list_price > 0
                 """, (tuple(pos_line_ids_for_solde),))
                 qty_sold_solde_total = int(request.env.cr.fetchone()[0] or 0)
+
+                # Détail par référence pour la liste cliquable "articles
+                # vendus en solde" : mêmes lignes et même critère que le
+                # compteur ci-dessus (un seul scan, restreint aux mêmes IDs),
+                # regroupées par produit avec le prix moyen réellement
+                # encaissé pour pouvoir le comparer au prix catalogue.
+                request.env.cr.execute("""
+                    SELECT pt.id,
+                           SUM(pol.qty) AS qty_solde,
+                           SUM(pol.price_subtotal_incl) AS ca_solde,
+                           MAX(pt.list_price) AS list_price,
+                           SUM(pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0) * pol.qty)
+                               / NULLIF(SUM(pol.qty), 0) AS prix_moyen_paye
+                    FROM pos_order_line pol
+                    JOIN product_product pp ON pp.id = pol.product_id
+                    JOIN product_template pt ON pt.id = pp.product_tmpl_id
+                    WHERE pol.id IN %s AND pt.list_price > 0
+                      AND pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0) < pt.list_price * 0.999
+                    GROUP BY pt.id
+                    HAVING SUM(pol.qty) > 0
+                """, (tuple(pos_line_ids_for_solde),))
+                solde_rows = request.env.cr.fetchall()
+                if solde_rows:
+                    solde_tmpl_ids = [r[0] for r in solde_rows]
+                    solde_tmpl_data = request.env['product.template'].sudo().search_read(
+                        [('id', 'in', solde_tmpl_ids)],
+                        ['name', 'default_code', 'base_pivot_reference']
+                    )
+                    solde_tmpl_by_id = {t['id']: t for t in solde_tmpl_data}
+                    for tid, qty_s, ca_s, lp, prix_moyen in solde_rows:
+                        t = solde_tmpl_by_id.get(tid, {})
+                        lp = lp or 0.0
+                        prix_moyen = prix_moyen or 0.0
+                        soldes_products.append({
+                            'id': tid,
+                            'name': t.get('name') or '—',
+                            'ref': (t.get('base_pivot_reference') or t.get('default_code')
+                                    or t.get('name') or '—'),
+                            'qty_solde': int(qty_s or 0),
+                            'ca_solde': round(ca_s or 0.0, 2),
+                            'prix_catalogue': round(lp, 2),
+                            'prix_moyen_paye': round(prix_moyen, 2),
+                            'remise_pct': round((lp - prix_moyen) / lp * 100, 1) if lp > 0 else 0.0,
+                        })
+                    soldes_products.sort(key=lambda x: -x['qty_solde'])
             qty_sold_normal_total = qty_sold_total - qty_sold_solde_total
 
             pos_tickets_agg = request.env['pos.order.line'].sudo().read_group(
@@ -1473,6 +1566,8 @@ class MaVieDashboardController(http.Controller):
                 'qty_sold': qty_sold_total,
                 'qty_sold_normal': qty_sold_normal_total,
                 'qty_sold_solde': qty_sold_solde_total,
+                'soldes_count': len(soldes_products),
+                'soldes_list': soldes_products[:500],
                 'qty_purchased': qty_purchased_total,
                 'stock_total': stock_total,
                 'valeur_stock_ht': round(val_ht_total, 2),
@@ -1640,12 +1735,16 @@ class MaVieDashboardController(http.Controller):
         buffer.write('﻿')  # BOM pour qu'Excel détecte l'UTF-8
         writer = csv.writer(buffer, delimiter=';')
         writer.writerow(['Top Produits' if kind != 'flop' else 'Flop Produits'])
-        writer.writerow(['#', 'Produit', 'Réf', 'Qté vendue', 'CA Potentiel', 'Stock', 'Qté achetée'])
+        writer.writerow(['#', 'Produit', 'Réf', 'Qté vendue', 'CA Potentiel', 'Stock', 'Qté achetée', 'Reste'])
         for row in rows or []:
+            # Reste = acheté − vendu, même définition qu'à l'écran.
+            qty_sold_row = row.get('qty_sold', row.get('qty', 0)) or 0
+            qty_purchased_row = row.get('qty_purchased', 0) or 0
             writer.writerow([
                 row.get('rank'), row.get('name'), row.get('ref'),
-                row.get('qty_sold', row.get('qty', 0)), row.get('ca', 0),
-                row.get('stock', 0), row.get('qty_purchased', 0),
+                qty_sold_row, row.get('ca', 0),
+                row.get('stock', 0), qty_purchased_row,
+                qty_purchased_row - qty_sold_row,
             ])
 
         filename = 'mavie_export_{}.csv'.format('flop_produits' if kind == 'flop' else 'top_produits')
@@ -1868,6 +1967,23 @@ class MaVieDashboardController(http.Controller):
             # CA HT — comparé au coût (lui aussi HT) pour calculer une marge
             # juste, sans le biais de la TVA incluse dans price_subtotal_incl.
             ca_ht = sum(pos_lines.mapped('price_subtotal')) if pos_lines else 0.0
+
+            # Ventes d'une société non-retail explicitement cochée
+            # (MOD FOR LIFE) : elle ne vend PAS en caisse, ses ventes vers les
+            # sociétés magasins passent par sale.order. Sans ça, cocher
+            # MOD FOR LIFE laissait CA Vendu inchangé alors que CA Achat, lui,
+            # réagissait — même incohérence que celle corrigée côté achats
+            # (voir _get_excluded_non_retail_ids). Ajouté uniquement quand la
+            # société est cochée, donc aucun impact sur la vision retail.
+            ca_so_lines = request.env['sale.order.line'].sudo().browse()
+            if self._get_explicit_non_retail_ids(kw):
+                ca_so_lines = request.env['sale.order.line'].sudo().search(
+                    self._build_non_retail_sale_domain(kw, [product_tmpl.id])
+                )
+                if ca_so_lines:
+                    qty_sold += int(sum(ca_so_lines.mapped('product_uom_qty')))
+                    ca += sum(ca_so_lines.mapped('price_total'))
+                    ca_ht += sum(ca_so_lines.mapped('price_subtotal'))
 
             # Qté vendue "en solde" = lignes vendues à un prix effectif
             # (remise incluse) inférieur au prix catalogue (list_price) —

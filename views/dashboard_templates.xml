@@ -927,6 +927,22 @@
                     animation: fadeInOverlay 0.22s ease;
                 }
 
+                #soldes-overlay {
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(15,23,42,0.4);
+                    z-index: 9600;
+                    display: none;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 16px;
+                }
+
+                #soldes-overlay.active {
+                    display: flex;
+                    animation: fadeInOverlay 0.22s ease;
+                }
+
                 #dormant-overlay {
                     position: fixed;
                     inset: 0;
@@ -1402,6 +1418,8 @@
                                     <th>Réf</th>
                                     <th class="top-col-4">Qté vendue</th>
                                     <th class="top-col-5">CA Vendu</th>
+                                    <th title="Quantité achetée par les magasins (commandes fournisseur confirmées).">Qté achetée</th>
+                                    <th title="Reste = Qté achetée − Qté vendue. Estimation « papier » de ce qui devrait rester ; à comparer au stock physique réel.">Reste</th>
                                 </tr>
                             </thead>
                             <tbody id="top-products-tbody"></tbody>
@@ -1423,6 +1441,8 @@
                                     <th>Réf</th>
                                     <th class="flop-col-4">Qté vendue</th>
                                     <th class="flop-col-5">CA Vendu</th>
+                                    <th title="Quantité achetée par les magasins (commandes fournisseur confirmées).">Qté achetée</th>
+                                    <th title="Reste = Qté achetée − Qté vendue. Estimation « papier » de ce qui devrait rester ; à comparer au stock physique réel.">Reste</th>
                                 </tr>
                             </thead>
                             <tbody id="flop-products-tbody"></tbody>
@@ -1755,6 +1775,40 @@
                                 </tr>
                             </thead>
                             <tbody id="ruptures-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div id="soldes-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-soldes-btn" title="Fermer">✕</button>
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding-right:30px;">
+                        <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700; display:flex; align-items:center; gap:8px;">
+                            <span>🏷️</span> Articles vendus en solde
+                            <span id="soldes-count-badge" style="background:#DBEAFE; color:#1E40AF; font-weight:700; font-size:0.8rem; padding:3px 10px; border-radius:12px;">0</span>
+                        </h3>
+                    </div>
+                    <div style="font-size:0.8rem; color:#64748B; background:#F8FAFC; border:1px solid #E2E8F0; border-radius:8px; padding:8px 12px; margin-bottom:12px;">
+                        Détection par le prix : une vente est comptée « en solde » quand le prix réellement payé (remise incluse) est inférieur au prix catalogue du produit. Une remise exceptionnelle ou un geste commercial apparaîtra donc ici aussi.
+                    </div>
+                    <div style="margin-bottom:16px;">
+                        <input type="text" id="search-soldes-input" placeholder="🔍 Rechercher une référence ou un nom..." style="width:100%; padding:10px 14px; border:1px solid #CBD5E1; border-radius:8px; font-size:0.9rem; outline:none; background:#F8FAFC; color:#0F172A; font-weight:500;"/>
+                    </div>
+                    <div style="max-height:55vh; overflow-y:auto;">
+                        <table style="width:100%; border-collapse:collapse;">
+                            <thead>
+                                <tr style="border-bottom:2px solid #E2E8F0; text-align:left; background:#F1F5F9; position:sticky; top:0; z-index:10;">
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Réf</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Désignation / Article</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Qté en solde</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">Prix catalogue</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">Prix moyen payé</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Remise</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">CA en solde</th>
+                                </tr>
+                            </thead>
+                            <tbody id="soldes-tbody"></tbody>
                         </table>
                     </div>
                 </div>

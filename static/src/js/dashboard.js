@@ -2100,25 +2100,29 @@ function _renderDormantList(searchFilter) {
         tdMagasin.style.padding = '10px';
         tdMagasin.style.color = '#334155';
         tdMagasin.style.fontSize = '0.85rem';
-        // Le stock dormant est presque toujours réparti sur plusieurs
-        // magasins : n'en afficher qu'un laissait croire que tout y était.
-        // On liste donc les 3 premiers, avec le nombre de magasins restants,
-        // et l'infobulle donne la répartition complète.
+        // Un seul magasin affiché : celui où la marchandise n'a plus bougé
+        // depuis le plus longtemps (c'est là que le stock est vraiment
+        // bloqué), avec la quantité qui s'y trouve. La répartition complète
+        // reste disponible au survol.
+        tdMagasin.textContent = (p.magasin || '—')
+            + ((p.magasin_qty !== null && p.magasin_qty !== undefined)
+                ? ' (' + formatNumber(p.magasin_qty) + ')' : '');
         var br = p.magasin_breakdown || [];
-        if (br.length) {
-            var top = br.slice(0, 3).map(function(x) {
-                return x.magasin + ' (' + formatNumber(x.qty) + ')';
-            }).join(', ');
-            if (br.length > 3) top += ' + ' + (br.length - 3) + ' autre' + (br.length - 3 > 1 ? 's' : '');
-            tdMagasin.textContent = top;
-            tdMagasin.title = 'Répartition complète :\n' + br.map(function(x) {
+        var tip = '';
+        if (p.magasin_days !== null && p.magasin_days !== undefined) {
+            var sub = document.createElement('div');
+            sub.textContent = 'sans mouvement depuis ' + formatNumber(p.magasin_days) + ' jours';
+            sub.style.fontSize = '0.75rem';
+            sub.style.color = '#B45309';
+            tdMagasin.appendChild(sub);
+            tip = 'Dernier mouvement dans ce magasin : ' + (p.magasin_last_move || '?') + '\n';
+        }
+        if (br.length > 1) {
+            tip += 'Répartition sur ' + br.length + ' magasins :\n' + br.map(function(x) {
                 return '• ' + x.magasin + ' : ' + formatNumber(x.qty);
             }).join('\n');
-        } else {
-            tdMagasin.textContent = (p.magasin || '—')
-                + ((p.magasin_qty !== null && p.magasin_qty !== undefined)
-                    ? ' (' + formatNumber(p.magasin_qty) + ')' : '');
         }
+        tdMagasin.title = tip;
         tr.appendChild(tdMagasin);
 
         var tdStock = document.createElement('td');

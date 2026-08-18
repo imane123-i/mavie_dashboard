@@ -1834,7 +1834,7 @@
                                 <tr style="border-bottom:2px solid #E2E8F0; text-align:left; background:#F1F5F9; position:sticky; top:0; z-index:10;">
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Réf</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Désignation / Article</th>
-                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;" title="Magasins où ce stock dormant est immobilisé, du plus chargé au moins chargé (3 premiers affichés — survolez la cellule pour la répartition complète).">Où dort ce stock</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;" title="Magasin où cette référence n'a plus bougé depuis le plus longtemps, avec la quantité qui s'y trouve — c'est là que le stock est réellement bloqué. Survolez une ligne pour voir la répartition dans les autres magasins.">Magasin le plus figé</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;" title="Stock total de la référence sur TOUT le réseau, pas seulement dans le magasin principal indiqué à gauche.">Stock total réseau</th>
                                 </tr>
                             </thead>

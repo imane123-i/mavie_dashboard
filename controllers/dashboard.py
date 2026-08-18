@@ -577,6 +577,84 @@ class MaVieDashboardController(http.Controller):
 
         return magasin_by_tid
 
+    def _resolve_magasin_stagnant(self, product_tmpl_ids, shop_mappings, breakdown_by_tid):
+        """Magasin où le stock d'une référence n'a plus bougé depuis le plus
+        longtemps (dernier mouvement le plus ancien), parmi ceux qui en
+        détiennent encore.
+
+        Pour du stock dormant, c'est l'information utile : savoir où la
+        marchandise est réellement bloquée, plutôt que simplement où il y en
+        a le plus. Une requête groupée par magasin (même coût que
+        _resolve_magasin_batch), pas de N+1 par référence.
+        """
+        result = {}
+        product_tmpl_ids = [t for t in product_tmpl_ids if breakdown_by_tid.get(t)]
+        if not product_tmpl_ids:
+            return result
+
+        variant_rows = request.env['product.product'].sudo().search_read(
+            [('product_tmpl_id', 'in', product_tmpl_ids)], ['id', 'product_tmpl_id']
+        )
+        tmpl_by_variant = {v['id']: v['product_tmpl_id'][0] for v in variant_rows if v.get('product_tmpl_id')}
+        all_variant_ids = list(tmpl_by_variant.keys())
+        if not all_variant_ids:
+            return result
+
+        # Dernier mouvement par (référence, magasin) : on regarde les
+        # mouvements terminés touchant l'emplacement du magasin, dans un sens
+        # comme dans l'autre.
+        last_move = {}
+        for sm in shop_mappings:
+            if not sm.warehouse_id or not sm.warehouse_id.lot_stock_id:
+                continue
+            label = sm.warehouse_id.name or sm.shop_label or sm.shop_field
+            loc_id = sm.warehouse_id.lot_stock_id.id
+            grouped = request.env['stock.move.line'].sudo().read_group(
+                [
+                    ('product_id', 'in', all_variant_ids),
+                    ('state', '=', 'done'),
+                    '|', ('location_id', 'child_of', loc_id), ('location_dest_id', 'child_of', loc_id),
+                ],
+                ['date:max', 'product_id'], ['product_id'], lazy=False
+            )
+            for g in grouped:
+                pid = g['product_id'][0] if g.get('product_id') else None
+                tid = tmpl_by_variant.get(pid)
+                if not tid or not g.get('date'):
+                    continue
+                cur = last_move.setdefault(tid, {})
+                if label not in cur or g['date'] > cur[label]:
+                    cur[label] = g['date']
+
+        now = datetime.now()
+        for tid in product_tmpl_ids:
+            rows = breakdown_by_tid.get(tid) or []
+            # Uniquement les magasins qui détiennent encore du stock positif.
+            rows = [r for r in rows if r['qty'] > 0]
+            if not rows:
+                continue
+            dates_here = last_move.get(tid) or {}
+            # Le plus ancien dernier-mouvement ; à défaut de date connue, on
+            # retombe sur le magasin le plus chargé (rows est déjà trié).
+            candidates = [(dates_here.get(r['magasin']), r) for r in rows if dates_here.get(r['magasin'])]
+            if candidates:
+                candidates.sort(key=lambda x: x[0])
+                dt, row = candidates[0]
+                if isinstance(dt, str):
+                    try:
+                        dt = datetime.strptime(dt[:19], '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        dt = None
+                result[tid] = {
+                    'magasin': row['magasin'], 'qty': row['qty'],
+                    'days': (now - dt).days if dt else None,
+                    'last_move': dt.strftime('%d/%m/%Y') if dt else None,
+                }
+            else:
+                result[tid] = {'magasin': rows[0]['magasin'], 'qty': rows[0]['qty'],
+                               'days': None, 'last_move': None}
+        return result
+
     # ─────────────────────────────────────────────────────────────
     # FILTERS
     # ─────────────────────────────────────────────────────────────
@@ -1355,19 +1433,30 @@ class MaVieDashboardController(http.Controller):
 
             # Magasin où le stock dormant est réellement immobilisé (le plus
             # de stock, pas le moins — contraire de la résolution "rupture").
+            # DÉCISION UTILISATEUR (2026-08-18) : pour du stock DORMANT, le
+            # magasin utile n'est pas celui qui en a le plus, mais celui où
+            # la marchandise n'a plus bougé depuis le plus longtemps — c'est
+            # là que le stock est réellement bloqué. On calcule donc, par
+            # référence et par magasin, la date du dernier mouvement de
+            # stock, et on retient le magasin le plus ancien.
             qty_in_magasin_dormant = {}
             breakdown_dormant = {}
-            magasin_by_tid_dormant = self._resolve_magasin_batch(
+            self._resolve_magasin_batch(
                 [d['id'] for d in dormant_products], shop_mappings, kw.get('shop_field'), mode='max',
                 qty_by_tid=qty_in_magasin_dormant, breakdown_by_tid=breakdown_dormant
             )
+            stagnant = self._resolve_magasin_stagnant(
+                [d['id'] for d in dormant_products], shop_mappings, breakdown_dormant
+            )
             for d in dormant_products:
-                d['magasin'] = magasin_by_tid_dormant.get(d['id'], 'Réseau')
-                # Quantité dans CE magasin précis — 'stock' reste le total
-                # réseau, les deux sont affichés séparément à l'écran.
-                d['magasin_qty'] = qty_in_magasin_dormant.get(d['id'])
-                # Répartition complète, pour montrer où dort le reste du
-                # stock et pas seulement le magasin le plus chargé.
+                info = stagnant.get(d['id']) or {}
+                d['magasin'] = info.get('magasin') or 'Réseau'
+                # Quantité présente dans CE magasin ('stock' reste le total
+                # réseau) et ancienneté du dernier mouvement qui s'y est
+                # produit — les deux sont affichés séparément à l'écran.
+                d['magasin_qty'] = info.get('qty')
+                d['magasin_days'] = info.get('days')
+                d['magasin_last_move'] = info.get('last_move')
                 d['magasin_breakdown'] = breakdown_dormant.get(d['id']) or []
 
             alertes_stock = []
@@ -1553,12 +1642,27 @@ class MaVieDashboardController(http.Controller):
             )
 
             val_pids = [g['product_id'][0] for g in quant_val_grouped if g.get('product_id')]
+            val_cost_estime = False
             if val_pids:
                 val_prods = request.env['product.product'].sudo().search_read(
                     [('id', 'in', val_pids)],
-                    ['id', 'list_price', 'standard_price']
+                    ['id', 'list_price', 'standard_price', 'product_tmpl_id']
                 )
                 val_prod_map = {p['id']: p for p in val_prods}
+
+                # DÉCISION UTILISATEUR (2026-08-18) : le champ "Coût" n'est
+                # renseigné que sur 12 références sur 4972, d'où une "Valeur
+                # au coût" à 0,00 quasiment partout. Quand ce champ est vide
+                # mais qu'on connaît le PRIX D'ACHAT RÉELLEMENT PAYÉ sur les
+                # commandes fournisseur (même source que CA Achat), on
+                # l'utilise comme repli plutôt que d'afficher zéro. La valeur
+                # est alors signalée comme estimée (val_cost_estime) pour ne
+                # pas la confondre avec un coût réellement saisi.
+                prix_achat_moyen_by_tmpl = {}
+                for tid, qte in purchase_by_tmpl.items():
+                    montant = ca_achat_by_tmpl.get(tid) or 0.0
+                    if qte and montant > 0:
+                        prix_achat_moyen_by_tmpl[tid] = montant / qte
 
                 val_by_company = {}
                 for g in quant_val_grouped:
@@ -1570,6 +1674,13 @@ class MaVieDashboardController(http.Controller):
                     p_data = val_prod_map[pid]
                     price_ht = p_data.get('list_price') or 0.0
                     cost_price = p_data.get('standard_price') or 0.0
+                    if not cost_price:
+                        tmpl_ref = p_data.get('product_tmpl_id')
+                        tmpl_id_val = tmpl_ref[0] if tmpl_ref else None
+                        fallback = prix_achat_moyen_by_tmpl.get(tmpl_id_val)
+                        if fallback:
+                            cost_price = fallback
+                            val_cost_estime = True
 
                     v_ht = qty * price_ht
                     v_cost = qty * cost_price
@@ -1643,6 +1754,7 @@ class MaVieDashboardController(http.Controller):
                 'stock_total': stock_total,
                 'valeur_stock_ht': round(val_ht_total, 2),
                 'valeur_stock_cost': round(val_cost_total, 2),
+                'valeur_stock_cost_estime': val_cost_estime,
                 'stock_val_by_store': stock_val_by_store,
                 'sell_through': sell_through,
                 'ruptures_count': ruptures_count,

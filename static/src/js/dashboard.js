@@ -75,7 +75,26 @@ var lastRupturesCount = 0;
 var lastDormantCount = 0;
 var lastSoldesList = [];
 var lastSoldesCount = 0;
+// Écarts d'inventaire (références en stock négatif) : le compteur vient des
+// KPIs, la liste détaillée n'est chargée qu'à l'ouverture du popup — elle
+// suppose de résoudre entrepôts et libellés, inutile tant qu'on ne clique pas.
+var lastEcartsRefsCount = 0;
+var lastEcartsList = [];
+// Historique transferts / soldes affiché sous les cartes.
+var lastHistory = { transfers: [], soldes: [] };
+var historyTab = 'transferts';
 var _searchDebounce = null;
+
+// ── Anti-réponse-périmée ──────────────────────────────────────────────
+// BUG CORRIGÉ : le graphique "CA par Arrivage" affichait par intermittence
+// TOUS les arrivages alors qu'une collection était filtrée. Cause : les
+// appels sont lancés sans attendre, et le temps de réponse dépend du
+// périmètre — une requête SANS filtre (lente, elle scanne toutes les ventes)
+// peut donc revenir APRÈS la requête filtrée lancée ensuite, et écraser le
+// résultat correct. D'où le "parfois ça marche, parfois non".
+// On numérote chaque appel et on ignore toute réponse qui n'est plus la
+// dernière demandée.
+var _reqSeq = { kpis: 0, salesDaily: 0, history: 0 };
 
 function el(id) { return document.getElementById(id); }
 
@@ -144,15 +163,11 @@ async function loadFilters() {
         }
 
         state.shops = data.shops || [];
+        state.online_shops = data.online_shops || [];
         var magasinSelect = el('filter-magasin');
         if (magasinSelect && data.shops && data.shops.length > 0) {
             while (magasinSelect.options.length > 1) magasinSelect.remove(1);
-            data.shops.forEach(function(s) {
-                var opt = document.createElement('option');
-                opt.value = s.field;
-                opt.textContent = s.name;
-                magasinSelect.appendChild(opt);
-            });
+            _appendShopOptions(magasinSelect, data.shops, data.online_shops);
             magasinSelect.disabled = false;
         } else if (magasinSelect) {
             var opt = document.createElement('option');
@@ -189,18 +204,40 @@ async function loadFilters() {
     }
 }
 
+// Remplit un <select> magasin : magasins physiques d'abord, puis les points
+// de vente en ligne dans leur propre groupe. Chaque entrée donne un chiffre
+// exact et distinct — un magasin physique ne compte plus les tickets de son
+// jumeau « Online », qui a désormais sa propre ligne.
+function _appendShopOptions(select, shops, onlineShops) {
+    (shops || []).forEach(function(s) {
+        var opt = document.createElement('option');
+        opt.value = s.field;
+        opt.textContent = s.name;
+        select.appendChild(opt);
+    });
+    if (onlineShops && onlineShops.length) {
+        var group = document.createElement('optgroup');
+        group.label = '🌐 Magasins en ligne';
+        onlineShops.forEach(function(s) {
+            var opt = document.createElement('option');
+            opt.value = s.field;
+            opt.textContent = s.name + (s.company ? ' — ' + s.company : '');
+            group.appendChild(opt);
+        });
+        select.appendChild(group);
+    }
+}
+
 function _populateDetailFilters(data) {
     var detailMagasin = el('detail-filter-magasin');
     if (detailMagasin && data.shops) {
         while (detailMagasin.options.length > 1) detailMagasin.remove(1);
-        data.shops.forEach(function(s) {
-            var opt = document.createElement('option');
-            opt.value = s.field;
-            opt.textContent = s.name;
-            detailMagasin.appendChild(opt);
-        });
+        _appendShopOptions(detailMagasin, data.shops, data.online_shops);
     }
 
+    // Destination de transfert : uniquement les magasins physiques. Un point
+    // de vente en ligne n'a pas d'entrepôt propre (il partage celui de son
+    // magasin), il ne peut donc être ni source ni cible d'un transfert.
     var transferDest = el('transfer-dest-shop');
     if (transferDest && data.shops) {
         while (transferDest.options.length > 1) transferDest.remove(1);
@@ -374,6 +411,13 @@ function getFilterParams() {
     };
 }
 
+// Seule page portant l'historique transferts/soldes : le "Tableau de bord"
+// (menu Dashboard → Tableau de bord, page=ventes), qui est aussi la page par
+// défaut et celle où s'affiche la vue MOD FOR LIFE.
+function isHistoryPage() {
+    return currentPage === 'ventes';
+}
+
 function adjustUIForPage() {
     // ── Bascule entre l'ancien tableau de bord et le nouveau "Stock & Rupture" ──
     var stockOnlyIds  = ['stock-kpi-grid', 'stock-middle-section', 'stock-30j-section', 'stock-valorisation-section'];
@@ -386,6 +430,14 @@ function adjustUIForPage() {
         stockOnlyIds.forEach(function(id)  { var e = el(id); if (e) e.style.display = 'none'; });
         legacyOnlyIds.forEach(function(id) { var e = el(id); if (e) e.style.display = ''; });
     }
+
+    // DÉCISION UTILISATEUR : l'historique transferts/soldes ne vit que sur
+    // la page "Tableau de bord" — c'est de là que partent la quasi-totalité
+    // des transferts, et c'est aussi la page qui affiche la vue MOD FOR LIFE.
+    // Le dupliquer sur "Stock & ruptures" n'apportait rien et allongeait la
+    // page pour rien.
+    var historySection = el('history-section');
+    if (historySection) historySection.style.display = isHistoryPage() ? '' : 'none';
 
     var displayMap = {
         ventes: {
@@ -455,8 +507,13 @@ async function loadKPIs() {
     adjustUIForPage();
     showLoading(true);
 
+    var seq = ++_reqSeq.kpis;
     var params = getFilterParams();
     var data = await rpc('/mavie/api/kpis', params);
+    // Même garde que loadSalesDaily : une réponse correspondant à un filtre
+    // déjà remplacé ne doit ni s'afficher, ni masquer le spinner d'un appel
+    // encore en cours.
+    if (seq !== _reqSeq.kpis) return;
     showLoading(false);
 
     if (!data || data.error) {
@@ -468,6 +525,11 @@ async function loadKPIs() {
     }
     return;
 }
+
+    // L'historique n'existe que sur la page "Tableau de bord" — inutile de
+    // payer l'appel serveur ailleurs. Il reste chargé avant l'aiguillage
+    // MOD FOR LIFE, car il s'affiche aussi sous cette vue.
+    if (isHistoryPage()) loadHistory();
 
     if (data.is_modforlife) {
         _renderModForLifeDashboard(data);
@@ -580,6 +642,9 @@ function _renderModForLifeDashboard(data) {
     var grid = el('modforlife-kpi-grid');
     if (grid) grid.style.display = '';
 
+    // Vue en PIÈCES (décision utilisateur du 2026-08-19) : une conversion en
+    // cartons avait été ajoutée puis retirée, faute de donnée en base disant
+    // combien de pièces tient un carton hors chaussures.
     var kpiMap = {
         'mfl-ca-achats':    formatMAD(data.ca_achats_fournisseurs),
         'mfl-nb-commandes': formatNumber(data.nb_commandes_fournisseurs),
@@ -595,6 +660,8 @@ function _renderModForLifeDashboard(data) {
     if (qtyAchatsSubEl) qtyAchatsSubEl.textContent = formatNumber(data.qty_achats_fournisseurs) + ' pièces';
     var qtyVentesSubEl = el('mfl-qty-ventes-sub');
     if (qtyVentesSubEl) qtyVentesSubEl.textContent = formatNumber(data.qty_ventes_societes) + ' pièces';
+    var stockSubEl = el('mfl-stock-sub');
+    if (stockSubEl) stockSubEl.textContent = 'pièces';
 
     var tbody = el('modforlife-ventes-tbody');
     if (!tbody) return;
@@ -618,6 +685,7 @@ function _renderModForLifeDashboard(data) {
         tr.appendChild(tdName);
         var tdQty = document.createElement('td');
         tdQty.textContent = formatNumber(r.qty);
+        tdQty.style.fontWeight = '700';
         tr.appendChild(tdQty);
         var tdCa = document.createElement('td');
         tdCa.textContent = formatMAD(r.ca);
@@ -631,6 +699,30 @@ function _renderTopFlopFromCache() {
     _renderProductTable('flop-products-tbody', state.flop_products_all.slice(0, state.flop_limit), true);
 }
 
+// Cellule photo d'une ligne produit. `has_image` vient du serveur : sans
+// lui on afficherait le visuel de remplacement gris d'Odoo pour la quasi
+// totalité du catalogue (vérifié en base : 50 fiches produit sur ~5 000
+// portent réellement une image), impossible à distinguer d'une vraie photo.
+function _photoCell(p) {
+    var td = document.createElement('td');
+    td.style.width = '52px';
+    if (p.has_image && p.image_url) {
+        var img = document.createElement('img');
+        img.src = p.image_url;
+        img.alt = p.name || '';
+        img.loading = 'lazy';
+        img.style.cssText = 'width:40px;height:40px;object-fit:cover;border-radius:6px;border:1px solid #E2E8F0;display:block;';
+        td.appendChild(img);
+    } else {
+        var placeholder = document.createElement('span');
+        placeholder.textContent = '—';
+        placeholder.title = 'Aucune photo enregistrée dans Odoo pour cette référence.';
+        placeholder.style.cssText = 'display:inline-block;width:40px;height:40px;line-height:40px;text-align:center;border:1px dashed #CBD5E1;border-radius:6px;color:#CBD5E1;';
+        td.appendChild(placeholder);
+    }
+    return td;
+}
+
 function _renderProductTable(tbodyId, products, isFlop) {
     var tbody = el(tbodyId);
     if (!tbody) return;
@@ -639,7 +731,7 @@ function _renderProductTable(tbodyId, products, isFlop) {
     if (!products || products.length === 0) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 8;
+        td.colSpan = 9;
         td.textContent = 'Aucun produit';
         td.style.textAlign = 'center';
         td.style.color = '#999';
@@ -658,6 +750,8 @@ function _renderProductTable(tbodyId, products, isFlop) {
         tdRank.style.fontWeight = '700';
         tdRank.style.color = isFlop ? '#EF4444' : '#7C3AED';
         tr.appendChild(tdRank);
+
+        tr.appendChild(_photoCell(p));
 
         var tdName = document.createElement('td');
         tdName.textContent = p.name;
@@ -776,8 +870,12 @@ function _hideChartTooltip() {
 }
 
 async function loadSalesDaily() {
+    var seq = ++_reqSeq.salesDaily;
     var params = getFilterParams();
     var data = await rpc('/mavie/api/sales-daily', params);
+    // Réponse d'un filtre déjà remplacé : on la jette au lieu d'écraser le
+    // graphique avec des données qui ne correspondent plus à l'écran.
+    if (seq !== _reqSeq.salesDaily) return;
     if (!data || data.error) return;
     lastSalesDailyData = data;
     _renderSalesChart();
@@ -980,14 +1078,20 @@ async function _fetchAndRenderDetail() {
     if (el('detail-family'))     el('detail-family').textContent     = data.family || '—';
 
     var imgEl = el('detail-image');
+    var imgMissingEl = el('detail-image-missing');
+    var hasPhoto = !!(data.has_image && data.image_url);
     if (imgEl) {
-        if (data.image_url) {
+        if (hasPhoto) {
             imgEl.src = data.image_url;
             imgEl.style.display = 'block';
         } else {
+            imgEl.removeAttribute('src');
             imgEl.style.display = 'none';
         }
     }
+    // Sans photo, on l'annonce explicitement : Odoo renvoie sinon un visuel
+    // de remplacement gris qui laisse croire que la photo existe.
+    if (imgMissingEl) imgMissingEl.style.display = hasPhoto ? 'none' : 'flex';
 
     var kpiMap = {
         'detail-qty-sold':      formatNumber(data.qty_sold),
@@ -1125,7 +1229,7 @@ function _renderStockByStore(tbodyId, stores, activeShop) {
     if (!stores || stores.length === 0) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 3;
+        td.colSpan = 4;
         td.textContent = 'Aucun dispatch enregistré';
         td.style.textAlign = 'center';
         td.style.color = '#999';
@@ -1143,7 +1247,7 @@ function _renderStockByStore(tbodyId, stores, activeShop) {
     if (activeShop) {
         var scopeRow = document.createElement('tr');
         var scopeTd = document.createElement('td');
-        scopeTd.colSpan = 3;
+        scopeTd.colSpan = 4;
         scopeTd.innerHTML = '<span style="font-size:0.78rem;color:#3730A3;background:#EEF2FF;border:1px solid #E0E7FF;border-radius:6px;padding:4px 10px;display:block;margin-bottom:4px;">'
             + 'ℹ️ Ce tableau affiche tout le réseau, indépendamment du magasin filtré ci-dessus (⭐ = magasin filtré) — les cartes en haut de fiche, elles, ne montrent que ce magasin.'
             + '</span>';
@@ -1155,7 +1259,7 @@ function _renderStockByStore(tbodyId, stores, activeShop) {
     if (hasNegative) {
         var noteRow = document.createElement('tr');
         var noteTd = document.createElement('td');
-        noteTd.colSpan = 3;
+        noteTd.colSpan = 4;
         noteTd.innerHTML = '<span style="font-size:0.78rem;color:#92400E;background:#FFFBEB;border:1px solid #FEF3C7;border-radius:6px;padding:4px 10px;display:block;margin-bottom:4px;">'
             + '⚠️ Stock négatif = plus de sorties enregistrées que d\'entrées dans Odoo (ajustements, retours ou imports manquants)'
             + '</span>';
@@ -1170,8 +1274,18 @@ function _renderStockByStore(tbodyId, stores, activeShop) {
             tr.style.fontWeight = '600';
         }
 
+        // Société propriétaire du magasin : le dispatch d'une référence se
+        // lit "quelle société, quel magasin", pas seulement "quel magasin"
+        // (une même société possède jusqu'à 7 magasins).
+        var tdCompany = document.createElement('td');
+        tdCompany.textContent = s.company || '—';
+        tdCompany.style.color = '#475569';
+        tdCompany.style.fontSize = '0.85rem';
+        tr.appendChild(tdCompany);
+
         var tdName = document.createElement('td');
         tdName.textContent = s.name || s.field || '—';
+        if (s.city) tdName.title = 'Ville : ' + s.city;
         if (activeShop && s.field === activeShop) tdName.innerHTML += ' ⭐';
         tr.appendChild(tdName);
 
@@ -2233,7 +2347,9 @@ function _renderStockDashboard(data) {
         'kpi-stock-skus-rupture': formatNumber(data.ruptures_count),
         'kpi-stock-couverture':   formatNumber(data.couverture_moy) + ' j',
         'kpi-stock-dormant':      formatPctTight(data.stock_dormant_pct),
-        'kpi-stock-precision':    formatPctTight(data.precision_inventaire),
+        // La carte affiche désormais le TAUX D'ÉCART (0 % = tout est sain)
+        // et non plus une "précision" à ~99 % qui masquait le problème.
+        'kpi-stock-precision':    formatPctTight(data.ecarts_inventaire_pct || 0),
     };
     for (var id in kpiMap) {
         var e = el(id);
@@ -2242,6 +2358,25 @@ function _renderStockDashboard(data) {
 
     var subEl = el('kpi-stock-skus-rupture-sub');
     if (subEl) subEl.textContent = '/ ' + formatNumber(data.total_active_skus) + ' actifs';
+
+    // Carte "Écarts d'inventaire" : verte à 0 %, rouge dès qu'un écart
+    // existe, avec le nombre de références et de pièces manquantes.
+    lastEcartsRefsCount = data.ecarts_refs_count || 0;
+    var ecartsValueEl = el('kpi-stock-precision');
+    var ecartsSubEl = el('kpi-stock-precision-sub');
+    var ecartsCardEl = el('card-stock-precision');
+    if (ecartsValueEl) {
+        ecartsValueEl.style.color = lastEcartsRefsCount ? '#EF4444' : '#10B981';
+    }
+    if (ecartsSubEl) {
+        ecartsSubEl.textContent = lastEcartsRefsCount
+            ? formatNumber(lastEcartsRefsCount) + ' réf. · '
+              + formatNumber(Math.abs(data.ecarts_qty_manquante || 0)) + ' pièces manquantes — cliquer'
+            : 'Cible : 0% — aucun écart détecté';
+    }
+    if (ecartsCardEl) {
+        ecartsCardEl.style.cursor = lastEcartsRefsCount ? 'pointer' : 'default';
+    }
 
     lastRupturesList = data.ruptures_list || [];
     lastDormantList = data.dormant_list || [];
@@ -2354,7 +2489,16 @@ function _renderStockValorisation(data) {
         var tr = document.createElement('tr');
 
         var tdName = document.createElement('td');
-        tdName.textContent = r.store_name || '—';
+        // Chaque ligne est une société : on peut l'ouvrir pour voir la
+        // ventilation magasin par magasin (valeur, quantité).
+        if (r.company_id) {
+            tr.style.cursor = 'pointer';
+            tr.title = 'Voir le détail par magasin de ' + (r.store_name || '');
+            tr.onclick = function() { openValorisationDetail(r.company_id, r.store_name); };
+            tdName.innerHTML = '<span class="td-link">' + (r.store_name || '—') + '</span> 🔎';
+        } else {
+            tdName.textContent = r.store_name || '—';
+        }
         tr.appendChild(tdName);
 
         var tdQty = document.createElement('td');
@@ -2371,6 +2515,77 @@ function _renderStockValorisation(data) {
 
         tbody.appendChild(tr);
     });
+}
+
+// ═══════════════════════════════════════════════════════════
+// VALORISATION — DÉTAIL PAR MAGASIN D'UNE SOCIÉTÉ
+// ═══════════════════════════════════════════════════════════
+async function openValorisationDetail(companyId, companyName) {
+    var overlay = el('valorisation-overlay');
+    var nameEl = el('valorisation-company-name');
+    var summaryEl = el('valorisation-summary');
+    var tbody = el('valorisation-tbody');
+    if (!overlay || !tbody) return;
+
+    if (nameEl) nameEl.textContent = companyName || '';
+    if (summaryEl) summaryEl.textContent = 'Chargement…';
+    tbody.innerHTML = '';
+    overlay.classList.add('active');
+
+    var params = getFilterParams();
+    params.company_id = companyId;
+    var data = await rpc('/mavie/api/valorisation-detail', params);
+
+    if (!data || data.error) {
+        if (summaryEl) summaryEl.textContent = 'Erreur : ' + ((data && data.error) || 'inconnue');
+        return;
+    }
+
+    if (summaryEl) {
+        summaryEl.textContent = formatNumber(data.total_qty) + ' pièces · '
+            + formatMAD(data.total_ht) + ' HT · ' + formatMAD(data.total_cost) + ' au coût'
+            + (data.cost_estime
+                ? ' (coût estimé depuis le prix d\'achat réellement payé pour les références sans champ « Coût » renseigné)'
+                : '');
+    }
+
+    var rows = data.magasins || [];
+    if (!rows.length) {
+        var trEmpty = document.createElement('tr');
+        var tdEmpty = document.createElement('td');
+        tdEmpty.colSpan = 4;
+        tdEmpty.textContent = 'Aucun stock valorisé pour cette société sur ce périmètre.';
+        tdEmpty.style.cssText = 'text-align:center;padding:24px;color:#94A3B8;';
+        trEmpty.appendChild(tdEmpty);
+        tbody.appendChild(trEmpty);
+        return;
+    }
+
+    rows.forEach(function(m) {
+        var tr = document.createElement('tr');
+        tr.style.borderBottom = '1px solid #F1F5F9';
+
+        function cell(text, align, weight, color) {
+            var td = document.createElement('td');
+            td.textContent = text;
+            td.style.padding = '10px';
+            if (align) td.style.textAlign = align;
+            if (weight) td.style.fontWeight = weight;
+            if (color) td.style.color = color;
+            return td;
+        }
+
+        tr.appendChild(cell(m.name || '—', null, '600', '#0F172A'));
+        tr.appendChild(cell(formatNumber(m.qty), 'center'));
+        tr.appendChild(cell(formatMAD(m.valeur_ht), 'right', '600', '#10B981'));
+        tr.appendChild(cell(formatMAD(m.valeur_cost), 'right'));
+        tbody.appendChild(tr);
+    });
+}
+
+function closeValorisationDetail() {
+    var overlay = el('valorisation-overlay');
+    if (overlay) overlay.classList.remove('active');
 }
 
 function _renderStockAlerts(alertes) {
@@ -2504,6 +2719,373 @@ function _renderGmroiCategorie(gmroi) {
     });
 }
 
+// ═══════════════════════════════════════════════════════════
+// ÉCARTS D'INVENTAIRE — RÉFÉRENCES EN STOCK NÉGATIF
+//
+// Un stock négatif signifie qu'Odoo a enregistré plus de sorties que
+// d'entrées pour cette référence dans ce magasin : c'est exactement le cas
+// « le magasin a 3 pièces mais en a vendu 4 ». Le détail reconstitue le
+// grand livre des mouvements pour montrer d'où viennent les pièces sorties.
+// ═══════════════════════════════════════════════════════════
+async function openEcarts() {
+    if (!lastEcartsRefsCount) return;
+    var overlay = el('ecarts-overlay');
+    var tbody = el('ecarts-tbody');
+    if (!overlay || !tbody) return;
+
+    overlay.classList.add('active');
+    tbody.innerHTML = '';
+    var loadingRow = document.createElement('tr');
+    var loadingCell = document.createElement('td');
+    loadingCell.colSpan = 5;
+    loadingCell.textContent = 'Analyse des mouvements de stock…';
+    loadingCell.style.cssText = 'text-align:center;padding:24px;color:#94A3B8;';
+    loadingRow.appendChild(loadingCell);
+    tbody.appendChild(loadingRow);
+
+    var data = await rpc('/mavie/api/inventory-anomalies', getFilterParams());
+    if (!data || data.error) {
+        loadingCell.textContent = 'Erreur : ' + ((data && data.error) || 'inconnue');
+        return;
+    }
+    lastEcartsList = data.anomalies || [];
+
+    var badge = el('ecarts-count-badge');
+    if (badge) {
+        badge.textContent = formatNumber(data.refs_count || 0) + ' réf. · '
+            + formatNumber(Math.abs(data.qty_manquante || 0)) + ' pièces';
+    }
+    _renderEcartsList();
+}
+
+function closeEcarts() {
+    var overlay = el('ecarts-overlay');
+    if (overlay) overlay.classList.remove('active');
+}
+
+function _renderEcartsList(searchFilter) {
+    var tbody = el('ecarts-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    var list = lastEcartsList;
+    if (searchFilter) {
+        var q = searchFilter.toLowerCase().trim();
+        list = list.filter(function(a) {
+            return (a.ref && a.ref.toLowerCase().includes(q))
+                || (a.name && a.name.toLowerCase().includes(q))
+                || (a.magasin && a.magasin.toLowerCase().includes(q))
+                || (a.company && a.company.toLowerCase().includes(q));
+        });
+    }
+
+    if (!list.length) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 5;
+        td.textContent = searchFilter
+            ? 'Aucun écart ne correspond à votre recherche.'
+            : 'Aucun écart d\'inventaire détecté sur ce périmètre.';
+        td.style.cssText = 'text-align:center;padding:24px;color:#94A3B8;';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    list.forEach(function(a) {
+        var tr = document.createElement('tr');
+        tr.style.cursor = 'pointer';
+        tr.style.borderBottom = '1px solid #F1F5F9';
+        tr.title = 'Voir d\'où vient le manque';
+        tr.onclick = function() { openEcartDetail(a); };
+
+        function cell(text, color, weight, align) {
+            var td = document.createElement('td');
+            td.textContent = text;
+            td.style.padding = '10px';
+            td.style.fontSize = '0.85rem';
+            if (color) td.style.color = color;
+            if (weight) td.style.fontWeight = weight;
+            if (align) td.style.textAlign = align;
+            return td;
+        }
+
+        tr.appendChild(cell(a.ref || '—', '#64748B', '600'));
+        tr.appendChild(cell(a.name || '—', '#0F172A', '600'));
+        tr.appendChild(cell(a.company || '—', '#475569'));
+        tr.appendChild(cell(a.magasin || '—', '#475569'));
+        tr.appendChild(cell(formatNumber(a.qty_negative), '#EF4444', '700', 'center'));
+
+        tbody.appendChild(tr);
+    });
+}
+
+async function openEcartDetail(anomaly) {
+    var overlay = el('ecart-detail-overlay');
+    var headerEl = el('ecart-detail-header');
+    var bodyEl = el('ecart-detail-body');
+    if (!overlay || !bodyEl) return;
+
+    overlay.classList.add('active');
+    if (headerEl) {
+        headerEl.innerHTML = '<strong>' + (anomaly.ref || '') + '</strong> — '
+            + (anomaly.name || '') + '<br/>'
+            + (anomaly.company || '') + ' · ' + (anomaly.magasin || '');
+    }
+    bodyEl.innerHTML = '<p style="color:#94A3B8;">Reconstitution des mouvements…</p>';
+
+    var data = await rpc('/mavie/api/inventory-anomaly-detail', {
+        article_id: anomaly.id,
+        warehouse_id: anomaly.warehouse_id,
+    });
+    if (!data || data.error) {
+        bodyEl.innerHTML = '<p style="color:#EF4444;">Erreur : ' + ((data && data.error) || 'inconnue') + '</p>';
+        return;
+    }
+    bodyEl.innerHTML = _buildEcartDetailHtml(data);
+}
+
+function closeEcartDetail() {
+    var overlay = el('ecart-detail-overlay');
+    if (overlay) overlay.classList.remove('active');
+}
+
+function _escapeHtml(text) {
+    var div = document.createElement('div');
+    div.textContent = text === null || text === undefined ? '' : String(text);
+    return div.innerHTML;
+}
+
+function _ledgerTable(title, buckets, color) {
+    if (!buckets || !buckets.length) {
+        return '<div style="margin-bottom:14px;"><div style="font-weight:700;color:#0F172A;margin-bottom:6px;">'
+            + title + '</div><div style="color:#94A3B8;font-size:0.85rem;">Aucun mouvement enregistré.</div></div>';
+    }
+    var html = '<div style="margin-bottom:14px;"><div style="font-weight:700;color:#0F172A;margin-bottom:6px;">'
+        + title + '</div>'
+        + '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
+        + '<thead><tr style="background:#F8FAFC;text-align:left;">'
+        + '<th style="padding:8px;">Nature</th>'
+        + '<th style="padding:8px;text-align:center;">Pièces</th>'
+        + '<th style="padding:8px;text-align:center;">Mouvements</th>'
+        + '<th style="padding:8px;">Derniers documents</th>'
+        + '</tr></thead><tbody>';
+    buckets.forEach(function(b) {
+        var examples = (b.exemples || []).map(function(e) {
+            return _escapeHtml(e.document) + ' (' + formatNumber(e.qty) + ' — ' + _escapeHtml(e.date) + ')';
+        }).join('<br/>');
+        html += '<tr style="border-bottom:1px solid #F1F5F9;">'
+            + '<td style="padding:8px;font-weight:600;">' + _escapeHtml(b.label) + '</td>'
+            + '<td style="padding:8px;text-align:center;font-weight:700;color:' + color + ';">'
+                + formatNumber(b.qty) + '</td>'
+            + '<td style="padding:8px;text-align:center;color:#64748B;">' + formatNumber(b.nb_mouvements) + '</td>'
+            + '<td style="padding:8px;color:#64748B;font-size:0.78rem;">' + (examples || '—') + '</td>'
+            + '</tr>';
+    });
+    return html + '</tbody></table></div>';
+}
+
+function _buildEcartDetailHtml(data) {
+    var manque = data.stock_reel;
+    var html = '';
+
+    // Synthèse en une phrase : c'est la question posée — d'où vient le
+    // produit vendu en trop.
+    html += '<div style="background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;padding:12px;margin-bottom:16px;font-size:0.88rem;color:#7F1D1D;line-height:1.6;">'
+        + '<strong>Stock actuel dans ce magasin : ' + formatNumber(manque) + '</strong><br/>'
+        + 'Entrées enregistrées : ' + formatNumber(data.total_entrees) + ' · '
+        + 'Sorties enregistrées : ' + formatNumber(data.total_sorties) + ' · '
+        + 'Stock théorique (entrées − sorties) : ' + formatNumber(data.stock_theorique) + '<br/>'
+        + 'Vendu en caisse : <strong>' + formatNumber(data.qty_vendue_caisse) + '</strong> '
+        + '(dont ' + formatNumber(data.qty_vendue_solde) + ' en solde et '
+        + formatNumber(data.qty_vendue_normale) + ' au prix catalogue).'
+        + '</div>';
+
+    if (data.ecart_non_explique) {
+        html += '<div style="background:#FFFBEB;border:1px solid #FEF3C7;border-radius:8px;padding:12px;margin-bottom:16px;font-size:0.85rem;color:#92400E;line-height:1.6;">'
+            + '⚠️ ' + formatNumber(Math.abs(data.ecart_non_explique)) + ' pièces d\'écart ne sont expliquées par '
+            + 'AUCUN mouvement de stock : le stock a été écrit directement (import de données, correction '
+            + 'manuelle en base, reprise d\'historique) sans passer par une réception, un transfert ou un '
+            + 'ajustement. C\'est la cause à corriger en priorité.'
+            + '</div>';
+    } else {
+        html += '<div style="background:#F0FDF4;border:1px solid #BBF7D0;border-radius:8px;padding:12px;margin-bottom:16px;font-size:0.85rem;color:#166534;line-height:1.6;">'
+            + '✔️ Tous les mouvements se recoupent : le stock négatif vient bien des sorties listées '
+            + 'ci-dessous, pas d\'une donnée écrite hors mouvement. Le manque provient donc de sorties '
+            + 'effectuées alors que la marchandise n\'avait jamais été réceptionnée dans ce magasin.'
+            + '</div>';
+    }
+
+    html += _ledgerTable('📥 D\'où sont venues les pièces (entrées)', data.entrees, '#10B981');
+    html += _ledgerTable('📤 Où sont parties les pièces (sorties)', data.sorties, '#EF4444');
+
+    var transferts = data.transferts || [];
+    if (transferts.length) {
+        html += '<div style="margin-bottom:8px;"><div style="font-weight:700;color:#0F172A;margin-bottom:6px;">'
+            + '🔄 Bons de transfert impliquant ce magasin pour cette référence</div>'
+            + '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
+            + '<thead><tr style="background:#F8FAFC;text-align:left;">'
+            + '<th style="padding:8px;">Bon</th><th style="padding:8px;">Date</th>'
+            + '<th style="padding:8px;">Sens</th><th style="padding:8px;">Source → Cible</th>'
+            + '<th style="padding:8px;text-align:center;">Qté</th><th style="padding:8px;">État</th>'
+            + '</tr></thead><tbody>';
+        transferts.forEach(function(t) {
+            html += '<tr style="border-bottom:1px solid #F1F5F9;">'
+                + '<td style="padding:8px;font-weight:600;">' + _escapeHtml(t.name) + '</td>'
+                + '<td style="padding:8px;color:#64748B;">' + _escapeHtml(t.date) + '</td>'
+                + '<td style="padding:8px;">' + _escapeHtml(t.sens) + '</td>'
+                + '<td style="padding:8px;color:#64748B;font-size:0.78rem;">'
+                    + _escapeHtml(t.source) + ' → ' + _escapeHtml(t.cible) + '</td>'
+                + '<td style="padding:8px;text-align:center;font-weight:700;">' + formatNumber(t.qty) + '</td>'
+                + '<td style="padding:8px;color:#64748B;">' + _escapeHtml(t.state) + '</td>'
+                + '</tr>';
+        });
+        html += '</tbody></table></div>';
+    }
+
+    return html;
+}
+
+// ═══════════════════════════════════════════════════════════
+// HISTORIQUE — TRANSFERTS & SOLDES
+// ═══════════════════════════════════════════════════════════
+async function loadHistory() {
+    var section = el('history-section');
+    if (!section) return;
+    var seq = ++_reqSeq.history;
+    var data = await rpc('/mavie/api/history', getFilterParams());
+    if (seq !== _reqSeq.history) return;
+    if (!data || data.error) {
+        lastHistory = { transfers: [], soldes: [] };
+        var summaryErr = el('history-summary');
+        if (summaryErr) summaryErr.textContent = 'Erreur : ' + ((data && data.error) || 'inconnue');
+        return;
+    }
+    lastHistory = data;
+    _renderHistory();
+}
+
+function setHistoryTab(tab) {
+    historyTab = tab;
+    var tabTransferts = el('history-tab-transferts');
+    var tabSoldes = el('history-tab-soldes');
+    if (tabTransferts) tabTransferts.classList.toggle('active', tab === 'transferts');
+    if (tabSoldes) tabSoldes.classList.toggle('active', tab === 'soldes');
+    _renderHistory();
+}
+
+function _renderHistory() {
+    var theadRow = el('history-thead-row');
+    var tbody = el('history-tbody');
+    var summaryEl = el('history-summary');
+    if (!theadRow || !tbody) return;
+
+    theadRow.innerHTML = '';
+    tbody.innerHTML = '';
+
+    var columns = historyTab === 'soldes'
+        ? ['Date', 'Ticket', 'Magasin', 'Réf', 'Produit', 'Qté', 'Prix catalogue', 'Prix payé', 'Remise', 'CA encaissé']
+        : ['Bon', 'Date', 'État', 'Société source', 'Magasin source', 'Société cible', 'Magasin cible',
+           'Type', 'Réf.', 'Qté'];
+    columns.forEach(function(label) {
+        var th = document.createElement('th');
+        th.textContent = label;
+        th.style.cssText = 'padding:10px 8px;font-size:0.72rem;font-weight:700;color:#64748B;text-transform:uppercase;';
+        theadRow.appendChild(th);
+    });
+
+    var rows = historyTab === 'soldes' ? (lastHistory.soldes || []) : (lastHistory.transfers || []);
+
+    if (summaryEl) {
+        summaryEl.textContent = historyTab === 'soldes'
+            ? formatNumber(lastHistory.soldes_count || 0) + ' lignes vendues sous le prix catalogue · '
+              + formatNumber(lastHistory.soldes_qty || 0) + ' pièces · '
+              + formatMAD(lastHistory.soldes_ca || 0) + ' encaissés'
+            : formatNumber(lastHistory.transfers_count || 0) + ' bons de transfert · '
+              + formatNumber(lastHistory.transfers_qty || 0) + ' pièces déplacées';
+    }
+
+    if (!rows.length) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = columns.length;
+        // L'historique ne liste QUE les transferts lancés depuis le
+        // dashboard : il démarre donc vide, sans reprendre les bons créés
+        // auparavant par le formulaire Odoo. On l'explique plutôt que de
+        // laisser croire à un filtre trop restrictif ou à un bug.
+        td.textContent = historyTab === 'soldes'
+            ? 'Aucune vente en solde sur ce périmètre.'
+            : 'Aucun transfert lancé depuis le dashboard pour le moment. '
+              + 'Les bons créés ici apparaîtront dans cette liste ; '
+              + 'les transferts antérieurs restent consultables dans Odoo (Transferts internes).';
+        td.style.cssText = 'text-align:center;padding:24px;color:#94A3B8;';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    function cell(text, color, weight, align) {
+        var td = document.createElement('td');
+        td.textContent = text;
+        td.style.padding = '9px 8px';
+        td.style.fontSize = '0.84rem';
+        if (color) td.style.color = color;
+        if (weight) td.style.fontWeight = weight;
+        if (align) td.style.textAlign = align;
+        return td;
+    }
+
+    rows.forEach(function(r) {
+        var tr = document.createElement('tr');
+        tr.style.borderBottom = '1px solid #F1F5F9';
+
+        if (historyTab === 'soldes') {
+            tr.style.cursor = 'pointer';
+            tr.onclick = function() { openDetail(r.id, r.name); };
+            tr.appendChild(cell(r.date, '#64748B'));
+            tr.appendChild(cell(r.ticket, '#64748B'));
+            tr.appendChild(cell(r.magasin));
+            tr.appendChild(cell(r.ref, '#64748B', '600'));
+            tr.appendChild(cell(r.name, '#0F172A', '600'));
+            tr.appendChild(cell(formatNumber(r.qty), null, '700', 'center'));
+            tr.appendChild(cell(formatMAD(r.prix_catalogue), '#64748B', null, 'right'));
+            tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
+            tr.appendChild(cell('-' + (r.remise_pct || 0).toFixed(1).replace('.', ',') + ' %',
+                                '#DC2626', '700', 'center'));
+            tr.appendChild(cell(formatMAD(r.ca), null, null, 'right'));
+        } else {
+            var stateColor = r.state === 'done' ? '#10B981'
+                : (r.state === 'submitted' ? '#F59E0B' : '#94A3B8');
+            tr.appendChild(cell(r.name, '#0F172A', '700'));
+            tr.appendChild(cell(r.date, '#64748B'));
+            tr.appendChild(cell(r.state_label, stateColor, '600'));
+            tr.appendChild(cell(r.source_societe, '#475569'));
+            tr.appendChild(cell(r.source_magasin, '#0F172A', '600'));
+            tr.appendChild(cell(r.dest_societe, '#475569'));
+            tr.appendChild(cell(r.dest_magasin, '#0F172A', '600'));
+            // Un transfert intra-société ne passe pas par le circuit
+            // inter-sociétés (avoir + commande d'achat) : on le distingue.
+            tr.appendChild(cell(r.intra_societe ? 'Intra-société' : 'Inter-sociétés',
+                                r.intra_societe ? '#7C3AED' : '#64748B'));
+            tr.appendChild(cell(formatNumber(r.nb_references), null, null, 'center'));
+            tr.appendChild(cell(formatNumber(r.qty), null, '700', 'center'));
+        }
+
+        tbody.appendChild(tr);
+    });
+}
+
+function _buildExportParams(extra) {
+    var filterParams = getFilterParams();
+    var params = new URLSearchParams();
+    for (var k in filterParams) {
+        if (filterParams[k] !== null && filterParams[k] !== undefined && filterParams[k] !== '') {
+            params.set(k, filterParams[k]);
+        }
+    }
+    for (var key in (extra || {})) params.set(key, extra[key]);
+    return params;
+}
 // ═══════════════════════════════════════════════════════════
 // EVENT LISTENERS
 // ═══════════════════════════════════════════════════════════
@@ -2766,6 +3348,73 @@ document.addEventListener('DOMContentLoaded', function() {
 
     var cardStockDormant = el('card-stock-dormant');
     if (cardStockDormant) cardStockDormant.addEventListener('click', openDormant);
+
+    var exportDormantBtn = el('btn-export-dormant');
+    if (exportDormantBtn) {
+        exportDormantBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            window.open('/mavie/api/dormant/export?' + _buildExportParams().toString(), '_blank');
+        });
+    }
+
+    // ── Écarts d'inventaire (carte cliquable + popup explicatif) ──
+    var cardStockPrecision = el('card-stock-precision');
+    if (cardStockPrecision) cardStockPrecision.addEventListener('click', openEcarts);
+
+    var searchEcartsInput = el('search-ecarts-input');
+    if (searchEcartsInput) {
+        searchEcartsInput.addEventListener('input', function(e) {
+            _renderEcartsList(e.target.value);
+        });
+    }
+
+    var closeEcartsBtn = el('close-ecarts-btn');
+    if (closeEcartsBtn) closeEcartsBtn.addEventListener('click', closeEcarts);
+
+    var ecartsOverlay = el('ecarts-overlay');
+    if (ecartsOverlay) {
+        ecartsOverlay.addEventListener('click', function(e) {
+            if (e.target === ecartsOverlay) closeEcarts();
+        });
+    }
+
+    var closeEcartDetailBtn = el('close-ecart-detail-btn');
+    if (closeEcartDetailBtn) closeEcartDetailBtn.addEventListener('click', closeEcartDetail);
+
+    var ecartDetailOverlay = el('ecart-detail-overlay');
+    if (ecartDetailOverlay) {
+        ecartDetailOverlay.addEventListener('click', function(e) {
+            if (e.target === ecartDetailOverlay) closeEcartDetail();
+        });
+    }
+
+    // ── Valorisation : détail par magasin d'une société ──
+    var closeValorisationBtn = el('close-valorisation-btn');
+    if (closeValorisationBtn) closeValorisationBtn.addEventListener('click', closeValorisationDetail);
+
+    var valorisationOverlay = el('valorisation-overlay');
+    if (valorisationOverlay) {
+        valorisationOverlay.addEventListener('click', function(e) {
+            if (e.target === valorisationOverlay) closeValorisationDetail();
+        });
+    }
+
+    // ── Historique transferts / soldes ──
+    var historyTabTransferts = el('history-tab-transferts');
+    if (historyTabTransferts) {
+        historyTabTransferts.addEventListener('click', function() { setHistoryTab('transferts'); });
+    }
+    var historyTabSoldes = el('history-tab-soldes');
+    if (historyTabSoldes) {
+        historyTabSoldes.addEventListener('click', function() { setHistoryTab('soldes'); });
+    }
+    var exportHistoryBtn = el('btn-export-history');
+    if (exportHistoryBtn) {
+        exportHistoryBtn.addEventListener('click', function() {
+            var params = _buildExportParams({ kind: historyTab });
+            window.open('/mavie/api/history/export?' + params.toString(), '_blank');
+        });
+    }
 
     var searchDormantInput = el('search-dormant-input');
     if (searchDormantInput) {

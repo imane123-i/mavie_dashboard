@@ -37,6 +37,27 @@ class InterInternalTransferExt(models.Model):
     # utilisé ensuite pour les regrouper à l'affichage (liste + PDF).
     group_ref = fields.Char(string='Groupe de transfert', index=True, copy=False)
 
+    # DÉCISION UTILISATEUR : l'historique du dashboard doit repartir de zéro
+    # et ne lister QUE les transferts lancés depuis le dashboard. Les 590
+    # bons déjà en base ont été créés autrement (formulaire Odoo, reprise de
+    # données) et ne doivent pas y apparaître.
+    #
+    # Un marqueur explicite plutôt qu'un filtre sur la date de création :
+    # une date de bascule masquerait les anciens bons, mais ferait aussi
+    # remonter dans l'historique tout bon créé plus tard depuis le
+    # formulaire Odoo — ce qui n'est pas « un transfert fait depuis le
+    # dashboard ». Le champ vaut False sur tout l'existant, l'historique
+    # démarre donc vide.
+    created_from_dashboard = fields.Boolean(
+        string='Créé depuis le dashboard',
+        default=False,
+        index=True,
+        copy=False,
+        help="Coché automatiquement quand le bon est créé par le bouton "
+             "« Proposer un transfert » du dashboard MaVie. Seuls ces bons "
+             "apparaissent dans la section Historique du dashboard.",
+    )
+
     group_size = fields.Integer(
         string='Nb bons du groupe',
         compute='_compute_group_info',

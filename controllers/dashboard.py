@@ -198,6 +198,42 @@ class MaVieDashboardController(http.Controller):
             '|', ('name', 'ilike', 'sachet'), ('name', 'ilike', 'sacher'),
         ]).ids
 
+    def _pos_sales_by_product_and_config(self, pos_domain):
+        """[(product_id, config_id, company_id, ca_ttc, qty)] pour ce domaine.
+
+        ⚡ PERF : la version précédente faisait un read_group par
+        (product_id, order_id) puis un search_read sur TOUTES les commandes
+        pour retrouver leur magasin. Sans filtre, cela représentait ~250 000
+        commandes à lire, plus le name_get qu'Odoo exécute sur chaque groupe
+        many2one (le piège déjà documenté dans _group_sums) : le graphique
+        "CA par Arrivage" mettait 62 s à répondre, mesuré en base.
+
+        Le magasin est en réalité une simple jointure
+        ligne → commande → session → config : on la fait directement en SQL
+        et on agrège par (produit, point de vente), ce qui ramène quelques
+        milliers de lignes au lieu de centaines de milliers. Les jointures
+        sont ajoutées APRÈS le FROM généré par _where_calc, avec des alias
+        dédiés (po_sales/ps_sales) pour ne pas entrer en collision avec ceux
+        qu'Odoo génère lui-même à partir du domaine.
+        """
+        Line = request.env['pos.order.line'].sudo()
+        query = Line._where_calc(pos_domain)
+        Line._apply_ir_rules(query, 'read')
+        from_clause, where_clause, params = query.get_sql()
+        request.env.cr.execute(
+            'SELECT "pos_order_line"."product_id", ps_sales."config_id", '
+            '       po_sales."company_id", '
+            '       SUM("pos_order_line"."price_subtotal_incl"), '
+            '       SUM("pos_order_line"."qty") '
+            'FROM %s '
+            'LEFT JOIN "pos_order" AS po_sales ON po_sales."id" = "pos_order_line"."order_id" '
+            'LEFT JOIN "pos_session" AS ps_sales ON ps_sales."id" = po_sales."session_id" '
+            'WHERE %s '
+            'GROUP BY 1, 2, 3' % (from_clause, where_clause or 'TRUE'),
+            params,
+        )
+        return request.env.cr.fetchall()
+
     def _group_sums(self, model_name, domain, sum_fields, group_fields=('product_id',), agg='SUM'):
         """read_group par product_id (et éventuellement company_id) SANS le
         surcoût de libellé d'Odoo.
@@ -242,6 +278,67 @@ class MaVieDashboardController(http.Controller):
                 rec[f] = val if val is not None else (None if agg != 'SUM' else 0.0)
             out.append(rec)
         return out
+
+    # ─────────────────────────────────────────────────────────────
+    # PHOTOS PRODUIT
+    #
+    # VÉRIFICATION EN BASE (demande utilisateur "vérifie les photos") :
+    # seules 50 fiches product.template sur ~5 000 portent réellement une
+    # image, et 53 mv.article.base (Base Pivot) en portent une de leur côté.
+    # Le dashboard pointait toujours /web/image/product.template/<id>/... :
+    # pour tout le reste du catalogue, Odoo renvoie une image de
+    # remplacement grise, indistinguable d'une vraie photo. On résout donc
+    # explicitement la source disponible (produit, puis repli Base Pivot) et
+    # on renvoie `has_image` pour que l'écran affiche un vrai « pas de
+    # photo » plutôt qu'un carré vide trompeur, et pour que l'export CSV ne
+    # contienne une URL que quand une photo existe vraiment.
+    # ─────────────────────────────────────────────────────────────
+
+    def _image_availability(self, product_tmpl_ids, size='image_128'):
+        """{product_tmpl_id: 'product' | 'article' | None} en 2 requêtes."""
+        result = {tid: None for tid in product_tmpl_ids}
+        if not product_tmpl_ids:
+            return result
+
+        Attachment = request.env['ir.attachment'].sudo()
+        tmpl_with_image = Attachment.search_read([
+            ('res_model', '=', 'product.template'),
+            ('res_field', '=', size),
+            ('res_id', 'in', list(product_tmpl_ids)),
+        ], ['res_id'])
+        for row in tmpl_with_image:
+            result[row['res_id']] = 'product'
+
+        missing = [tid for tid, src in result.items() if not src]
+        if missing:
+            try:
+                articles = request.env['mv.article.base'].sudo().search_read(
+                    [('product_tmpl_id', 'in', missing), ('image_1920', '!=', False)],
+                    ['id', 'product_tmpl_id'],
+                )
+                for art in articles:
+                    tmpl_ref = art.get('product_tmpl_id')
+                    if tmpl_ref:
+                        result[tmpl_ref[0]] = 'article:%s' % art['id']
+            except Exception as e:  # Base Pivot absent / champ renommé
+                _logger.warning("Photos Base Pivot indisponibles: %s", e)
+        return result
+
+    def _image_url(self, product_tmpl_id, source, size='image_128'):
+        """URL de la photo réellement disponible, ou None."""
+        if not source:
+            return None
+        if source == 'product':
+            return '/web/image/product.template/%s/%s' % (product_tmpl_id, size)
+        if source.startswith('article:'):
+            return '/web/image/mv.article.base/%s/image_1920' % source.split(':', 1)[1]
+        return None
+
+    def _absolute_url(self, path):
+        if not path:
+            return ''
+        base = request.env['ir.config_parameter'].sudo().get_param('web.base.url') or ''
+        return base.rstrip('/') + path
 
     def _get_sachet_variant_ids(self):
         """Variantes (product.product) de la collection Sachet.
@@ -382,18 +479,12 @@ class MaVieDashboardController(http.Controller):
             domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
 
         if kw.get('shop_field'):
-            mapping = request.env['mv.batch.shop.mapping'].sudo().search(
-                [('shop_field', '=', kw['shop_field'])], limit=1
-            )
-            if mapping:
-                if mapping.company_id:
-                    domain.append(('order_id.company_id', '=', mapping.company_id.id))
-                if mapping.warehouse_id:
-                    configs = request.env['pos.config'].sudo().search([
-                        ('picking_type_id.warehouse_id', '=', mapping.warehouse_id.id)
-                    ])
-                    if configs:
-                        domain.append(('order_id.session_id.config_id', 'in', configs.ids))
+            scope = self._get_shop_scope(kw['shop_field'])
+            if scope:
+                if scope['company_id']:
+                    domain.append(('order_id.company_id', '=', scope['company_id']))
+                if scope['pos_config_ids'] is not None:
+                    domain.append(('order_id.session_id.config_id', 'in', scope['pos_config_ids']))
         else:
             # Pas de magasin précis choisi dans le dashboard : on retombe sur
             # la/les société(s) cochée(s) dans le sélecteur standard Odoo.
@@ -445,14 +536,15 @@ class MaVieDashboardController(http.Controller):
         # POS : société via order_id.company_id, magasin via le picking
         # (bon de réception) rattaché à l'entrepôt du magasin.
         if kw.get('shop_field'):
-            mapping = request.env['mv.batch.shop.mapping'].sudo().search(
-                [('shop_field', '=', kw['shop_field'])], limit=1
-            )
-            if mapping:
-                if mapping.company_id:
-                    domain.append(('order_id.company_id', '=', mapping.company_id.id))
-                if mapping.warehouse_id:
-                    domain.append(('order_id.picking_type_id.warehouse_id', '=', mapping.warehouse_id.id))
+            # Un point de vente en ligne partage l'entrepôt de son magasin
+            # physique : les achats affichés sont donc ceux de cet entrepôt
+            # (il n'existe pas d'approvisionnement propre au canal en ligne).
+            scope = self._get_shop_scope(kw['shop_field'])
+            if scope:
+                if scope['company_id']:
+                    domain.append(('order_id.company_id', '=', scope['company_id']))
+                if scope['warehouse']:
+                    domain.append(('order_id.picking_type_id.warehouse_id', '=', scope['warehouse'].id))
         else:
             # Pas de magasin précis choisi dans le dashboard : on retombe sur
             # la/les société(s) cochée(s) dans le sélecteur standard Odoo.
@@ -469,14 +561,12 @@ class MaVieDashboardController(http.Controller):
         ]
         quant_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
         if shop_field:
-            mapping = request.env['mv.batch.shop.mapping'].sudo().search(
-                [('shop_field', '=', shop_field)], limit=1
-            )
-            if mapping:
-                if mapping.company_id:
-                    quant_domain.append(('company_id', '=', mapping.company_id.id))
-                if mapping.warehouse_id and mapping.warehouse_id.lot_stock_id:
-                    quant_domain.append(('location_id', 'child_of', mapping.warehouse_id.lot_stock_id.id))
+            scope = self._get_shop_scope(shop_field)
+            if scope:
+                if scope['company_id']:
+                    quant_domain.append(('company_id', '=', scope['company_id']))
+                if scope['warehouse'] and scope['warehouse'].lot_stock_id:
+                    quant_domain.append(('location_id', 'child_of', scope['warehouse'].lot_stock_id.id))
         if product_tmpl_ids is not None:
             variants = request.env['product.product'].sudo().search(
                 [('product_tmpl_id', 'in', product_tmpl_ids)]
@@ -494,6 +584,117 @@ class MaVieDashboardController(http.Controller):
         return request.env['mv.batch.shop.mapping'].sudo().search([
             ('active', '=', True), ('shop_field', '!=', 'shop')
         ])
+
+    # ─────────────────────────────────────────────────────────────
+    # MAGASINS EN LIGNE (points de vente e-commerce)
+    #
+    # DEMANDE UTILISATEUR : les magasins "online" n'apparaissaient nulle
+    # part dans le dashboard. Vérifié en base : chaque magasin physique a un
+    # pos.config jumeau "Online – <magasin>" qui PARTAGE le même
+    # picking_type/entrepôt (ex: config 2 "MAGASIN MARINA AGADIR" et
+    # config 35 "Online – MARINA AGADIR" pointent tous deux sur l'entrepôt
+    # 2). Le filtre magasin ciblant l'entrepôt, les ventes en ligne étaient
+    # donc silencieusement fondues dans celles du magasin physique, sans
+    # aucun moyen de les isoler. S'y ajoute DIGITAL SHOP (entrepôt 20,
+    # 4 900 tickets) dont le mapping magasin est désactivé : il était
+    # totalement absent de tous les KPIs.
+    #
+    # On expose désormais ces points de vente comme des "magasins" à part
+    # entière dans le filtre, sous la clé `pos:<config_id>`, et le magasin
+    # physique ne compte plus que ses propres tickets — chaque ligne du
+    # filtre donne ainsi un chiffre exact, sans double comptage : la somme
+    # physique + online reste égale au total société.
+    # ─────────────────────────────────────────────────────────────
+
+    ONLINE_SHOP_PREFIX = 'pos:'
+
+    def _is_online_config_name(self, name):
+        normalized = (name or '').strip().lower().replace('–', '-').replace('—', '-')
+        return normalized.startswith('online') or 'digital' in normalized
+
+    def _get_online_pos_configs(self):
+        """pos.config considérés comme "magasin en ligne".
+
+        Reconnaissance par le nom (préfixe « Online » ou « Digital »), le
+        seul critère fiable en base : ces configs partagent l'entrepôt et le
+        type d'opération de leur magasin physique, donc rien dans les
+        relations ne permet de les distinguer.
+        """
+        configs = request.env['pos.config'].sudo().search([])
+        return configs.filtered(lambda c: self._is_online_config_name(c.name))
+
+    def _get_online_shop_entries(self):
+        """Entrées de filtre magasin pour les points de vente en ligne."""
+        entries = []
+        for config in self._get_online_pos_configs():
+            warehouse = config.picking_type_id.warehouse_id
+            entries.append({
+                'field': '%s%s' % (self.ONLINE_SHOP_PREFIX, config.id),
+                'name': config.name,
+                'company': config.company_id.name or '—',
+                'warehouse': warehouse.name if warehouse else '—',
+            })
+        entries.sort(key=lambda e: (e['company'], e['name']))
+        return entries
+
+    def _get_shop_scope(self, shop_field):
+        """Résout un choix du filtre magasin en périmètre technique.
+
+        Retourne None si aucun magasin n'est filtré, sinon un dict :
+          - kind            : 'shop' (magasin physique) ou 'online'
+          - company_id      : société du point de vente
+          - warehouse       : stock.warehouse (peut être vide)
+          - pos_config_ids  : configs POS à retenir pour les ventes caisse
+          - label           : libellé affichable
+          - mapping         : mv.batch.shop.mapping (vide pour un online)
+
+        Point clé : pour un magasin physique, `pos_config_ids` exclut
+        explicitement les configs « Online » du même entrepôt, sinon les
+        ventes en ligne resteraient comptées deux fois (une fois dans le
+        magasin physique, une fois dans son entrée online dédiée).
+        """
+        if not shop_field:
+            return None
+
+        if str(shop_field).startswith(self.ONLINE_SHOP_PREFIX):
+            try:
+                config_id = int(str(shop_field)[len(self.ONLINE_SHOP_PREFIX):])
+            except (TypeError, ValueError):
+                return None
+            config = request.env['pos.config'].sudo().browse(config_id)
+            if not config.exists():
+                return None
+            return {
+                'kind': 'online',
+                'company_id': config.company_id.id if config.company_id else None,
+                'warehouse': config.picking_type_id.warehouse_id,
+                'pos_config_ids': [config.id],
+                'label': config.name,
+                'mapping': request.env['mv.batch.shop.mapping'].sudo().browse(),
+            }
+
+        mapping = request.env['mv.batch.shop.mapping'].sudo().search(
+            [('shop_field', '=', shop_field)], limit=1
+        )
+        if not mapping:
+            return None
+
+        pos_config_ids = None
+        if mapping.warehouse_id:
+            configs = request.env['pos.config'].sudo().search([
+                ('picking_type_id.warehouse_id', '=', mapping.warehouse_id.id)
+            ])
+            configs = configs.filtered(lambda c: not self._is_online_config_name(c.name))
+            pos_config_ids = configs.ids
+        return {
+            'kind': 'shop',
+            'company_id': mapping.company_id.id if mapping.company_id else None,
+            'warehouse': mapping.warehouse_id,
+            'pos_config_ids': pos_config_ids,
+            'label': (mapping.warehouse_id.name if mapping.warehouse_id
+                      else (mapping.shop_label or mapping.shop_field)),
+            'mapping': mapping,
+        }
 
     def _clean_ref_for_lookup(self, text):
         if not text:
@@ -559,7 +760,9 @@ class MaVieDashboardController(http.Controller):
             mapping = shop_mappings.filtered(lambda m: m.shop_field == shop_field_filter)[:1]
             if mapping:
                 return mapping.warehouse_id.name if mapping.warehouse_id else (mapping.shop_label or shop_field_filter)
-            return 'Réseau'
+            # Magasin en ligne (clé "pos:<id>") : pas de mv.batch.shop.mapping.
+            scope = self._get_shop_scope(shop_field_filter)
+            return scope['label'] if scope else 'Réseau'
 
         variants = request.env['product.product'].sudo().search([
             ('product_tmpl_id', '=', product_tmpl_id)
@@ -605,10 +808,15 @@ class MaVieDashboardController(http.Controller):
 
         if shop_field_filter:
             filt_mapping = shop_mappings.filtered(lambda m: m.shop_field == shop_field_filter)[:1]
-            default_label = (
-                (filt_mapping.warehouse_id.name if filt_mapping.warehouse_id else (filt_mapping.shop_label or shop_field_filter))
-                if filt_mapping else 'Réseau'
-            )
+            if filt_mapping:
+                default_label = (
+                    filt_mapping.warehouse_id.name if filt_mapping.warehouse_id
+                    else (filt_mapping.shop_label or shop_field_filter)
+                )
+            else:
+                # Magasin en ligne (clé "pos:<id>") : pas de mv.batch.shop.mapping.
+                filt_scope = self._get_shop_scope(shop_field_filter)
+                default_label = filt_scope['label'] if filt_scope else 'Réseau'
             for tid in product_tmpl_ids:
                 magasin_by_tid[tid] = default_label
             return magasin_by_tid
@@ -750,6 +958,7 @@ class MaVieDashboardController(http.Controller):
                 'collections': [],
                 'batches': [],
                 'shops': [],
+                'online_shops': [],
                 'categories': [],
             }
 
@@ -784,6 +993,16 @@ class MaVieDashboardController(http.Controller):
                 _logger.warning(f"Erreur shop mapping: {str(e)}")
 
             try:
+                # Magasins en ligne : listés à part pour que le sélecteur
+                # puisse les regrouper sous leur propre en-tête, et pour que
+                # les listes destinées aux transferts inter-magasins
+                # continuent de n'exposer que les magasins physiques (seuls
+                # à avoir un entrepôt/société propres).
+                filters['online_shops'] = self._get_online_shop_entries()
+            except Exception as e:
+                _logger.warning(f"Erreur magasins en ligne: {str(e)}")
+
+            try:
                 request.env.cr.execute("""
                     SELECT DISTINCT pc.id, pc.name
                     FROM product_template pt
@@ -807,7 +1026,8 @@ class MaVieDashboardController(http.Controller):
 
         except Exception as e:
             _logger.error(f"Erreur api_filters: {str(e)}")
-            return {'error': str(e), 'collections': [], 'batches': [], 'shops': [], 'categories': []}
+            return {'error': str(e), 'collections': [], 'batches': [], 'shops': [],
+                    'online_shops': [], 'categories': []}
 
     # ─────────────────────────────────────────────────────────────
     # KPIs
@@ -856,6 +1076,7 @@ class MaVieDashboardController(http.Controller):
                         'references_count': 0, 'total_active_skus': 0,
                         'taux_rupture': 0, 'couverture_moy': 0,
                         'stock_dormant_pct': 0, 'dormant_count': 0, 'dormant_list': [], 'precision_inventaire': 99.5,
+                        'ecarts_inventaire_pct': 0.0, 'ecarts_refs_count': 0, 'ecarts_qty_manquante': 0,
                         'alertes_stock': [], 'rotation_collection': [],
                         'gmroi_categorie': [], 'proches_rupture_30j': [],
                         'valeur_stock_ht': 0, 'valeur_stock_cost': 0, 'stock_val_by_store': [],
@@ -1103,15 +1324,15 @@ class MaVieDashboardController(http.Controller):
             ]
             quant_domain_base += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
             shop_field = kw.get('shop_field')
+            shop_scope = self._get_shop_scope(shop_field)
             if shop_field:
-                mapping = request.env['mv.batch.shop.mapping'].sudo().search(
-                    [('shop_field', '=', shop_field)], limit=1
-                )
-                if mapping:
-                    if mapping.company_id:
-                        quant_domain_base.append(('company_id', '=', mapping.company_id.id))
-                    if mapping.warehouse_id and mapping.warehouse_id.lot_stock_id:
-                        quant_domain_base.append(('location_id', 'child_of', mapping.warehouse_id.lot_stock_id.id))
+                if shop_scope:
+                    if shop_scope['company_id']:
+                        quant_domain_base.append(('company_id', '=', shop_scope['company_id']))
+                    if shop_scope['warehouse'] and shop_scope['warehouse'].lot_stock_id:
+                        quant_domain_base.append(
+                            ('location_id', 'child_of', shop_scope['warehouse'].lot_stock_id.id)
+                        )
             else:
                 # Pas de magasin précis choisi : on retombe sur la/les
                 # société(s) cochée(s) dans le sélecteur standard Odoo.
@@ -1154,6 +1375,13 @@ class MaVieDashboardController(http.Controller):
                 scoped_warehouses |= Warehouse.search([
                     ('company_id', 'in', explicit_non_retail_ids),
                 ])
+            # Un magasin en ligne explicitement sélectionné doit voir son
+            # entrepôt compté même s'il n'a pas de mapping magasin actif
+            # (cas DIGITAL SHOP, entrepôt 20) — sans quoi le filtre
+            # renverrait 0 partout alors que ce point de vente a bien du
+            # stock et des ventes.
+            if shop_scope and shop_scope['kind'] == 'online' and shop_scope['warehouse']:
+                scoped_warehouses |= shop_scope['warehouse']
             retail_lot_stock_ids = scoped_warehouses.mapped('lot_stock_id').ids
 
             quant_domain = quant_domain_base
@@ -1325,15 +1553,14 @@ class MaVieDashboardController(http.Controller):
                 references_count = len(product_tmpl_ids)
             elif shop_field:
                 quant_domain_refs = [('location_id.usage', '=', 'internal')]
-                mapping_refs = request.env['mv.batch.shop.mapping'].sudo().search(
-                    [('shop_field', '=', shop_field)], limit=1
-                )
-                if mapping_refs and mapping_refs.company_id:
-                    quant_domain_refs.append(('company_id', '=', mapping_refs.company_id.id))
+                if shop_scope and shop_scope['company_id']:
+                    quant_domain_refs.append(('company_id', '=', shop_scope['company_id']))
                 else:
                     quant_domain_refs.append(('company_id', 'not in', self._get_non_retail_company_ids()))
-                if mapping_refs and mapping_refs.warehouse_id and mapping_refs.warehouse_id.lot_stock_id:
-                    quant_domain_refs.append(('location_id', 'child_of', mapping_refs.warehouse_id.lot_stock_id.id))
+                if shop_scope and shop_scope['warehouse'] and shop_scope['warehouse'].lot_stock_id:
+                    quant_domain_refs.append(
+                        ('location_id', 'child_of', shop_scope['warehouse'].lot_stock_id.id)
+                    )
                 tmpl_ids_here = request.env['stock.quant'].sudo().search(quant_domain_refs).mapped(
                     'product_id.product_tmpl_id'
                 ).ids
@@ -1485,6 +1712,19 @@ class MaVieDashboardController(http.Controller):
             # réellement mauvaise (beaucoup d'ajustements) doit pouvoir
             # s'afficher comme telle plutôt que d'être masquée.
             precision_inventaire = min(100.0, round(100.0 - (inv_adjustments_count / (total_active_skus or 1)) * 100, 1)) if inv_adjustments_count > 0 else 99.5
+
+            # ── Écarts d'inventaire (remplace l'affichage "Précision") ──
+            # DEMANDE UTILISATEUR : l'indicateur doit valoir 0 % quand tout
+            # est sain, et être cliquable dès qu'il grimpe. Le comptage
+            # d'ajustements ci-dessus donnait une "précision" à ~99 % qui
+            # masquait le vrai problème : des références en stock NÉGATIF,
+            # c'est-à-dire plus de sorties enregistrées que d'entrées.
+            ecarts = self._inventory_anomaly_summary(kw)
+            ecarts_refs_count = ecarts['refs_count']
+            ecarts_qty = ecarts['qty_manquante']
+            ecarts_inventaire_pct = round(
+                (ecarts_refs_count / (total_active_skus or 1)) * 100, 1
+            ) if ecarts_refs_count else 0.0
 
             abc_class_map = {}
             ca_sorted = sorted(product_stats, key=lambda a: a['ca'], reverse=True)
@@ -1755,9 +1995,7 @@ class MaVieDashboardController(http.Controller):
                     # _group_sums ne renvoie pas les libellés (voir son
                     # docstring) : on résout les noms de sociétés à part,
                     # il n'y en a qu'une poignée.
-                    cid = company_name_by_id.get(
-                        g['company_id'][0] if g.get('company_id') else None, 'Société'
-                    )
+                    cid = g['company_id'][0] if g.get('company_id') else None
                     qty = g.get('quantity') or 0.0
                     if qty <= 0 or not pid or pid not in val_prod_map:
                         continue
@@ -1784,9 +2022,16 @@ class MaVieDashboardController(http.Controller):
                     val_by_company[cid]['cost'] += v_cost
                     val_by_company[cid]['qty'] += int(qty)
 
-                for comp_name, vdata in val_by_company.items():
+                for comp_id, vdata in val_by_company.items():
                     stock_val_by_store.append({
-                        'store_name': comp_name,
+                        # company_id permet au clic d'ouvrir le détail par
+                        # magasin de CETTE société (api_valorisation_detail),
+                        # calculé à la demande plutôt qu'en doublant le coût
+                        # du calcul principal (le regroupement par
+                        # emplacement double le nombre de groupes : 127 050
+                        # → 248 528, mesuré en base).
+                        'company_id': comp_id,
+                        'store_name': company_name_by_id.get(comp_id, 'Société'),
                         'valeur_ht': round(vdata['ht'], 2),
                         'valeur_cost': round(vdata['cost'], 2),
                         'qty': vdata['qty']
@@ -1826,6 +2071,15 @@ class MaVieDashboardController(http.Controller):
             for p in proches_rupture_30j:
                 p['magasin'] = magasin_by_tid_30j.get(p['id'], 'Réseau')
 
+            # Photos du Top/Flop — résolues en 2 requêtes pour l'ensemble des
+            # lignes affichées, pas une par ligne.
+            top_flop_ids = [p['id'] for p in top_products] + [p['id'] for p in flop_products]
+            image_sources = self._image_availability(set(top_flop_ids))
+            for p in list(top_products) + list(flop_products):
+                src = image_sources.get(p['id'])
+                p['image_url'] = self._image_url(p['id'], src)
+                p['has_image'] = bool(src)
+
             return {
                 'ca_total': round(ca_total, 2),
                 'ca_ht': round(ca_ht_total, 2),
@@ -1863,6 +2117,9 @@ class MaVieDashboardController(http.Controller):
                 'dormant_count': len(dormant_products),
                 'dormant_list': sorted(dormant_products, key=lambda x: x['stock'], reverse=True)[:500],
                 'precision_inventaire': precision_inventaire,
+                'ecarts_inventaire_pct': ecarts_inventaire_pct,
+                'ecarts_refs_count': ecarts_refs_count,
+                'ecarts_qty_manquante': ecarts_qty,
                 'alertes_stock': alertes_stock,
                 'rotation_collection': rotation_collection,
                 'gmroi_categorie': gmroi_categorie,
@@ -1921,6 +2178,7 @@ class MaVieDashboardController(http.Controller):
                 po_domain, ['product_qty:sum', 'price_total:sum'], [], lazy=False
             )
             qty_achats_fournisseurs = int(po_grouped[0].get('product_qty') or 0) if po_grouped else 0
+
             # TTC, comme tous les CA du dashboard (décision 2026-08-18).
             ca_achats_fournisseurs = round(po_grouped[0].get('price_total') or 0.0, 2) if po_grouped else 0.0
 
@@ -1953,6 +2211,7 @@ class MaVieDashboardController(http.Controller):
                 lazy=False
             )
             partner_name_by_id = {p.id: p.name for p in retail_companies.mapped('partner_id')}
+
             ventes_par_societe = []
             qty_ventes_total = 0.0
             ca_ventes_total = 0.0
@@ -1985,6 +2244,14 @@ class MaVieDashboardController(http.Controller):
             )
             stock_entrepot = int(sum(g.get('quantity') or 0 for g in quant_grouped)) if quant_grouped else 0
 
+            # DÉCISION UTILISATEUR (2026-08-19) : cette vue reste en PIÈCES.
+            # Une conversion en cartons avait été ajoutée, puis retirée :
+            # vérifié en base, aucune donnée ne dit combien de pièces tient
+            # dans un carton hors chaussures (product_packaging vide, pas
+            # d'unité "carton", et sur les articles Base Pivot de famille SAC
+            # la colonne « Qté Colis » contient déjà le nombre de sacs). Le
+            # nombre de cartons aurait donc été égal au nombre de pièces,
+            # c'est-à-dire faux.
             return {
                 'is_modforlife': True,
                 'company_name': mod_for_life.name,
@@ -2000,10 +2267,138 @@ class MaVieDashboardController(http.Controller):
             _logger.error(f"Erreur _compute_kpis_modforlife: {str(e)}", exc_info=True)
             return {'error': str(e)}
 
+    # ─────────────────────────────────────────────────────────────
+    # EXPORTS EXCEL AVEC PHOTOS INCRUSTÉES
+    #
+    # DEMANDE UTILISATEUR : « ya pas de photo dans l'excel ».
+    # Première tentative : une formule =IMAGE("url") dans un CSV. Elle
+    # renvoie #NOM? (#NAME? en anglais) car la fonction IMAGE n'existe que
+    # depuis Excel 365 — et même là, l'URL pointe vers Odoo, qui exige une
+    # session authentifiée : Excel ne pourrait pas la charger.
+    #
+    # La seule façon d'avoir réellement les photos dans le fichier est de
+    # les y incruster, ce qu'un CSV ne sait pas faire (c'est du texte pur).
+    # On produit donc un vrai classeur .xlsx (xlsxwriter, déjà présent dans
+    # l'image Odoo) avec les images embarquées. Le CSV reste accessible via
+    # ?format=csv pour qui veut les données brutes.
+    # ─────────────────────────────────────────────────────────────
+
+    _XLSX_PHOTO_PX = 72          # taille d'affichage de la vignette
+    _XLSX_ROW_HEIGHT = 56        # hauteur de ligne (points) pour la loger
+    _XLSX_PHOTO_COL_WIDTH = 12
+
+    def _photo_bytes_by_tmpl(self, image_sources, field='image_128'):
+        """{product_tmpl_id: bytes de l'image} pour les vraies photos seulement.
+
+        `image_sources` vient de _image_availability. Deux sources possibles,
+        lues en deux requêtes groupées : la fiche produit (image_128, déjà
+        à la bonne taille) et l'article Base Pivot (image_1920, redimensionné
+        ici pour ne pas alourdir le classeur).
+        """
+        result = {}
+        if not image_sources:
+            return result
+
+        tmpl_ids = [tid for tid, src in image_sources.items() if src == 'product']
+        if tmpl_ids:
+            for rec in request.env['product.template'].sudo().browse(tmpl_ids).read([field]):
+                if rec.get(field):
+                    try:
+                        result[rec['id']] = base64.b64decode(rec[field])
+                    except Exception:
+                        continue
+
+        article_by_tmpl = {
+            tid: int(src.split(':', 1)[1])
+            for tid, src in image_sources.items()
+            if src and src.startswith('article:')
+        }
+        if article_by_tmpl:
+            tmpl_by_article = {aid: tid for tid, aid in article_by_tmpl.items()}
+            try:
+                records = request.env['mv.article.base'].sudo().browse(
+                    list(tmpl_by_article)).read(['image_1920'])
+            except Exception as e:
+                _logger.warning("Photos Base Pivot illisibles: %s", e)
+                records = []
+            for rec in records:
+                if not rec.get('image_1920'):
+                    continue
+                raw = base64.b64decode(rec['image_1920'])
+                result[tmpl_by_article[rec['id']]] = self._shrink_image(raw)
+        return result
+
+    def _shrink_image(self, raw, box=256):
+        """Réduit une image pour l'export ; renvoie l'original si Pillow échoue."""
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(raw))
+            img.thumbnail((box, box))
+            if img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+            buf = io.BytesIO()
+            img.save(buf, format='PNG')
+            return buf.getvalue()
+        except Exception as e:
+            _logger.warning("Redimensionnement image impossible: %s", e)
+            return raw
+
+    def _xlsx_workbook(self):
+        """Classeur en mémoire + jeu de formats partagé par tous les exports."""
+        import xlsxwriter
+        stream = io.BytesIO()
+        book = xlsxwriter.Workbook(stream, {'in_memory': True})
+        formats = {
+            'title': book.add_format({'bold': True, 'font_size': 14, 'font_color': '#4C1D95'}),
+            'meta': book.add_format({'font_color': '#64748B'}),
+            'header': book.add_format({
+                'bold': True, 'bg_color': '#EDE9FE', 'font_color': '#4C1D95',
+                'border': 1, 'border_color': '#DDD6FE', 'align': 'center', 'valign': 'vcenter',
+                'text_wrap': True,
+            }),
+            'cell': book.add_format({'valign': 'vcenter'}),
+            'num': book.add_format({'valign': 'vcenter', 'num_format': '#,##0'}),
+            'money': book.add_format({'valign': 'vcenter', 'num_format': '#,##0.00'}),
+            'muted': book.add_format({'valign': 'vcenter', 'font_color': '#94A3B8'}),
+        }
+        return stream, book, formats
+
+    def _xlsx_insert_photo(self, sheet, row, col, image_bytes, index):
+        """Incruste une vignette centrée dans la cellule."""
+        if not image_bytes:
+            return
+        scale = self._XLSX_PHOTO_PX / 128.0
+        sheet.insert_image(row, col, 'photo_%s.png' % index, {
+            'image_data': io.BytesIO(image_bytes),
+            'x_scale': scale,
+            'y_scale': scale,
+            'x_offset': 4,
+            'y_offset': 3,
+            'object_position': 1,   # l'image suit la cellule (tri/filtre)
+        })
+
+    def _xlsx_response(self, stream, book, filename):
+        book.close()
+        payload = stream.getvalue()
+        stream.close()
+        return request.make_response(
+            payload,
+            headers=[
+                ('Content-Type',
+                 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+                ('Content-Disposition', 'attachment; filename="%s"' % filename),
+                ('Content-Length', len(payload)),
+            ],
+        )
+
     @http.route('/mavie/api/top-flop/export', type='http', auth='user', methods=['GET'], csrf=False)
     def api_top_flop_export(self, **kw):
-        """Export CSV du Top ou Flop Produits, avec les mêmes filtres et la
-        même limite (top_limit / flop_limit) qu'affichés à l'écran."""
+        """Export du Top ou Flop Produits, mêmes filtres et même limite
+        (top_limit / flop_limit) qu'à l'écran.
+
+        Classeur .xlsx par défaut, photos incrustées. `?format=csv` renvoie
+        l'ancien CSV (données brutes, sans photo — un CSV est du texte pur).
+        """
         kind = kw.get('kind') or 'top'
         data = self._compute_kpis(kw)
         if not data or data.get('error'):
@@ -2023,35 +2418,74 @@ class MaVieDashboardController(http.Controller):
         except (ValueError, TypeError):
             requested_limit = 10
         rows = (rows or [])[:requested_limit]
+        titre = 'Top Produits' if kind != 'flop' else 'Flop Produits'
+        base_name = 'flop_produits' if kind == 'flop' else 'top_produits'
+        columns = ['#', 'Photo', 'Produit', 'Réf', 'CA Achat (TTC)', 'CA Vendu (TTC)',
+                   'Qté achetée', 'Qté vendue', 'Reste', 'Stock']
 
-        buffer = io.StringIO()
-        buffer.write('﻿')  # BOM pour qu'Excel détecte l'UTF-8
-        writer = csv.writer(buffer, delimiter=';')
-        writer.writerow(['Top Produits' if kind != 'flop' else 'Flop Produits'])
-        # Mêmes colonnes et même ordre qu'à l'écran.
-        writer.writerow([
-            '#', 'Produit', 'Réf', 'CA Achat (TTC)', 'CA Vendu (TTC)',
-            'Qté achetée', 'Qté vendue', 'Reste', 'Stock',
-        ])
-        for row in rows or []:
+        def _values(row):
             # Reste = acheté − vendu, même définition qu'à l'écran.
             qty_sold_row = row.get('qty_sold', row.get('qty', 0)) or 0
             qty_purchased_row = row.get('qty_purchased', 0) or 0
-            writer.writerow([
+            return [
                 row.get('rank'), row.get('name'), row.get('ref'),
                 row.get('ca_achat', 0), row.get('ca', 0),
                 qty_purchased_row, qty_sold_row,
                 qty_purchased_row - qty_sold_row, row.get('stock', 0),
-            ])
+            ]
 
-        filename = 'mavie_export_{}.csv'.format('flop_produits' if kind == 'flop' else 'top_produits')
-        return request.make_response(
-            buffer.getvalue(),
-            headers=[
-                ('Content-Type', 'text/csv; charset=utf-8'),
-                ('Content-Disposition', f'attachment; filename="{filename}"'),
-            ],
-        )
+        if (kw.get('format') or 'xlsx').lower() == 'csv':
+            buffer = io.StringIO()
+            buffer.write(u'﻿')  # BOM pour qu'Excel détecte l'UTF-8
+            writer = csv.writer(buffer, delimiter=';')
+            writer.writerow([titre])
+            # En CSV la photo ne peut être qu'un lien : le format ne sait pas
+            # porter d'image. Le classeur .xlsx, lui, les incruste.
+            writer.writerow(['#', 'URL photo', 'Produit', 'Réf', 'CA Achat (TTC)',
+                             'CA Vendu (TTC)', 'Qté achetée', 'Qté vendue', 'Reste', 'Stock'])
+            for row in rows:
+                vals = _values(row)
+                photo_url = self._absolute_url(row.get('image_url')) if row.get('has_image') else ''
+                writer.writerow([vals[0], photo_url] + vals[1:])
+            return request.make_response(
+                buffer.getvalue(),
+                headers=[
+                    ('Content-Type', 'text/csv; charset=utf-8'),
+                    ('Content-Disposition',
+                     'attachment; filename="mavie_export_%s.csv"' % base_name),
+                ],
+            )
+
+        photos = self._photo_bytes_by_tmpl(self._image_availability({r['id'] for r in rows}))
+        stream, book, fmt = self._xlsx_workbook()
+        sheet = book.add_worksheet(titre[:31])
+        sheet.write(0, 0, titre, fmt['title'])
+        sheet.write(1, 0, '%s référence(s) — %s avec photo'
+                    % (len(rows), sum(1 for r in rows if photos.get(r['id']))), fmt['meta'])
+        for col, label in enumerate(columns):
+            sheet.write(3, col, label, fmt['header'])
+        sheet.set_column(1, 1, self._XLSX_PHOTO_COL_WIDTH)
+        sheet.set_column(2, 2, 34)
+        sheet.set_column(3, 3, 16)
+        sheet.set_column(4, 9, 15)
+        sheet.freeze_panes(4, 0)
+
+        for idx, row in enumerate(rows):
+            excel_row = 4 + idx
+            sheet.set_row(excel_row, self._XLSX_ROW_HEIGHT)
+            vals = _values(row)
+            sheet.write(excel_row, 0, vals[0], fmt['cell'])
+            image_bytes = photos.get(row['id'])
+            if image_bytes:
+                self._xlsx_insert_photo(sheet, excel_row, 1, image_bytes, idx)
+            else:
+                sheet.write(excel_row, 1, 'Aucune photo', fmt['muted'])
+            for offset, value in enumerate(vals[1:], start=2):
+                style = fmt['money'] if offset in (4, 5) else (
+                    fmt['num'] if offset >= 6 else fmt['cell'])
+                sheet.write(excel_row, offset, value, style)
+
+        return self._xlsx_response(stream, book, 'mavie_export_%s.xlsx' % base_name)
 
     # ─────────────────────────────────────────────────────────────
     # VENTES PAR ARRIVAGE
@@ -2067,123 +2501,88 @@ class MaVieDashboardController(http.Controller):
                 domain = self._build_product_domain(kw)
                 products = request.env['product.template'].sudo().search(domain)
                 if not products:
-                    return {'daily': []}
+                    return {'daily': [], 'by_shop': []}
                 product_tmpl_ids = products.ids
 
             pos_domain = self._build_pos_domain(kw, product_tmpl_ids)
-            pos_grouped = request.env['pos.order.line'].sudo().read_group(
-                pos_domain,
-                ['price_subtotal_incl:sum', 'qty:sum', 'product_id'],
-                ['product_id'],
-                lazy=False
+
+            # Une seule agrégation SQL alimente les deux modes du graphique :
+            # "Par Arrivage" (somme sur tous les points de vente) et
+            # "Par Magasin" (détail par point de vente). Auparavant deux
+            # read_group distincts, dont un par commande — voir
+            # _pos_sales_by_product_and_config pour le coût mesuré.
+            rows = self._pos_sales_by_product_and_config(pos_domain)
+            if not rows:
+                return {'daily': [], 'by_shop': []}
+
+            pids = list({r[0] for r in rows if r[0]})
+            prods = request.env['product.product'].sudo().search_read(
+                [('id', 'in', pids)], ['id', 'product_tmpl_id']
             )
+            prod_to_tmpl = {p['id']: p['product_tmpl_id'][0] for p in prods if p.get('product_tmpl_id')}
 
-            if not pos_grouped:
-                return {'daily': []}
+            tmpls = request.env['product.template'].sudo().search_read(
+                [('id', 'in', list(set(prod_to_tmpl.values())))], ['id', 'arrivage_id']
+            )
+            tmpl_to_arrivage = {
+                t['id']: t['arrivage_id'][1] for t in tmpls if t.get('arrivage_id')
+            }
 
-            pids = [g['product_id'][0] for g in pos_grouped if g.get('product_id')]
+            # Libellé du magasin : nom du point de vente, repli sur la société
+            # (même règle qu'auparavant). Quelques dizaines d'enregistrements,
+            # résolus en deux requêtes au lieu d'une par commande.
+            config_ids = list({r[1] for r in rows if r[1]})
+            config_name_by_id = {
+                c['id']: c['name'] for c in request.env['pos.config'].sudo().search_read(
+                    [('id', 'in', config_ids)], ['id', 'name'])
+            } if config_ids else {}
+            company_ids = list({r[2] for r in rows if r[2]})
+            company_name_by_id = {
+                c['id']: c['name'] for c in request.env['res.company'].sudo().search_read(
+                    [('id', 'in', company_ids)], ['id', 'name'])
+            } if company_ids else {}
+
             sales_by_arrivage = {}
-            prod_to_tmpl = {}
-            tmpl_to_arrivage = {}
-            if pids:
-                prods = request.env['product.product'].sudo().search_read(
-                    [('id', 'in', pids)],
-                    ['id', 'product_tmpl_id']
-                )
-                prod_to_tmpl = {p['id']: p['product_tmpl_id'][0] for p in prods if p.get('product_tmpl_id')}
-                tmpl_ids = list(set(prod_to_tmpl.values()))
-                
-                tmpls = request.env['product.template'].sudo().search_read(
-                    [('id', 'in', tmpl_ids)],
-                    ['id', 'arrivage_id']
-                )
-                tmpl_to_arrivage = {t['id']: (t['arrivage_id'][0], t['arrivage_id'][1]) for t in tmpls if t.get('arrivage_id')}
+            by_shop_map = {}
+            for product_id, config_id, company_id, ca, qty in rows:
+                tid = prod_to_tmpl.get(product_id)
+                if not tid:
+                    continue
+                arrivage_name = tmpl_to_arrivage.get(tid)
+                if not arrivage_name:
+                    continue
+                ca = float(ca or 0.0)
+                qty = int(qty or 0)
 
-                for g in pos_grouped:
-                    pid = g['product_id'][0] if g.get('product_id') else None
-                    tid = prod_to_tmpl.get(pid)
-                    if not tid:
-                        continue
-                    arr = tmpl_to_arrivage.get(tid)
-                    if not arr:
-                        continue
-                    key = arr
-                    if key not in sales_by_arrivage:
-                        sales_by_arrivage[key] = {'ca': 0.0, 'qty': 0}
-                    sales_by_arrivage[key]['ca'] += g.get('price_subtotal_incl') or 0.0
-                    sales_by_arrivage[key]['qty'] += int(g.get('qty') or 0)
+                stats = sales_by_arrivage.setdefault(arrivage_name, {'ca': 0.0, 'qty': 0})
+                stats['ca'] += ca
+                stats['qty'] += qty
 
-            daily_sales = []
-            for (arrivage_id, arrivage_name), stats in sales_by_arrivage.items():
-                daily_sales.append({
+                shop_name = (config_name_by_id.get(config_id)
+                             or company_name_by_id.get(company_id)
+                             or 'Inconnu')
+                shop_stats = by_shop_map.setdefault((arrivage_name, shop_name), {'ca': 0.0, 'qty': 0})
+                shop_stats['ca'] += ca
+                shop_stats['qty'] += qty
+
+            daily_sales = [
+                {
                     'date': arrivage_name,
                     'label': arrivage_name,
                     'ca': round(stats['ca'], 2),
-                    'qty': int(stats['qty']),
-                    'articles': int(stats['qty']),
-                })
-
-            daily_sales.sort(key=lambda x: x['ca'], reverse=True)
-
-            # ── CA par Arrivage × Magasin ──
-            # read_group ne peut pas grouper pos.order.line directement par
-            # "magasin" (ce n'est pas un champ, c'est dérivé de
-            # order_id.session_id.config_id / order_id.company_id) : on
-            # regroupe donc par (product_id, order_id) — un 2e read_group,
-            # toujours pas de scan ligne par ligne — puis on résout order_id
-            # -> libellé magasin en 1-2 requêtes groupées (même règle que
-            # sales_by_variant dans _compute_product_detail : préférer
-            # session_id.config_id.name, repli sur company_id.name).
-            by_shop_map = {}
-            if pos_grouped:
-                pos_grouped_by_order = request.env['pos.order.line'].sudo().read_group(
-                    pos_domain,
-                    ['price_subtotal_incl:sum', 'qty:sum', 'product_id', 'order_id'],
-                    ['product_id', 'order_id'],
-                    lazy=False
-                )
-                order_ids = list({g['order_id'][0] for g in pos_grouped_by_order if g.get('order_id')})
-                orders = request.env['pos.order'].sudo().search_read(
-                    [('id', 'in', order_ids)], ['id', 'company_id', 'session_id']
-                )
-                session_ids = list({o['session_id'][0] for o in orders if o.get('session_id')})
-                sessions = request.env['pos.session'].sudo().search_read(
-                    [('id', 'in', session_ids)], ['id', 'config_id']
-                ) if session_ids else []
-                session_to_config_name = {
-                    s['id']: s['config_id'][1] for s in sessions if s.get('config_id')
+                    'qty': stats['qty'],
+                    'articles': stats['qty'],
                 }
-                order_to_shop = {}
-                for o in orders:
-                    shop_name = (o.get('company_id') and o['company_id'][1]) or 'Inconnu'
-                    sid = o.get('session_id') and o['session_id'][0]
-                    if sid and session_to_config_name.get(sid):
-                        shop_name = session_to_config_name[sid]
-                    order_to_shop[o['id']] = shop_name
-
-                for g in pos_grouped_by_order:
-                    pid = g['product_id'][0] if g.get('product_id') else None
-                    oid = g['order_id'][0] if g.get('order_id') else None
-                    tid = prod_to_tmpl.get(pid)
-                    if not tid or not oid:
-                        continue
-                    arr = tmpl_to_arrivage.get(tid)
-                    if not arr:
-                        continue
-                    arrivage_name = arr[1]
-                    shop_name = order_to_shop.get(oid, 'Inconnu')
-                    key = (arrivage_name, shop_name)
-                    if key not in by_shop_map:
-                        by_shop_map[key] = {'ca': 0.0, 'qty': 0}
-                    by_shop_map[key]['ca'] += g.get('price_subtotal_incl') or 0.0
-                    by_shop_map[key]['qty'] += int(g.get('qty') or 0)
+                for arrivage_name, stats in sales_by_arrivage.items()
+            ]
+            daily_sales.sort(key=lambda x: x['ca'], reverse=True)
 
             by_shop_grouped = {}
             for (arrivage_name, shop_name), stats in by_shop_map.items():
                 by_shop_grouped.setdefault(arrivage_name, []).append({
                     'shop': shop_name,
                     'ca': round(stats['ca'], 2),
-                    'qty': int(stats['qty']),
+                    'qty': stats['qty'],
                 })
             by_shop = [
                 {'arrivage': arrivage_name, 'shops': sorted(shops, key=lambda s: s['ca'], reverse=True)}
@@ -2402,14 +2801,12 @@ class MaVieDashboardController(http.Controller):
             # si un magasin est filtré (kw['shop_field']).
             stock_shop_by_variant = {}
             if kw.get('shop_field') and product_variants:
-                shop_mapping_for_stock = request.env['mv.batch.shop.mapping'].sudo().search(
-                    [('shop_field', '=', kw['shop_field'])], limit=1
-                )
-                if shop_mapping_for_stock and shop_mapping_for_stock.warehouse_id and shop_mapping_for_stock.warehouse_id.lot_stock_id:
+                scope_for_stock = self._get_shop_scope(kw['shop_field'])
+                if scope_for_stock and scope_for_stock['warehouse'] and scope_for_stock['warehouse'].lot_stock_id:
                     shop_quants_grouped = request.env['stock.quant'].sudo().read_group(
                         [
                             ('product_id', 'in', product_variants.ids),
-                            ('location_id', 'child_of', shop_mapping_for_stock.warehouse_id.lot_stock_id.id),
+                            ('location_id', 'child_of', scope_for_stock['warehouse'].lot_stock_id.id),
                         ],
                         ['quantity:sum'],
                         ['product_id'],
@@ -2602,11 +2999,9 @@ class MaVieDashboardController(http.Controller):
 
             stock_total = 0
             if kw.get('shop_field'):
-                mapping = request.env['mv.batch.shop.mapping'].sudo().search([
-                    ('shop_field', '=', kw['shop_field'])
-                ], limit=1)
-                if mapping and mapping.warehouse_id:
-                    target_wh = mapping.warehouse_id.name
+                scope_detail = self._get_shop_scope(kw['shop_field'])
+                if scope_detail and scope_detail['warehouse']:
+                    target_wh = scope_detail['warehouse'].name
                     stock_total = sum(s['stock'] for s in stock_by_store if s['store_name'] == target_wh)
                 else:
                     stock_total = sum(s['stock'] for s in stock_by_store)
@@ -2661,6 +3056,12 @@ class MaVieDashboardController(http.Controller):
                 stock_by_store_pivot.append({
                     'field': field,
                     'name': label,
+                    # DEMANDE UTILISATEUR : savoir non seulement à quel
+                    # magasin la référence a été dispatchée, mais aussi à
+                    # quelle société ce magasin appartient.
+                    'company': (mapping.company_id.name
+                                if mapping and mapping.company_id else '—'),
+                    'city': (mapping.city or '').strip() if mapping else '',
                     'qty': qty,
                     'dispatch_source': dispatch_src,
                 })
@@ -2671,6 +3072,16 @@ class MaVieDashboardController(http.Controller):
             stock_by_name = {s['store_name']: s['stock'] for s in stock_by_store}
             for row in stock_by_store_pivot:
                 row['stock'] = stock_by_name.get(row['name'], 0)
+
+            # DEMANDE UTILISATEUR : ce tableau sortait dans l'ordre arbitraire
+            # du mapping magasin. Il est désormais classé du plus dispatché au
+            # moins dispatché (puis par stock restant), pour lire directement
+            # le top → flop des magasins sur cette référence. Les magasins
+            # sans aucune commande fournisseur (qty = None) restent en bas.
+            stock_by_store_pivot.sort(
+                key=lambda r: (-(r['qty'] if r['qty'] is not None else -1),
+                               -(r.get('stock') or 0), r['name'])
+            )
 
             # Suite du panneau "Vérification des données" : le détail par
             # magasin, avec le même dict que stock_by_store_pivot ci-dessus
@@ -2688,9 +3099,14 @@ class MaVieDashboardController(http.Controller):
                 })
 
             # ✅ IMAGE LAZY LOADING — chargée uniquement au clic sur le produit
-            # (pas au chargement initial). Toujours l'image native du produit
-            # (plus de repli mv.article.base).
-            image_url = f'/web/image/product.template/{product_tmpl.id}/image_512'
+            # (pas au chargement initial). Le repli mv.article.base est
+            # rétabli : vérifié en base, 53 articles Base Pivot portent une
+            # photo alors que seules 50 fiches produit en ont une, et les
+            # deux ensembles ne se recouvrent pas complètement. `has_image`
+            # distingue une vraie photo du visuel de remplacement d'Odoo.
+            image_source = self._image_availability([product_tmpl.id], size='image_512').get(product_tmpl.id)
+            image_url = self._image_url(product_tmpl.id, image_source, size='image_512')
+            has_image = bool(image_source)
 
             return {
                 'id': product_tmpl.id,
@@ -2731,6 +3147,7 @@ class MaVieDashboardController(http.Controller):
                     'by_magasin': verif_by_magasin,
                 },
                 'image_url': image_url,
+                'has_image': has_image,
             }
         except Exception as e:
             _logger.error(f"Erreur api_product_detail: {str(e)}", exc_info=True)
@@ -2738,9 +3155,12 @@ class MaVieDashboardController(http.Controller):
 
     @http.route('/mavie/api/product-detail/export', type='http', auth='user', methods=['GET'], csrf=False)
     def api_product_detail_export(self, **kw):
-        """Export CSV de la fiche d'une seule référence : KPIs, variantes
-        couleurs et stock par magasin, tels qu'affichés dans le panneau
-        détail du dashboard."""
+        """Export de la fiche d'une référence : KPIs, variantes couleurs et
+        dispatch par société/magasin, tels qu'affichés dans le panneau détail.
+
+        Classeur .xlsx avec la photo incrustée par défaut ; `?format=csv`
+        renvoie les données brutes.
+        """
         data = self._compute_product_detail(kw)
         if not data or data.get('error'):
             message = data.get('error') if data else 'Produit introuvable'
@@ -2750,6 +3170,12 @@ class MaVieDashboardController(http.Controller):
                 status=404,
             )
 
+        ref_for_filename = re.sub(
+            r'[^A-Za-z0-9_-]+', '_', data.get('ref') or str(data.get('id') or 'produit'))
+
+        if (kw.get('format') or 'xlsx').lower() != 'csv':
+            return self._product_detail_xlsx(data, ref_for_filename)
+
         buffer = io.StringIO()
         buffer.write('﻿')  # BOM pour qu'Excel détecte l'UTF-8
         writer = csv.writer(buffer, delimiter=';')
@@ -2758,6 +3184,8 @@ class MaVieDashboardController(http.Controller):
         writer.writerow(['Référence', data.get('ref') or ''])
         writer.writerow(['Famille', data.get('family') or ''])
         writer.writerow(['Collection', data.get('collection_name') or ''])
+        photo_url = self._absolute_url(data.get('image_url')) if data.get('has_image') else ''
+        writer.writerow(['URL photo', photo_url or 'Aucune photo'])
         writer.writerow([])
 
         writer.writerow(['KPI', 'Valeur'])
@@ -2777,12 +3205,18 @@ class MaVieDashboardController(http.Controller):
             writer.writerow([idx, v.get('name'), v.get('total_pieces', 0), v.get('qty', 0), v.get('reste', 0)])
         writer.writerow([])
 
-        writer.writerow(['Stock par magasin'])
-        writer.writerow(['Magasin', 'Qté dispatché', 'Stock'])
+        # Dispatch : classé du plus dispatché au moins dispatché, avec la
+        # société propriétaire du magasin (demande utilisateur "le dispatch
+        # de la référence, il est donné à qui exactement, quelle société et
+        # quel magasin").
+        writer.writerow(['Dispatch par société / magasin (du plus dispatché au moins dispatché)'])
+        writer.writerow(['Société', 'Magasin', 'Ville', 'Qté dispatchée', 'Stock restant'])
         for s in data.get('stock_by_store') or []:
-            writer.writerow([s.get('name'), s.get('qty', 0), s.get('stock', 0)])
+            writer.writerow([
+                s.get('company') or '—', s.get('name'), s.get('city') or '—',
+                s.get('qty') if s.get('qty') is not None else '—', s.get('stock', 0),
+            ])
 
-        ref_for_filename = re.sub(r'[^A-Za-z0-9_-]+', '_', data.get('ref') or str(data.get('id') or 'produit'))
         filename = f'mavie_export_{ref_for_filename}.csv'
 
         return request.make_response(
@@ -2792,6 +3226,88 @@ class MaVieDashboardController(http.Controller):
                 ('Content-Disposition', f'attachment; filename="{filename}"'),
             ],
         )
+
+    def _product_detail_xlsx(self, data, ref_for_filename):
+        """Fiche produit en .xlsx, photo incrustée en haut de la feuille."""
+        stream, book, fmt = self._xlsx_workbook()
+        sheet = book.add_worksheet('Fiche produit')
+        sheet.set_column(0, 0, 42)
+        sheet.set_column(1, 4, 18)
+
+        sheet.write(0, 0, data.get('name') or 'Fiche produit', fmt['title'])
+        sheet.write(1, 0, 'Référence', fmt['cell'])
+        sheet.write(1, 1, data.get('ref') or '', fmt['cell'])
+        sheet.write(2, 0, 'Famille', fmt['cell'])
+        sheet.write(2, 1, data.get('family') or '', fmt['cell'])
+        sheet.write(3, 0, 'Collection', fmt['cell'])
+        sheet.write(3, 1, data.get('collection_name') or '', fmt['cell'])
+
+        row = 5
+        photos = self._photo_bytes_by_tmpl(
+            self._image_availability([data['id']], size='image_512'), field='image_512'
+        ) if data.get('has_image') else {}
+        image_bytes = photos.get(data['id'])
+        if image_bytes:
+            # Photo plus grande que dans les listes : c'est la fiche d'UNE
+            # référence, l'image y est l'information principale.
+            sheet.set_row(row, 150)
+            sheet.insert_image(row, 0, 'photo.png', {
+                'image_data': io.BytesIO(image_bytes),
+                'x_offset': 4, 'y_offset': 4, 'object_position': 1,
+            })
+            row += 2
+        else:
+            sheet.write(row, 0, 'Aucune photo enregistrée dans Odoo pour cette référence.',
+                        fmt['muted'])
+            row += 2
+
+        sheet.write(row, 0, 'KPI', fmt['header'])
+        sheet.write(row, 1, 'Valeur', fmt['header'])
+        row += 1
+        for label, value, style in [
+            ('Qté vendue', data.get('qty_sold', 0), 'num'),
+            ('Qté achetée', data.get('qty_purchased', 0), 'num'),
+            ('Stock réel Odoo', data.get('stock_total', 0), 'num'),
+            ('Stock théorique (achetée - vendue)', data.get('stock_theorique', 0), 'num'),
+            ('Écart stock (théorique - réel)', data.get('stock_ecart', 0), 'num'),
+            ('CA Vendu (TTC)', data.get('ca', 0), 'money'),
+            ('CA Achat', data.get('ca_achat', 0), 'money'),
+            ('Sell-through (%)', data.get('sell_through', 0), 'money'),
+        ]:
+            sheet.write(row, 0, label, fmt['cell'])
+            sheet.write(row, 1, value, fmt[style])
+            row += 1
+
+        row += 1
+        sheet.write(row, 0, 'Variantes couleurs (meilleure vente en tête)', fmt['title'])
+        row += 1
+        for col, label in enumerate(['#', 'Couleur', 'Total pièces', 'Qté vendue', 'Reste']):
+            sheet.write(row, col, label, fmt['header'])
+        row += 1
+        for idx, v in enumerate(data.get('variants') or [], start=1):
+            for col, value in enumerate([idx, v.get('name'), v.get('total_pieces', 0),
+                                         v.get('qty', 0), v.get('reste', 0)]):
+                sheet.write(row, col, value, fmt['cell'])
+            row += 1
+
+        row += 1
+        sheet.write(row, 0, 'Dispatch par société / magasin (du plus dispatché au moins dispatché)',
+                    fmt['title'])
+        row += 1
+        for col, label in enumerate(['Société', 'Magasin', 'Ville', 'Qté dispatchée',
+                                     'Stock restant']):
+            sheet.write(row, col, label, fmt['header'])
+        row += 1
+        for s in data.get('stock_by_store') or []:
+            values = [
+                s.get('company') or '—', s.get('name'), s.get('city') or '—',
+                s.get('qty') if s.get('qty') is not None else '—', s.get('stock', 0),
+            ]
+            for col, value in enumerate(values):
+                sheet.write(row, col, value, fmt['cell'])
+            row += 1
+
+        return self._xlsx_response(stream, book, 'mavie_export_%s.xlsx' % ref_for_filename)
 
     # ─────────────────────────────────────────────────────────────
     # EXTRACTION / TRANSFERT INTER-MAGASINS
@@ -3049,8 +3565,14 @@ class MaVieDashboardController(http.Controller):
                 return {'error': 'Magasin cible non configuré (entrepôt manquant).'}
             if not source_mapping.company_id or not dest_mapping.company_id:
                 return {'error': 'Société non configurée pour un des deux magasins.'}
-            if source_mapping.company_id.id == dest_mapping.company_id.id:
-                return {'error': 'Le magasin source et le magasin cible appartiennent à la même société.'}
+            # DEMANDE UTILISATEUR : un transfert entre deux magasins d'une
+            # MÊME société n'est plus bloqué. Il ne passe simplement pas par
+            # le circuit inter-sociétés (avoir + commande d'achat auprès de
+            # MOD FOR LIFE), qui n'aurait aucun sens ici : le modèle
+            # inter.internal.transfer bascule alors sur un simple transfert
+            # de stock interne d'un entrepôt à l'autre.
+            if source_mapping.warehouse_id.lot_stock_id.id == dest_mapping.warehouse_id.lot_stock_id.id:
+                return {'error': 'Le magasin source et le magasin cible sont le même emplacement.'}
 
             source_location = source_mapping.warehouse_id.lot_stock_id
             Quant = request.env['stock.quant'].sudo().with_company(source_mapping.company_id)
@@ -3095,6 +3617,10 @@ class MaVieDashboardController(http.Controller):
                 'location_target_id': dest_mapping.warehouse_id.lot_stock_id.id,
                 'line_ids': line_vals,
                 'group_ref': group_ref,
+                # Marque ce bon comme provenant du dashboard : c'est le seul
+                # critère retenu par la section Historique (voir
+                # created_from_dashboard sur inter.internal.transfer).
+                'created_from_dashboard': True,
             })
             transfer.sudo().action_submit()
 
@@ -3112,3 +3638,808 @@ class MaVieDashboardController(http.Controller):
         except Exception as e:
             _logger.error(f"Erreur api_transfer_create: {str(e)}", exc_info=True)
             return {'error': str(e)}
+
+    # ─────────────────────────────────────────────────────────────
+    # EXPORT DU STOCK DORMANT
+    # ─────────────────────────────────────────────────────────────
+
+    @http.route('/mavie/api/dormant/export', type='http', auth='user', methods=['GET'], csrf=False)
+    def api_dormant_export(self, **kw):
+        """Export du stock dormant, mêmes filtres qu'à l'écran.
+
+        Classeur .xlsx avec photos incrustées par défaut ; `?format=csv`
+        renvoie les données brutes (sans photo, un CSV ne peut pas en porter).
+        """
+        data = self._compute_kpis(kw)
+        if not data or data.get('error'):
+            message = data.get('error') if data else 'Erreur inconnue'
+            return request.make_response(
+                'Erreur : ' + message,
+                headers=[('Content-Type', 'text/plain; charset=utf-8')],
+                status=404,
+            )
+
+        rows = data.get('dormant_list') or []
+        image_sources = self._image_availability({r['id'] for r in rows})
+
+        def _values(idx, row):
+            breakdown = ' | '.join(
+                '%s : %s' % (b.get('magasin'), b.get('qty'))
+                for b in (row.get('magasin_breakdown') or [])
+            )
+            return [
+                idx,
+                row.get('ref'), row.get('name'), row.get('magasin') or '—',
+                row.get('magasin_qty') if row.get('magasin_qty') is not None else '—',
+                row.get('magasin_days') if row.get('magasin_days') is not None else '—',
+                row.get('magasin_last_move') or '—',
+                row.get('stock', 0), breakdown,
+            ]
+
+        if (kw.get('format') or 'xlsx').lower() == 'csv':
+            buffer = io.StringIO()
+            buffer.write(u'﻿')  # BOM pour qu'Excel détecte l'UTF-8
+            writer = csv.writer(buffer, delimiter=';')
+            writer.writerow(['Stock dormant (aucune vente depuis 90 jours)'])
+            writer.writerow(['Références concernées', data.get('dormant_count', 0)])
+            writer.writerow(['Part du stock immobilisé (%)', data.get('stock_dormant_pct', 0)])
+            writer.writerow([])
+            writer.writerow([
+                '#', 'URL photo', 'Réf', 'Produit', 'Magasin principal',
+                'Qté dans ce magasin', 'Jours sans mouvement', 'Dernier mouvement',
+                'Stock total', 'Répartition par magasin',
+            ])
+            for idx, row in enumerate(rows, start=1):
+                src = image_sources.get(row['id'])
+                photo_url = self._absolute_url(self._image_url(row['id'], src)) if src else ''
+                vals = _values(idx, row)
+                writer.writerow([vals[0], photo_url] + vals[1:])
+            return request.make_response(
+                buffer.getvalue(),
+                headers=[
+                    ('Content-Type', 'text/csv; charset=utf-8'),
+                    ('Content-Disposition',
+                     'attachment; filename="mavie_export_stock_dormant.csv"'),
+                ],
+            )
+
+        photos = self._photo_bytes_by_tmpl(image_sources)
+        stream, book, fmt = self._xlsx_workbook()
+        sheet = book.add_worksheet('Stock dormant')
+        sheet.write(0, 0, 'Stock dormant (aucune vente depuis 90 jours)', fmt['title'])
+        sheet.write(1, 0, '%s référence(s) concernée(s) — %s%% du stock immobilisé — %s avec photo'
+                    % (data.get('dormant_count', 0), data.get('stock_dormant_pct', 0),
+                       sum(1 for r in rows if photos.get(r['id']))), fmt['meta'])
+
+        columns = ['#', 'Photo', 'Réf', 'Produit', 'Magasin principal', 'Qté dans ce magasin',
+                   'Jours sans mouvement', 'Dernier mouvement', 'Stock total',
+                   'Répartition par magasin']
+        for col, label in enumerate(columns):
+            sheet.write(3, col, label, fmt['header'])
+        sheet.set_column(1, 1, self._XLSX_PHOTO_COL_WIDTH)
+        sheet.set_column(2, 2, 16)
+        sheet.set_column(3, 3, 34)
+        sheet.set_column(4, 4, 28)
+        sheet.set_column(5, 8, 14)
+        sheet.set_column(9, 9, 50)
+        sheet.freeze_panes(4, 0)
+
+        for idx, row in enumerate(rows, start=1):
+            excel_row = 3 + idx
+            sheet.set_row(excel_row, self._XLSX_ROW_HEIGHT)
+            vals = _values(idx, row)
+            sheet.write(excel_row, 0, vals[0], fmt['cell'])
+            image_bytes = photos.get(row['id'])
+            if image_bytes:
+                self._xlsx_insert_photo(sheet, excel_row, 1, image_bytes, idx)
+            else:
+                sheet.write(excel_row, 1, 'Aucune photo', fmt['muted'])
+            for offset, value in enumerate(vals[1:], start=2):
+                sheet.write(excel_row, offset, value, fmt['cell'])
+
+        return self._xlsx_response(stream, book, 'mavie_export_stock_dormant.xlsx')
+
+    # ─────────────────────────────────────────────────────────────
+    # VALORISATION — DÉTAIL PAR MAGASIN D'UNE SOCIÉTÉ
+    # ─────────────────────────────────────────────────────────────
+
+    @http.route('/mavie/api/valorisation-detail', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_valorisation_detail(self, **kw):
+        """Détail magasin par magasin de la valorisation d'UNE société.
+
+        Calculé à la demande (au clic sur une ligne société du tableau de
+        valorisation) et non dans _compute_kpis : regrouper les quants par
+        emplacement double le nombre de groupes à parcourir sur tout le
+        réseau (127 050 -> 248 528, mesuré en base), alors que restreint à
+        une seule société le calcul reste immédiat.
+        """
+        try:
+            company_id = kw.get('company_id')
+            if not company_id:
+                return {'error': 'Société manquante.', 'magasins': []}
+            company = request.env['res.company'].sudo().browse(int(company_id))
+            if not company.exists():
+                return {'error': 'Société introuvable.', 'magasins': []}
+
+            product_tmpl_ids = None
+            if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
+                product_tmpl_ids = request.env['product.template'].sudo().search(
+                    self._build_product_domain(kw)
+                ).ids
+                if not product_tmpl_ids:
+                    product_tmpl_ids = [-1]
+
+            quant_domain = [
+                ('location_id.usage', '=', 'internal'),
+                ('company_id', '=', company.id),
+            ]
+            quant_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+            if product_tmpl_ids is not None:
+                variant_ids = request.env['product.product'].sudo().search(
+                    [('product_tmpl_id', 'in', product_tmpl_ids)]
+                ).ids
+                quant_domain.append(('product_id', 'in', variant_ids))
+
+            grouped = self._group_sums(
+                'stock.quant', quant_domain, ['quantity'],
+                group_fields=('product_id', 'location_id'),
+            )
+
+            # Emplacement -> entrepôt : résolu une fois pour toutes, pas une
+            # requête par emplacement.
+            warehouses = request.env['stock.warehouse'].sudo().search([('company_id', '=', company.id)])
+            wh_by_location = {}
+            for wh in warehouses:
+                if not wh.lot_stock_id:
+                    continue
+                locations = request.env['stock.location'].sudo().search([
+                    ('id', 'child_of', wh.lot_stock_id.id)
+                ])
+                for loc in locations:
+                    wh_by_location[loc.id] = wh
+
+            pids = [g['product_id'][0] for g in grouped if g.get('product_id')]
+            prod_map = {}
+            if pids:
+                prod_map = {
+                    p['id']: p for p in request.env['product.product'].sudo().search_read(
+                        [('id', 'in', pids)], ['id', 'list_price', 'standard_price', 'product_tmpl_id'])
+                }
+
+            # Repli sur le prix d'achat moyen réellement payé quand le champ
+            # "Coût" est vide — même règle que la valorisation principale.
+            tmpl_ids_needed = {
+                p['product_tmpl_id'][0] for p in prod_map.values()
+                if p.get('product_tmpl_id') and not p.get('standard_price')
+            }
+            prix_achat_moyen = {}
+            if tmpl_ids_needed:
+                po_grouped = request.env['purchase.order.line'].sudo().read_group(
+                    [('order_id.state', 'in', ['purchase', 'done']),
+                     ('product_id.product_tmpl_id', 'in', list(tmpl_ids_needed))],
+                    ['product_qty:sum', 'price_subtotal:sum'], ['product_id'], lazy=False
+                )
+                po_pids = [g['product_id'][0] for g in po_grouped if g.get('product_id')]
+                po_tmpl = {}
+                if po_pids:
+                    po_tmpl = {
+                        p['id']: p['product_tmpl_id'][0]
+                        for p in request.env['product.product'].sudo().search_read(
+                            [('id', 'in', po_pids)], ['id', 'product_tmpl_id'])
+                        if p.get('product_tmpl_id')
+                    }
+                accum = {}
+                for g in po_grouped:
+                    tid = po_tmpl.get(g['product_id'][0] if g.get('product_id') else None)
+                    if not tid:
+                        continue
+                    entry = accum.setdefault(tid, [0.0, 0.0])
+                    entry[0] += g.get('product_qty') or 0.0
+                    entry[1] += g.get('price_subtotal') or 0.0
+                for tid, (qte, montant) in accum.items():
+                    if qte and montant > 0:
+                        prix_achat_moyen[tid] = montant / qte
+
+            cost_estime = False
+            by_warehouse = {}
+            for g in grouped:
+                pid = g['product_id'][0] if g.get('product_id') else None
+                loc_id = g['location_id'][0] if g.get('location_id') else None
+                qty = g.get('quantity') or 0.0
+                if qty <= 0 or pid not in prod_map:
+                    continue
+                wh = wh_by_location.get(loc_id)
+                if not wh:
+                    continue
+                p_data = prod_map[pid]
+                cost_price = p_data.get('standard_price') or 0.0
+                if not cost_price:
+                    tmpl_ref = p_data.get('product_tmpl_id')
+                    fallback = prix_achat_moyen.get(tmpl_ref[0]) if tmpl_ref else None
+                    if fallback:
+                        cost_price = fallback
+                        cost_estime = True
+                entry = by_warehouse.setdefault(wh.id, {
+                    'name': wh.name, 'qty': 0, 'valeur_ht': 0.0, 'valeur_cost': 0.0,
+                })
+                entry['qty'] += int(qty)
+                entry['valeur_ht'] += qty * (p_data.get('list_price') or 0.0)
+                entry['valeur_cost'] += qty * cost_price
+
+            magasins = [
+                {
+                    'name': v['name'],
+                    'qty': v['qty'],
+                    'valeur_ht': round(v['valeur_ht'], 2),
+                    'valeur_cost': round(v['valeur_cost'], 2),
+                }
+                for v in by_warehouse.values()
+            ]
+            magasins.sort(key=lambda m: -m['valeur_ht'])
+
+            return {
+                'company_name': company.name,
+                'magasins': magasins,
+                'total_qty': sum(m['qty'] for m in magasins),
+                'total_ht': round(sum(m['valeur_ht'] for m in magasins), 2),
+                'total_cost': round(sum(m['valeur_cost'] for m in magasins), 2),
+                'cost_estime': cost_estime,
+            }
+        except Exception as e:
+            _logger.error(f"Erreur api_valorisation_detail: {str(e)}", exc_info=True)
+            return {'error': str(e), 'magasins': []}
+
+    # ─────────────────────────────────────────────────────────────
+    # ÉCARTS D'INVENTAIRE — DÉTECTION ET EXPLICATION
+    #
+    # DEMANDE UTILISATEUR : « normalement dans la partie Précision
+    # Inventaire il doit afficher 0 % ; s'il affiche un pourcentage grand,
+    # on doit pouvoir cliquer et voir les problèmes détectés — le moins sur
+    # les références et la cause de ce moins : un magasin a 3 produits mais
+    # il en a vendu 4, d'où vient le 1 ? »
+    #
+    # Un stock négatif est la trace exacte de ce symptôme : Odoo a
+    # enregistré plus de sorties que d'entrées pour cette référence dans cet
+    # entrepôt. Vérifié en base : 46 740 quants négatifs, soit 8 212 couples
+    # (référence, emplacement) en anomalie — le sujet est massif et mérite
+    # d'être remonté comme un indicateur à part entière plutôt que dilué
+    # dans un pourcentage de « précision » proche de 100 %.
+    # ─────────────────────────────────────────────────────────────
+
+    def _negative_stock_groups(self, quant_domain):
+        """[(product_id, location_id, quantité)] pour les seuls stocks négatifs.
+
+        Agrégation + filtre HAVING exécutés par Postgres : seules les
+        quelques milliers de lignes réellement en anomalie remontent en
+        Python, au lieu des ~248 000 groupes que produirait un read_group
+        par (produit, emplacement) sur tout le réseau.
+        """
+        Quant = request.env['stock.quant'].sudo()
+        query = Quant._where_calc(quant_domain)
+        Quant._apply_ir_rules(query, 'read')
+        from_clause, where_clause, params = query.get_sql()
+        request.env.cr.execute(
+            'SELECT "stock_quant"."product_id", "stock_quant"."location_id", '
+            'SUM("stock_quant"."quantity") '
+            'FROM %s WHERE %s '
+            'GROUP BY "stock_quant"."product_id", "stock_quant"."location_id" '
+            'HAVING SUM("stock_quant"."quantity") < 0' % (from_clause, where_clause or 'TRUE'),
+            params,
+        )
+        return request.env.cr.fetchall()
+
+    def _location_to_warehouse_map(self, warehouses):
+        """{location_id: warehouse} pour tous les emplacements de ces entrepôts."""
+        mapping = {}
+        for wh in warehouses:
+            if not wh.lot_stock_id:
+                continue
+            locations = request.env['stock.location'].sudo().search([
+                ('id', 'child_of', wh.lot_stock_id.id)
+            ])
+            for loc in locations:
+                mapping[loc.id] = wh
+        return mapping
+
+    def _build_anomaly_quant_domain(self, kw):
+        """Périmètre des quants examinés pour les écarts d'inventaire."""
+        domain = [('location_id.usage', '=', 'internal')]
+        domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+
+        scope = self._get_shop_scope(kw.get('shop_field'))
+        if scope:
+            if scope['company_id']:
+                domain.append(('company_id', '=', scope['company_id']))
+            if scope['warehouse'] and scope['warehouse'].lot_stock_id:
+                domain.append(('location_id', 'child_of', scope['warehouse'].lot_stock_id.id))
+        else:
+            domain.append(('company_id', 'not in', self._get_excluded_non_retail_ids(kw)))
+            context_company_ids = self._get_context_company_ids()
+            if context_company_ids:
+                domain.append(('company_id', 'in', context_company_ids))
+
+        if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
+            product_tmpl_ids = request.env['product.template'].sudo().search(
+                self._build_product_domain(kw)
+            ).ids or [-1]
+            variant_ids = request.env['product.product'].sudo().search(
+                [('product_tmpl_id', 'in', product_tmpl_ids)]
+            ).ids
+            domain.append(('product_id', 'in', variant_ids))
+        return domain
+
+    def _inventory_anomaly_summary(self, kw):
+        """{refs_count, groups_count, qty_manquante} — version légère.
+
+        Appelée à chaque chargement du dashboard : elle ne fait que
+        l'agrégation SQL (filtrée côté Postgres) plus une seule lecture des
+        variantes concernées, sans résoudre libellés ni entrepôts — ce
+        travail-là n'est fait qu'à l'ouverture du détail.
+        """
+        try:
+            rows = self._negative_stock_groups(self._build_anomaly_quant_domain(kw))
+        except Exception as e:
+            _logger.warning("Écarts d'inventaire indisponibles: %s", e)
+            return {'refs_count': 0, 'groups_count': 0, 'qty_manquante': 0}
+        if not rows:
+            return {'refs_count': 0, 'groups_count': 0, 'qty_manquante': 0}
+        variant_ids = list({r[0] for r in rows})
+        variants = request.env['product.product'].sudo().with_context(active_test=False).search_read(
+            [('id', 'in', variant_ids)], ['id', 'product_tmpl_id']
+        )
+        tmpl_ids = {v['product_tmpl_id'][0] for v in variants if v.get('product_tmpl_id')}
+        return {
+            'refs_count': len(tmpl_ids),
+            'groups_count': len(rows),
+            'qty_manquante': int(sum(r[2] for r in rows)),
+        }
+
+    def _compute_inventory_anomalies(self, kw, limit=500):
+        """Références en stock négatif, regroupées par magasin."""
+        rows = self._negative_stock_groups(self._build_anomaly_quant_domain(kw))
+        if not rows:
+            return {'anomalies': [], 'count': 0, 'qty_manquante': 0}
+
+        variant_ids = list({r[0] for r in rows})
+        variants = request.env['product.product'].sudo().with_context(active_test=False).search_read(
+            [('id', 'in', variant_ids)], ['id', 'product_tmpl_id', 'display_name']
+        )
+        variant_map = {v['id']: v for v in variants}
+
+        warehouses = request.env['stock.warehouse'].sudo().search([])
+        wh_by_location = self._location_to_warehouse_map(warehouses)
+
+        grouped = {}
+        for variant_id, location_id, qty in rows:
+            v = variant_map.get(variant_id)
+            if not v or not v.get('product_tmpl_id'):
+                continue
+            wh = wh_by_location.get(location_id)
+            key = (v['product_tmpl_id'][0], wh.id if wh else 0)
+            entry = grouped.setdefault(key, {
+                'id': v['product_tmpl_id'][0],
+                'warehouse_id': wh.id if wh else None,
+                'magasin': wh.name if wh else 'Emplacement hors entrepôt',
+                'company': wh.company_id.name if wh and wh.company_id else '—',
+                'qty_negative': 0.0,
+                'variants': [],
+            })
+            entry['qty_negative'] += qty
+            entry['variants'].append({
+                'name': v.get('display_name') or '—',
+                'qty': int(qty),
+            })
+
+        tmpl_ids = list({e['id'] for e in grouped.values()})
+        tmpl_data = request.env['product.template'].sudo().search_read(
+            [('id', 'in', tmpl_ids)], ['id', 'name', 'default_code', 'base_pivot_reference']
+        )
+        tmpl_map = {t['id']: t for t in tmpl_data}
+
+        anomalies = []
+        for entry in grouped.values():
+            t = tmpl_map.get(entry['id'], {})
+            entry['name'] = t.get('name') or '—'
+            entry['ref'] = (t.get('base_pivot_reference') or t.get('default_code')
+                            or t.get('name') or '—')
+            entry['qty_negative'] = int(entry['qty_negative'])
+            entry['variants'].sort(key=lambda v: v['qty'])
+            anomalies.append(entry)
+
+        anomalies.sort(key=lambda a: a['qty_negative'])
+        return {
+            'anomalies': anomalies[:limit],
+            'count': len(anomalies),
+            'refs_count': len(tmpl_ids),
+            'qty_manquante': int(sum(a['qty_negative'] for a in anomalies)),
+        }
+
+    @http.route('/mavie/api/inventory-anomalies', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_inventory_anomalies(self, **kw):
+        try:
+            return self._compute_inventory_anomalies(kw)
+        except Exception as e:
+            _logger.error(f"Erreur api_inventory_anomalies: {str(e)}", exc_info=True)
+            return {'error': str(e), 'anomalies': []}
+
+    # Libellés des causes, dans l'ordre où on veut les lire à l'écran.
+    _LEDGER_LABELS = {
+        'achat': 'Réception fournisseur / import',
+        'transfert': 'Transfert entre magasins',
+        'transit': 'Transit inter-sociétés',
+        'inventaire': "Ajustement d'inventaire",
+        'vente': 'Vente / livraison client',
+        'retour': 'Retour client',
+        'production': 'Production / assemblage',
+        'autre': 'Autre mouvement',
+    }
+
+    def _classify_move_line(self, move_line, inside_location_ids, direction):
+        """Catégorie métier d'un mouvement, vue depuis l'entrepôt examiné."""
+        other = move_line.location_id if direction == 'in' else move_line.location_dest_id
+        usage = other.usage
+        if usage == 'supplier':
+            return 'achat' if direction == 'in' else 'autre'
+        if usage == 'customer':
+            return 'retour' if direction == 'in' else 'vente'
+        if usage == 'inventory':
+            return 'inventaire'
+        if usage == 'transit':
+            return 'transit'
+        if usage == 'production':
+            return 'production'
+        if usage == 'internal':
+            return 'transfert'
+        return 'autre'
+
+    @http.route('/mavie/api/inventory-anomaly-detail', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_inventory_anomaly_detail(self, **kw):
+        """Explique un stock négatif : d'où viennent les pièces sorties.
+
+        Reconstitue le grand livre des mouvements validés de cette référence
+        pour CET entrepôt (entrées d'un côté, sorties de l'autre, classées
+        par nature) et le confronte aux ventes en caisse, en distinguant les
+        ventes au prix catalogue des ventes en solde — c'est la question
+        posée : « le produit vendu en trop, il vient d'un transfert ou d'un
+        solde ? ».
+        """
+        try:
+            product_tmpl_id = kw.get('article_id') or kw.get('product_tmpl_id')
+            warehouse_id = kw.get('warehouse_id')
+            if not product_tmpl_id:
+                return {'error': 'Référence manquante.'}
+
+            product_tmpl = request.env['product.template'].sudo().browse(int(product_tmpl_id))
+            if not product_tmpl.exists():
+                return {'error': 'Référence introuvable.'}
+
+            warehouse = request.env['stock.warehouse'].sudo().browse(int(warehouse_id)) if warehouse_id else False
+            if not warehouse or not warehouse.exists() or not warehouse.lot_stock_id:
+                return {'error': 'Magasin introuvable ou sans emplacement de stock.'}
+
+            variants = request.env['product.product'].sudo().search([
+                ('product_tmpl_id', '=', product_tmpl.id)
+            ])
+            if not variants:
+                return {'error': 'Aucune variante pour cette référence.'}
+
+            lot_stock = warehouse.lot_stock_id
+            inside_locations = request.env['stock.location'].sudo().search([
+                ('id', 'child_of', lot_stock.id)
+            ])
+            inside_ids = set(inside_locations.ids)
+
+            MoveLine = request.env['stock.move.line'].sudo()
+            lines_in = MoveLine.search([
+                ('state', '=', 'done'),
+                ('product_id', 'in', variants.ids),
+                ('location_dest_id', 'in', list(inside_ids)),
+                '!', ('location_id', 'in', list(inside_ids)),
+            ])
+            lines_out = MoveLine.search([
+                ('state', '=', 'done'),
+                ('product_id', 'in', variants.ids),
+                ('location_id', 'in', list(inside_ids)),
+                '!', ('location_dest_id', 'in', list(inside_ids)),
+            ])
+
+            def _accumulate(lines, direction):
+                buckets = {}
+                for ml in lines:
+                    category = self._classify_move_line(ml, inside_ids, direction)
+                    bucket = buckets.setdefault(category, {
+                        'categorie': category,
+                        'label': self._LEDGER_LABELS.get(category, category),
+                        'sens': 'Entrée' if direction == 'in' else 'Sortie',
+                        'qty': 0.0,
+                        'nb_mouvements': 0,
+                        'derniere_date': None,
+                        'exemples': [],
+                    })
+                    bucket['qty'] += ml.quantity
+                    bucket['nb_mouvements'] += 1
+                    if ml.date and (not bucket['derniere_date'] or str(ml.date) > bucket['derniere_date']):
+                        bucket['derniere_date'] = str(ml.date)
+                    if len(bucket['exemples']) < 5:
+                        doc = ml.reference or (ml.picking_id.name if ml.picking_id else '') or (
+                            ml.move_id.origin if ml.move_id else '')
+                        contrepartie = (ml.location_id if direction == 'in' else ml.location_dest_id)
+                        bucket['exemples'].append({
+                            'document': doc or '—',
+                            'origine': ml.move_id.origin if ml.move_id else '',
+                            'emplacement': contrepartie.complete_name if contrepartie else '—',
+                            'qty': int(ml.quantity),
+                            'date': str(ml.date)[:10] if ml.date else '—',
+                        })
+                for bucket in buckets.values():
+                    bucket['qty'] = int(round(bucket['qty']))
+                return buckets
+
+            in_buckets = _accumulate(lines_in, 'in')
+            out_buckets = _accumulate(lines_out, 'out')
+
+            entrees = sorted(in_buckets.values(), key=lambda b: -b['qty'])
+            sorties = sorted(out_buckets.values(), key=lambda b: -b['qty'])
+            total_in = sum(b['qty'] for b in entrees)
+            total_out = sum(b['qty'] for b in sorties)
+
+            quants = request.env['stock.quant'].sudo().search([
+                ('product_id', 'in', variants.ids),
+                ('location_id', 'in', list(inside_ids)),
+            ])
+            stock_reel = int(sum(quants.mapped('quantity'))) if quants else 0
+
+            # Ventes en caisse de ce magasin, séparées normal / solde : c'est
+            # la question posée par l'utilisateur (« d'où vient le 1 vendu en
+            # trop : un transfert ou un solde ? »).
+            pos_configs = request.env['pos.config'].sudo().search([
+                ('picking_type_id.warehouse_id', '=', warehouse.id)
+            ])
+            qty_vendue = qty_vendue_solde = 0
+            if pos_configs:
+                request.env.cr.execute("""
+                    SELECT COALESCE(SUM(pol.qty), 0),
+                           COALESCE(SUM(CASE WHEN pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0)
+                                                  < pt.list_price * 0.999
+                                             THEN pol.qty ELSE 0 END), 0)
+                    FROM pos_order_line pol
+                    JOIN pos_order po ON po.id = pol.order_id
+                    JOIN pos_session ps ON ps.id = po.session_id
+                    JOIN product_product pp ON pp.id = pol.product_id
+                    JOIN product_template pt ON pt.id = pp.product_tmpl_id
+                    WHERE ps.config_id IN %s
+                      AND pp.product_tmpl_id = %s
+                      AND po.state IN ('paid', 'done', 'invoiced')
+                """, (tuple(pos_configs.ids), product_tmpl.id))
+                row = request.env.cr.fetchone()
+                qty_vendue = int(row[0] or 0)
+                qty_vendue_solde = int(row[1] or 0)
+
+            # Transferts inter-magasins passés par le module dédié : on cite
+            # les bons concernés, la piste la plus actionnable pour retrouver
+            # l'origine d'une sortie non couverte par une entrée.
+            transferts = []
+            try:
+                Transfer = request.env['inter.internal.transfer'].sudo()
+                related = Transfer.search([
+                    ('line_ids.product_id', 'in', variants.ids),
+                    '|', ('location_source_id', 'in', list(inside_ids)),
+                         ('location_target_id', 'in', list(inside_ids)),
+                ], order='id desc', limit=20)
+                for tr in related:
+                    qty = sum(
+                        line.quantity for line in tr.line_ids
+                        if line.product_id.id in set(variants.ids)
+                    )
+                    transferts.append({
+                        'name': tr.name,
+                        'date': str(tr.create_date)[:10] if tr.create_date else '—',
+                        'sens': 'Sortie' if tr.location_source_id.id in inside_ids else 'Entrée',
+                        'source': tr.location_source_id.complete_name,
+                        'cible': tr.location_target_id.complete_name,
+                        'qty': int(qty),
+                        'state': tr.state,
+                    })
+            except Exception as e:
+                _logger.warning("Transferts internes indisponibles: %s", e)
+
+            manquant = total_in - total_out - stock_reel
+            return {
+                'ref': product_tmpl.base_pivot_reference or product_tmpl.default_code or product_tmpl.name,
+                'name': product_tmpl.name,
+                'magasin': warehouse.name,
+                'societe': warehouse.company_id.name if warehouse.company_id else '—',
+                'entrees': entrees,
+                'sorties': sorties,
+                'total_entrees': total_in,
+                'total_sorties': total_out,
+                'stock_theorique': total_in - total_out,
+                'stock_reel': stock_reel,
+                # Non nul = des quants ont été écrits sans mouvement de stock
+                # correspondant (import, correction directe en base).
+                'ecart_non_explique': int(manquant),
+                'qty_vendue_caisse': qty_vendue,
+                'qty_vendue_solde': qty_vendue_solde,
+                'qty_vendue_normale': qty_vendue - qty_vendue_solde,
+                'transferts': transferts,
+            }
+        except Exception as e:
+            _logger.error(f"Erreur api_inventory_anomaly_detail: {str(e)}", exc_info=True)
+            return {'error': str(e)}
+
+    # ─────────────────────────────────────────────────────────────
+    # HISTORIQUE DES TRANSFERTS ET DES SOLDES
+    #
+    # DEMANDE UTILISATEUR : disposer, sous les cartes, de l'historique de
+    # tout ce qui a été fait — les transferts entre magasins d'un côté, les
+    # ventes en solde de l'autre. Les deux listes partagent les filtres de
+    # la barre du haut (période, magasin) et s'exportent en CSV.
+    # ─────────────────────────────────────────────────────────────
+
+    def _transfer_history_rows(self, kw, limit=300):
+        # Uniquement les bons lancés depuis le dashboard (décision
+        # utilisateur) : l'historique repart de zéro et ne reprend pas les
+        # transferts créés auparavant par d'autres canaux.
+        domain = [('created_from_dashboard', '=', True)]
+        if kw.get('date_start'):
+            domain.append(('create_date', '>=', kw['date_start'] + ' 00:00:00'))
+        if kw.get('date_end'):
+            domain.append(('create_date', '<=', kw['date_end'] + ' 23:59:59'))
+
+        scope = self._get_shop_scope(kw.get('shop_field'))
+        if scope and scope['warehouse'] and scope['warehouse'].lot_stock_id:
+            lot_stock_id = scope['warehouse'].lot_stock_id.id
+            domain += ['|', ('location_source_id', '=', lot_stock_id),
+                            ('location_target_id', '=', lot_stock_id)]
+        else:
+            context_company_ids = self._get_context_company_ids()
+            if context_company_ids:
+                domain += ['|', ('company_source_id', 'in', context_company_ids),
+                                ('company_target_id', 'in', context_company_ids)]
+
+        transfers = request.env['inter.internal.transfer'].sudo().search(
+            domain, order='id desc', limit=limit
+        )
+        state_labels = {'draft': 'Brouillon', 'submitted': 'En attente de validation', 'done': 'Fait'}
+        rows = []
+        for tr in transfers:
+            qty = sum(tr.line_ids.mapped('quantity'))
+            refs = tr.line_ids.mapped('product_id.product_tmpl_id')
+            rows.append({
+                'id': tr.id,
+                'name': tr.name,
+                'date': str(tr.create_date)[:16] if tr.create_date else '—',
+                'state': tr.state,
+                'state_label': state_labels.get(tr.state, tr.state),
+                'source_magasin': tr.emetteur_display or '—',
+                'source_societe': tr.company_source_id.name or '—',
+                'dest_magasin': tr.recepteur_display or '—',
+                'dest_societe': tr.company_target_id.name or '—',
+                # Un transfert au sein d'une même société ne passe plus par
+                # le circuit inter-sociétés : on le signale explicitement.
+                'intra_societe': tr.company_source_id.id == tr.company_target_id.id,
+                'nb_references': len(refs),
+                'nb_lignes': len(tr.line_ids),
+                'qty': int(qty),
+                'group_ref': tr.group_ref or '',
+            })
+        return rows
+
+    def _solde_history_rows(self, kw, limit=500):
+        """Lignes de caisse vendues sous le prix catalogue, les plus récentes."""
+        pos_domain = self._build_pos_domain(kw, None)
+        line_ids = request.env['pos.order.line'].sudo().search(pos_domain).ids
+        if not line_ids:
+            return []
+        request.env.cr.execute("""
+            SELECT po.date_order,
+                   po.name,
+                   pc.name AS magasin,
+                   pt.id AS tmpl_id,
+                   COALESCE(pt.base_pivot_reference, pt.default_code, pt.name->>'en_US') AS ref,
+                   pt.name->>'en_US' AS produit,
+                   pol.qty,
+                   pt.list_price,
+                   pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0) AS prix_paye,
+                   pol.price_subtotal_incl
+            FROM pos_order_line pol
+            JOIN pos_order po ON po.id = pol.order_id
+            JOIN pos_session ps ON ps.id = po.session_id
+            JOIN pos_config pc ON pc.id = ps.config_id
+            JOIN product_product pp ON pp.id = pol.product_id
+            JOIN product_template pt ON pt.id = pp.product_tmpl_id
+            WHERE pol.id IN %s
+              AND pt.list_price > 0
+              AND pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0) < pt.list_price * 0.999
+            ORDER BY po.date_order DESC
+            LIMIT %s
+        """, (tuple(line_ids), limit))
+
+        rows = []
+        for (date_order, ticket, magasin, tmpl_id, ref, produit,
+             qty, list_price, prix_paye, ca) in request.env.cr.fetchall():
+            list_price = float(list_price or 0.0)
+            prix_paye = float(prix_paye or 0.0)
+            rows.append({
+                'id': tmpl_id,
+                'date': str(date_order)[:16] if date_order else '—',
+                'ticket': ticket or '—',
+                'magasin': magasin or '—',
+                'ref': ref or '—',
+                'name': produit or '—',
+                'qty': int(qty or 0),
+                'prix_catalogue': round(list_price, 2),
+                'prix_paye': round(prix_paye, 2),
+                'remise_pct': round((list_price - prix_paye) / list_price * 100, 1) if list_price > 0 else 0.0,
+                'ca': round(float(ca or 0.0), 2),
+            })
+        return rows
+
+    @http.route('/mavie/api/history', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_history(self, **kw):
+        try:
+            transfers = self._transfer_history_rows(kw)
+            soldes = self._solde_history_rows(kw)
+            return {
+                'transfers': transfers,
+                'transfers_count': len(transfers),
+                'transfers_qty': sum(t['qty'] for t in transfers),
+                'soldes': soldes,
+                'soldes_count': len(soldes),
+                'soldes_qty': sum(s['qty'] for s in soldes),
+                'soldes_ca': round(sum(s['ca'] for s in soldes), 2),
+            }
+        except Exception as e:
+            _logger.error(f"Erreur api_history: {str(e)}", exc_info=True)
+            return {'error': str(e), 'transfers': [], 'soldes': []}
+
+    @http.route('/mavie/api/history/export', type='http', auth='user', methods=['GET'], csrf=False)
+    def api_history_export(self, **kw):
+        kind = kw.get('kind') or 'transferts'
+        buffer = io.StringIO()
+        buffer.write(u'﻿')  # BOM pour qu'Excel détecte l'UTF-8
+        writer = csv.writer(buffer, delimiter=';')
+
+        try:
+            if kind == 'soldes':
+                writer.writerow(['Historique des ventes en solde'])
+                writer.writerow([])
+                writer.writerow(['Date', 'Ticket', 'Magasin', 'Réf', 'Produit', 'Qté',
+                                 'Prix catalogue', 'Prix payé', 'Remise (%)', 'CA encaissé (TTC)'])
+                for row in self._solde_history_rows(kw):
+                    writer.writerow([
+                        row['date'], row['ticket'], row['magasin'], row['ref'], row['name'],
+                        row['qty'], row['prix_catalogue'], row['prix_paye'],
+                        row['remise_pct'], row['ca'],
+                    ])
+                filename = 'mavie_historique_soldes.csv'
+            else:
+                writer.writerow(['Historique des transferts entre magasins'])
+                writer.writerow([])
+                writer.writerow(['Bon', 'Date', 'État', 'Société source', 'Magasin source',
+                                 'Société cible', 'Magasin cible', 'Type', 'Références',
+                                 'Lignes', 'Qté totale', 'Groupe'])
+                for row in self._transfer_history_rows(kw):
+                    writer.writerow([
+                        row['name'], row['date'], row['state_label'],
+                        row['source_societe'], row['source_magasin'],
+                        row['dest_societe'], row['dest_magasin'],
+                        'Intra-société' if row['intra_societe'] else 'Inter-sociétés',
+                        row['nb_references'], row['nb_lignes'], row['qty'], row['group_ref'],
+                    ])
+                filename = 'mavie_historique_transferts.csv'
+        except Exception as e:
+            _logger.error(f"Erreur api_history_export: {str(e)}", exc_info=True)
+            return request.make_response(
+                'Erreur : ' + str(e),
+                headers=[('Content-Type', 'text/plain; charset=utf-8')],
+                status=500,
+            )
+
+        return request.make_response(
+            buffer.getvalue(),
+            headers=[
+                ('Content-Type', 'text/csv; charset=utf-8'),
+                ('Content-Disposition', f'attachment; filename="{filename}"'),
+            ],
+        )

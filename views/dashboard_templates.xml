@@ -959,6 +959,31 @@
                     animation: fadeInOverlay 0.22s ease;
                 }
 
+                #valorisation-overlay,
+                #ecarts-overlay,
+                #ecart-detail-overlay {
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(15,23,42,0.4);
+                    z-index: 9600;
+                    display: none;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 16px;
+                }
+
+                /* Le détail d'un écart s'ouvre PAR-DESSUS la liste des
+                   écarts : z-index supérieur, sinon il passe dessous et
+                   paraît ne pas s'ouvrir. */
+                #ecart-detail-overlay { z-index: 9700; }
+
+                #valorisation-overlay.active,
+                #ecarts-overlay.active,
+                #ecart-detail-overlay.active {
+                    display: flex;
+                    animation: fadeInOverlay 0.22s ease;
+                }
+
                 .ruptures-panel {
                     background: var(--surface);
                     width: 100%;
@@ -1276,8 +1301,9 @@
                         </div>
                         <div class="kpi-card kpi-amber" id="card-mfl-stock">
                             <span class="kpi-icon">📦</span>
-                            <div class="kpi-label">Stock entrepôt</div>
+                            <div class="kpi-label" title="Stock physique de l'entrepôt MOD FOR LIFE, en pièces.">Stock entrepôt</div>
                             <div class="kpi-value" id="mfl-stock">—</div>
+                            <div class="kpi-subtext" id="mfl-stock-sub"></div>
                         </div>
                     </div>
                     <div class="detail-section">
@@ -1286,7 +1312,7 @@
                             <thead>
                                 <tr>
                                     <th>Société</th>
-                                    <th>Qté</th>
+                                    <th>Pièces</th>
                                     <th>CA</th>
                                 </tr>
                             </thead>
@@ -1317,10 +1343,10 @@
                         <div class="kpi-value value-orange" id="kpi-stock-dormant">—</div>
                         <div class="kpi-subtext">Seuil : 10%</div>
                     </div>
-                    <div class="kpi-card stock-kpi-card border-green" id="card-stock-precision">
-                        <div class="kpi-label">Précision Inventaire</div>
+                    <div class="kpi-card stock-kpi-card border-green" id="card-stock-precision" style="cursor:pointer;" title="Part des références présentant un stock NÉGATIF, c'est-à-dire plus de sorties enregistrées dans Odoo que d'entrées. Doit valoir 0 %. Cliquer pour voir les références concernées et l'origine exacte du manque.">
+                        <div class="kpi-label">Écarts d'inventaire</div>
                         <div class="kpi-value value-green" id="kpi-stock-precision">—</div>
-                        <div class="kpi-subtext">Cible : 98%</div>
+                        <div class="kpi-subtext" id="kpi-stock-precision-sub">Cible : 0%</div>
                     </div>
                 </div>
 
@@ -1407,13 +1433,14 @@
                         <div class="section-title" id="top-products-title">
                             <span id="top-title-text">🏆 Top Produits</span>
                             <input type="number" id="top-limit" value="10" min="1" max="100" class="limit-input"/>
-                            <button id="btn-export-top" class="btn-transfer-open" title="Exporter le Top Produits affiché en CSV" style="padding:4px 10px;font-size:0.78rem;">📄 CSV</button>
+                            <button id="btn-export-top" class="btn-transfer-open" title="Exporter le Top Produits affiché en Excel (.xlsx), photos incrustées" style="padding:4px 10px;font-size:0.78rem;">📊 Excel</button>
                             <span class="title-line"></span>
                         </div>
                         <table>
                             <thead>
                                 <tr>
                                     <th>#</th>
+                                    <th title="Photo du produit. Vide = aucune photo n'est enregistrée dans Odoo pour cette référence.">Photo</th>
                                     <th>Produit</th>
                                     <th>Réf</th>
                                     <th title="Montant TTC des commandes fournisseur confirmées pour cette référence.">CA Achat (TTC)</th>
@@ -1431,13 +1458,14 @@
                         <div class="section-title" id="flop-products-title">
                             <span id="flop-title-text">📉 Flop Produits</span>
                             <input type="number" id="flop-limit" value="10" min="1" max="100" class="limit-input"/>
-                            <button id="btn-export-flop" class="btn-transfer-open" title="Exporter le Flop Produits affiché en CSV" style="padding:4px 10px;font-size:0.78rem;">📄 CSV</button>
+                            <button id="btn-export-flop" class="btn-transfer-open" title="Exporter le Flop Produits affiché en Excel (.xlsx), photos incrustées" style="padding:4px 10px;font-size:0.78rem;">📊 Excel</button>
                             <span class="title-line"></span>
                         </div>
                         <table>
                             <thead>
                                 <tr>
                                     <th>#</th>
+                                    <th title="Photo du produit. Vide = aucune photo n'est enregistrée dans Odoo pour cette référence.">Photo</th>
                                     <th>Produit</th>
                                     <th>Réf</th>
                                     <th title="Montant TTC des commandes fournisseur confirmées pour cette référence.">CA Achat (TTC)</th>
@@ -1470,6 +1498,39 @@
                     <div id="sales-daily-legend" class="chart-legend" style="display:none;"></div>
                 </div>
 
+                <!-- ══════════ HISTORIQUE TRANSFERTS / SOLDES ══════════
+                     Demande utilisateur : voir sous les cartes tout ce qui a
+                     déjà été fait — les bons de transfert entre magasins
+                     d'un côté, les ventes en solde de l'autre. Les deux
+                     listes suivent les filtres de la barre du haut (période,
+                     magasin) et s'exportent en CSV.
+
+                     Masqué par défaut : n'apparaît que sur la page
+                     "Tableau de bord" (voir isHistoryPage/adjustUIForPage
+                     dans dashboard.js), d'où partent la quasi-totalité des
+                     transferts. -->
+                <div class="section-card full-width" id="history-section" style="display:none; padding:24px; margin-bottom:20px;">
+                    <div class="section-header-row" style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; flex-wrap:wrap; gap:12px;">
+                        <div class="section-title" style="font-weight:700; font-size:1rem; color:#0F172A; display:flex; align-items:center; gap:8px; margin-bottom:0;">
+                            <span style="color:#7C3AED; font-size:1.2rem;">●</span> Historique — transferts &amp; soldes
+                        </div>
+                        <div class="section-actions" style="display:flex; align-items:center; gap:10px; margin-left:auto;">
+                            <button type="button" id="history-tab-transferts" class="chart-mode-btn active">🔄 Transferts</button>
+                            <button type="button" id="history-tab-soldes" class="chart-mode-btn">🏷️ Soldes</button>
+                            <button id="btn-export-history" class="btn-transfer-open" title="Exporter l'historique affiché en CSV" style="padding:4px 10px;font-size:0.78rem;">📄 CSV</button>
+                        </div>
+                    </div>
+                    <div id="history-summary" style="font-size:0.85rem; color:#64748B; margin-bottom:10px;"></div>
+                    <div style="max-height:45vh; overflow:auto;">
+                        <table class="stock-table" style="width:100%; border-collapse:collapse;">
+                            <thead>
+                                <tr id="history-thead-row" style="border-bottom:1px solid #F1F5F9; text-align:left; background:#F8FAFC; position:sticky; top:0; z-index:5;"></tr>
+                            </thead>
+                            <tbody id="history-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
             </div><!-- /container -->
 
             <div id="loading-overlay">
@@ -1488,6 +1549,7 @@
 
                     <div class="detail-header">
                         <img id="detail-image" src="" alt="Image produit" style="display:none"/>
+                        <div id="detail-image-missing" style="display:none; width:96px; height:96px; border-radius:10px; border:1px dashed #CBD5E1; background:#F8FAFC; color:#94A3B8; font-size:0.7rem; font-weight:600; text-align:center; line-height:1.2; align-items:center; justify-content:center; padding:6px;">Aucune photo</div>
                         <div class="detail-title-block">
                             <h2 id="detail-name">Produit</h2>
                             <div class="detail-meta">
@@ -1496,7 +1558,7 @@
                                 <span id="detail-family" class="detail-badge">—</span>
                             </div>
                         </div>
-                        <button id="btn-export-detail" class="btn-transfer-open" title="Exporter cette fiche produit en CSV">📄 Exporter CSV</button>
+                        <button id="btn-export-detail" class="btn-transfer-open" title="Exporter cette fiche produit en Excel (.xlsx), photo incrustée">📊 Exporter Excel</button>
                         <button id="btn-open-transfer" class="btn-transfer-open" title="Proposer un transfert inter-magasins">🔄 Transférer</button>
                     </div>
 
@@ -1560,10 +1622,11 @@
                     </div>
 
                     <div class="detail-section">
-                        <h3>🏪 Stock par Magasin (Achats)</h3>
+                        <h3>🏪 Dispatch par Société / Magasin (Achats) — du plus dispatché au moins dispatché</h3>
                         <table>
                             <thead>
                                 <tr>
+                                    <th>Société</th>
                                     <th>Magasin</th>
                                     <th>Qté Dispatché</th>
                                     <th>Stock</th>
@@ -1824,6 +1887,7 @@
                             <span>💤</span> Stock dormant (aucune vente depuis 90 jours)
                             <span id="dormant-count-badge" style="background:#FEF3C7; color:#92400E; font-weight:700; font-size:0.8rem; padding:3px 10px; border-radius:12px;">0</span>
                         </h3>
+                        <button id="btn-export-dormant" class="btn-transfer-open" title="Exporter le stock dormant en Excel (.xlsx), photos incrustées" style="padding:4px 10px;font-size:0.78rem;">📊 Excel</button>
                     </div>
                     <div style="margin-bottom:16px;">
                         <input type="text" id="search-dormant-input" placeholder="🔍 Rechercher une référence ou un nom..." style="width:100%; padding:10px 14px; border:1px solid #CBD5E1; border-radius:8px; font-size:0.9rem; outline:none; background:#F8FAFC; color:#0F172A; font-weight:500;"/>
@@ -1844,6 +1908,87 @@
                 </div>
             </div>
 
+
+            <!-- ══════════════════════════════════════════════════════
+                 VALORISATION — DÉTAIL PAR MAGASIN D'UNE SOCIÉTÉ
+                 Ouvert au clic sur une ligne du tableau de valorisation.
+            ═══════════════════════════════════════════════════════ -->
+            <div id="valorisation-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-valorisation-btn" title="Fermer">✕</button>
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding-right:30px;">
+                        <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700; display:flex; align-items:center; gap:8px;">
+                            <span>💵</span> Valorisation — <span id="valorisation-company-name">société</span>
+                        </h3>
+                    </div>
+                    <div id="valorisation-summary" style="font-size:0.85rem; color:#64748B; margin-bottom:12px;"></div>
+                    <div style="max-height:55vh; overflow-y:auto;">
+                        <table style="width:100%; border-collapse:collapse;">
+                            <thead>
+                                <tr style="border-bottom:2px solid #E2E8F0; text-align:left; background:#F1F5F9; position:sticky; top:0; z-index:10;">
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Magasin</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Qté</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">Valeur HT</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">Valeur au coût</th>
+                                </tr>
+                            </thead>
+                            <tbody id="valorisation-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ══════════════════════════════════════════════════════
+                 ÉCARTS D'INVENTAIRE — LISTE DES RÉFÉRENCES EN NÉGATIF
+            ═══════════════════════════════════════════════════════ -->
+            <div id="ecarts-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-ecarts-btn" title="Fermer">✕</button>
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; padding-right:30px;">
+                        <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700; display:flex; align-items:center; gap:8px;">
+                            <span>⚠️</span> Écarts d'inventaire détectés
+                            <span id="ecarts-count-badge" style="background:#FEE2E2; color:#991B1B; font-weight:700; font-size:0.8rem; padding:3px 10px; border-radius:12px;">0</span>
+                        </h3>
+                    </div>
+                    <p style="font-size:0.82rem; color:#64748B; margin:0 0 12px 0; line-height:1.5;">
+                        Chaque ligne est une référence dont le stock est <strong>négatif</strong> dans un magasin :
+                        Odoo y a enregistré plus de sorties que d'entrées. Cliquez une ligne pour voir d'où
+                        viennent les pièces sorties — réception fournisseur, transfert entre magasins,
+                        ajustement d'inventaire, vente au prix catalogue ou vente en solde.
+                    </p>
+                    <div style="margin-bottom:16px;">
+                        <input type="text" id="search-ecarts-input" placeholder="🔍 Rechercher une référence, un produit ou un magasin..." style="width:100%; padding:10px 14px; border:1px solid #CBD5E1; border-radius:8px; font-size:0.9rem; outline:none; background:#F8FAFC; color:#0F172A; font-weight:500;"/>
+                    </div>
+                    <div style="max-height:50vh; overflow-y:auto;">
+                        <table style="width:100%; border-collapse:collapse;">
+                            <thead>
+                                <tr style="border-bottom:2px solid #E2E8F0; text-align:left; background:#F1F5F9; position:sticky; top:0; z-index:10;">
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Réf</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Produit</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Société</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Magasin</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Manque</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ecarts-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ══════════════════════════════════════════════════════
+                 ÉCART D'INVENTAIRE — EXPLICATION D'UNE RÉFÉRENCE
+            ═══════════════════════════════════════════════════════ -->
+            <div id="ecart-detail-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-ecart-detail-btn" title="Fermer">✕</button>
+                    <h3 style="margin:0 30px 4px 0; color:#0F172A; font-size:1.2rem; font-weight:700;">
+                        🔎 D'où vient le manque ?
+                    </h3>
+                    <div id="ecart-detail-header" style="font-size:0.9rem; color:#334155; margin-bottom:14px;"></div>
+                    <div id="ecart-detail-body" style="max-height:60vh; overflow-y:auto;"></div>
+                </div>
+            </div>
             <script t-attf-src="/mavie_dashboard/static/src/js/dashboard.js?v=#{js_version}"></script>
         </body>
     </html>

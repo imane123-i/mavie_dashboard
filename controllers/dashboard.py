@@ -340,6 +340,54 @@ class MaVieDashboardController(http.Controller):
         base = request.env['ir.config_parameter'].sudo().get_param('web.base.url') or ''
         return base.rstrip('/') + path
 
+    # ─────────────────────────────────────────────────────────────
+    # PRIX AFFICHÉS EN TTC
+    #
+    # DÉCISION UTILISATEUR (2026-08-29) : « le client ne va pas payer
+    # seulement 186,75, il va payer 224,10 ». Les listes de soldes
+    # affichaient le prix catalogue et le prix payé en HT (price_unit,
+    # list_price) à côté d'un CA encaissé en TTC (price_subtotal_incl) —
+    # trois colonnes, deux bases différentes, et un prix qui ne correspondait
+    # à rien de ce qu'un responsable magasin voit au comptoir.
+    #
+    # Aucune taxe n'est recalculée ici : Odoo stocke déjà le montant TTC de
+    # chaque ligne. On lit ce montant, et on en déduit le taux réellement
+    # appliqué à CETTE ligne (price_subtotal_incl / price_subtotal) plutôt
+    # que de coder un 20 % en dur — vérifié en base, 358 876 lignes sont à
+    # 20 % mais 2 796 lignes sont sans taxe.
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ttc_ratio(subtotal_ht, subtotal_incl):
+        """Coefficient TTC/HT réellement appliqué ; 1.0 si indéterminable."""
+        try:
+            ht = float(subtotal_ht or 0.0)
+            incl = float(subtotal_incl or 0.0)
+        except (TypeError, ValueError):
+            return 1.0
+        if not ht:
+            return 1.0
+        ratio = incl / ht
+        # Un ratio aberrant (données incohérentes) ne doit pas gonfler un
+        # prix affiché : on retombe alors sur "pas de conversion".
+        return ratio if 0.5 <= ratio <= 2.0 else 1.0
+
+    @staticmethod
+    def _unit_price_ttc(subtotal_incl, qty):
+        """Prix unitaire TTC = montant encaissé / quantité.
+
+        Passe par le montant déjà calculé par Odoo plutôt que par price_unit
+        (HT) : exact, et valable aussi pour un retour (quantité négative et
+        montant négatif se compensent).
+        """
+        try:
+            qty = float(qty or 0.0)
+            if not qty:
+                return 0.0
+            return float(subtotal_incl or 0.0) / qty
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0.0
+
     def _get_sachet_variant_ids(self):
         """Variantes (product.product) de la collection Sachet.
 
@@ -1168,8 +1216,7 @@ class MaVieDashboardController(http.Controller):
                            SUM(pol.qty) AS qty_solde,
                            SUM(pol.price_subtotal_incl) AS ca_solde,
                            MAX(pt.list_price) AS list_price,
-                           SUM(pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0) * pol.qty)
-                               / NULLIF(SUM(pol.qty), 0) AS prix_moyen_paye
+                           SUM(pol.price_subtotal) AS sous_total_ht
                     FROM pos_order_line pol
                     JOIN product_product pp ON pp.id = pol.product_id
                     JOIN product_template pt ON pt.id = pp.product_tmpl_id
@@ -1186,10 +1233,13 @@ class MaVieDashboardController(http.Controller):
                         ['name', 'default_code', 'base_pivot_reference']
                     )
                     solde_tmpl_by_id = {t['id']: t for t in solde_tmpl_data}
-                    for tid, qty_s, ca_s, lp, prix_moyen in solde_rows:
+                    for tid, qty_s, ca_s, lp, sous_total_ht in solde_rows:
                         t = solde_tmpl_by_id.get(tid, {})
-                        lp = lp or 0.0
-                        prix_moyen = prix_moyen or 0.0
+                        # Prix en TTC : même base que le CA encaissé affiché
+                        # à côté, et que ce que le client règle en caisse.
+                        ratio = self._ttc_ratio(sous_total_ht, ca_s)
+                        lp = (lp or 0.0) * ratio
+                        prix_moyen = self._unit_price_ttc(ca_s, qty_s)
                         soldes_products.append({
                             'id': tid,
                             'name': t.get('name') or '—',
@@ -2833,11 +2883,13 @@ class MaVieDashboardController(http.Controller):
             for pol in po_lines:
                 purchased_by_variant[pol.product_id.id] = purchased_by_variant.get(pol.product_id.id, 0) + pol.product_qty
 
-            best_variants = []
+            by_color = {}
             for v in product_variants:
                 stat = sales_by_variant.get(v.id, {'qty': 0, 'ca': 0, 'shops': {}})
 
-                color_name, size_name = resolve_variant_color_size(v)
+                # La pointure n'est plus lue ici : ce tableau agrège par
+                # couleur (voir plus bas).
+                color_name = resolve_variant_color_size(v)[0]
                 color_name = (color_name or '—').upper().strip() if color_name else '—'
 
                 dispatched_achats = purchased_by_variant.get(v.id, 0)
@@ -2858,32 +2910,59 @@ class MaVieDashboardController(http.Controller):
                 ])
                 var_stock = int(sum(quants_v.mapped('quantity'))) if quants_v else 0
 
-                # Pas de fallback silencieux "dispatched = var_stock" : si
-                # aucune commande fournisseur n'a de donnée pour cette
-                # variante, on le signale explicitement (dispatch_missing)
+                # DEMANDE UTILISATEUR (2026-08-24) : ce tableau s'appelle
+                # "Variantes Couleurs" et doit lister des COULEURS, pas des
+                # couples couleur+pointure. On agrège donc les pointures
+                # d'une même couleur (plus de lignes "KAKI, 38" / "KAKI, 39"
+                # / "KAKI, 40" séparées). La pointure reste disponible là où
+                # elle a du sens : le détail par couleur et la matrice de
+                # transfert la résolvent eux-mêmes, variante par variante.
+                #
+                # Pas de fallback silencieux "dispatché = stock" : quand
+                # aucune commande fournisseur ne couvre la couleur, on le
+                # signale (dispatch_missing, calculé après agrégation)
                 # plutôt que de fabriquer un "total pièces" à partir du stock
-                # actuel, qui masquait le vrai problème de données.
-                dispatch_missing = dispatched == 0 and (var_stock > 0 or stat['qty'] > 0)
+                # actuel, ce qui masquait le vrai problème de données.
+                color_label = color_name if color_name != '—' else 'Standard'
 
-                # Nom court : juste la couleur (+ taille si présente), sans le
-                # préfixe "[réf] nom produit" de display_name — la référence
-                # est déjà affichée en en-tête de la fiche produit.
-                variant_label = color_name if color_name != '—' else 'Standard'
-                if size_name:
-                    variant_label += ', ' + size_name
+                entry = by_color.get(color_label)
+                if entry is None:
+                    entry = {
+                        'name': color_label,
+                        'color': color_name,
+                        'qty': 0,
+                        'ca': 0.0,
+                        'dispatched': 0,
+                        'dispatch_source': None,
+                        'dispatch_missing': False,
+                        'stock': 0,
+                        'stock_shop': 0 if kw.get('shop_field') else None,
+                        'shops': {},
+                    }
+                    by_color[color_label] = entry
 
-                best_variants.append({
-                    'name': variant_label,
-                    'color': color_name,
-                    'qty': int(stat['qty']),
-                    'ca': round(stat['ca'], 2),
-                    'dispatched': dispatched,
-                    'dispatch_source': dispatch_source,
-                    'dispatch_missing': dispatch_missing,
-                    'stock': var_stock,
-                    'stock_shop': int(stock_shop_by_variant.get(v.id, 0)) if kw.get('shop_field') else None,
-                    'shops': stat['shops']
-                })
+                entry['qty'] += int(stat['qty'])
+                entry['ca'] += stat['ca']
+                entry['dispatched'] += dispatched
+                if dispatch_source:
+                    entry['dispatch_source'] = dispatch_source
+                entry['stock'] += var_stock
+                if kw.get('shop_field'):
+                    entry['stock_shop'] += int(stock_shop_by_variant.get(v.id, 0))
+                for shop_name, shop_qty in (stat['shops'] or {}).items():
+                    entry['shops'][shop_name] = entry['shops'].get(shop_name, 0) + shop_qty
+
+            # `dispatch_missing` se juge sur la couleur entière, pas pointure
+            # par pointure : une couleur reçue en commande fournisseur n'a
+            # pas de donnée manquante, même si une pointure isolée n'y figure
+            # pas.
+            best_variants = []
+            for entry in by_color.values():
+                entry['ca'] = round(entry['ca'], 2)
+                entry['dispatch_missing'] = (
+                    entry['dispatched'] == 0 and (entry['stock'] > 0 or entry['qty'] > 0)
+                )
+                best_variants.append(entry)
 
             # "Total Pièces"/"Reste" ne sont indisponibles que si aucune
             # commande fournisseur confirmée n'a de donnée pour AUCUNE
@@ -4340,7 +4419,7 @@ class MaVieDashboardController(http.Controller):
                    pt.name->>'en_US' AS produit,
                    pol.qty,
                    pt.list_price,
-                   pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0) AS prix_paye,
+                   pol.price_subtotal,
                    pol.price_subtotal_incl
             FROM pos_order_line pol
             JOIN pos_order po ON po.id = pol.order_id
@@ -4357,9 +4436,12 @@ class MaVieDashboardController(http.Controller):
 
         rows = []
         for (date_order, ticket, magasin, tmpl_id, ref, produit,
-             qty, list_price, prix_paye, ca) in request.env.cr.fetchall():
-            list_price = float(list_price or 0.0)
-            prix_paye = float(prix_paye or 0.0)
+             qty, list_price, sous_total_ht, ca) in request.env.cr.fetchall():
+            # Prix affichés en TTC : c'est ce que le client paie réellement
+            # au comptoir, et c'est déjà la base du CA encaissé.
+            ratio = self._ttc_ratio(sous_total_ht, ca)
+            catalogue_ttc = float(list_price or 0.0) * ratio
+            paye_ttc = self._unit_price_ttc(ca, qty)
             rows.append({
                 'id': tmpl_id,
                 'date': str(date_order)[:16] if date_order else '—',
@@ -4368,9 +4450,12 @@ class MaVieDashboardController(http.Controller):
                 'ref': ref or '—',
                 'name': produit or '—',
                 'qty': int(qty or 0),
-                'prix_catalogue': round(list_price, 2),
-                'prix_paye': round(prix_paye, 2),
-                'remise_pct': round((list_price - prix_paye) / list_price * 100, 1) if list_price > 0 else 0.0,
+                'prix_catalogue': round(catalogue_ttc, 2),
+                'prix_paye': round(paye_ttc, 2),
+                'remise_pct': (
+                    round((catalogue_ttc - paye_ttc) / catalogue_ttc * 100, 1)
+                    if catalogue_ttc > 0 else 0.0
+                ),
                 'ca': round(float(ca or 0.0), 2),
             })
         return rows
@@ -4405,7 +4490,7 @@ class MaVieDashboardController(http.Controller):
                 writer.writerow(['Historique des ventes en solde'])
                 writer.writerow([])
                 writer.writerow(['Date', 'Ticket', 'Magasin', 'Réf', 'Produit', 'Qté',
-                                 'Prix catalogue', 'Prix payé', 'Remise (%)', 'CA encaissé (TTC)'])
+                                 'Prix catalogue (TTC)', 'Prix payé (TTC)', 'Remise (%)', 'CA encaissé (TTC)'])
                 for row in self._solde_history_rows(kw):
                     writer.writerow([
                         row['date'], row['ticket'], row['magasin'], row['ref'], row['name'],
@@ -4443,3 +4528,167 @@ class MaVieDashboardController(http.Controller):
                 ('Content-Disposition', f'attachment; filename="{filename}"'),
             ],
         )
+
+
+    # ─────────────────────────────────────────────────────────────
+    # HISTORIQUE D'UNE RÉFÉRENCE (transferts + soldes)
+    #
+    # DEMANDE UTILISATEUR : depuis la fiche produit, un bouton qui montre
+    # tout ce qui a été fait sur CETTE référence — transferts et ventes en
+    # solde, avec la date, le magasin et l'état.
+    #
+    # Différence assumée avec la section "Historique" du tableau de bord :
+    # celle-ci ne liste que les transferts lancés depuis le dashboard
+    # (created_from_dashboard), pour repartir de zéro. Ici on veut au
+    # contraire l'histoire COMPLÈTE de la référence, quel que soit le canal
+    # par lequel le bon a été créé — c'est le sens de "tout ce qui est fait
+    # pour ce produit".
+    # ─────────────────────────────────────────────────────────────
+
+    @http.route('/mavie/api/product-history', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_product_history(self, **kw):
+        try:
+            product_tmpl_id = kw.get('article_id') or kw.get('product_tmpl_id')
+            if not product_tmpl_id:
+                return {'error': 'Référence manquante.', 'transfers': [], 'soldes': []}
+            product_tmpl_id = int(product_tmpl_id)
+
+            product_tmpl = request.env['product.template'].sudo().browse(product_tmpl_id)
+            if not product_tmpl.exists():
+                return {'error': 'Référence introuvable.', 'transfers': [], 'soldes': []}
+
+            # active_test=False : une variante archivée reste présente dans
+            # l'historique (un transfert passé la référence toujours).
+            variants = request.env['product.product'].sudo().with_context(
+                active_test=False
+            ).search([('product_tmpl_id', '=', product_tmpl_id)])
+            if not variants:
+                return {'transfers': [], 'soldes': [], 'ref': product_tmpl.default_code or ''}
+
+            # ── Transferts inter-magasins ──
+            state_labels = {
+                'draft': 'Brouillon',
+                'submitted': 'En attente de validation',
+                'done': 'Fait',
+            }
+            transfers = []
+            try:
+                lines = request.env['inter.internal.transfer.line'].sudo().search(
+                    [('product_id', 'in', variants.ids)], order='id desc', limit=500
+                )
+                # Le magasin réel (et non la société) est déjà résolu par les
+                # champs stockés emetteur_display / recepteur_display, ajoutés
+                # à inter.internal.transfer par ce module.
+                for line in lines:
+                    transfer = line.transfer_id
+                    if not transfer:
+                        continue
+                    color, size = resolve_variant_color_size(line.product_id)
+                    transfers.append({
+                        'transfer_id': transfer.id,
+                        'name': transfer.name,
+                        'date': str(transfer.create_date)[:16] if transfer.create_date else '—',
+                        'state': transfer.state,
+                        'state_label': state_labels.get(transfer.state, transfer.state),
+                        'source_magasin': transfer.emetteur_display or '—',
+                        'source_societe': transfer.company_source_id.name or '—',
+                        'dest_magasin': transfer.recepteur_display or '—',
+                        'dest_societe': transfer.company_target_id.name or '—',
+                        'intra_societe': transfer.company_source_id.id == transfer.company_target_id.id,
+                        'depuis_dashboard': bool(transfer.created_from_dashboard),
+                        'couleur': (color or '—').upper() if color else '—',
+                        'taille': size or '—',
+                        'qty': int(line.quantity or 0),
+                    })
+            except Exception as e:
+                _logger.warning("Historique transferts indisponible pour %s: %s", product_tmpl_id, e)
+
+            # ── Ventes en solde (sous le prix catalogue) ──
+            # Même critère que le compteur "articles vendus en solde" du
+            # tableau de bord : prix réellement encaissé (remise déduite)
+            # strictement inférieur au prix catalogue.
+            soldes = []
+            request.env.cr.execute("""
+                SELECT po.date_order,
+                       po.name,
+                       pc.name AS magasin,
+                       rc.name AS societe,
+                       pol.product_id,
+                       pol.qty,
+                       pt.list_price,
+                       pol.price_subtotal,
+                       pol.price_subtotal_incl
+                FROM pos_order_line pol
+                JOIN pos_order po ON po.id = pol.order_id
+                JOIN pos_session ps ON ps.id = po.session_id
+                JOIN pos_config pc ON pc.id = ps.config_id
+                LEFT JOIN res_company rc ON rc.id = po.company_id
+                JOIN product_product pp ON pp.id = pol.product_id
+                JOIN product_template pt ON pt.id = pp.product_tmpl_id
+                WHERE pp.product_tmpl_id = %s
+                  AND po.state IN ('paid', 'done', 'invoiced')
+                  -- PIÈGE SQL : is_reward_line est NULL sur 417 249 lignes
+                  -- (vérifié en base) et seulement `false` sur 213.
+                  -- `= false` écarte donc les NULL et vidait complètement
+                  -- l'historique. Le domaine ORM ('is_reward_line','=',False)
+                  -- utilisé ailleurs, lui, couvre bien le cas NULL.
+                  AND pol.is_reward_line IS NOT TRUE
+                  AND pt.list_price > 0
+                  AND pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0) < pt.list_price * 0.999
+                ORDER BY po.date_order DESC
+                LIMIT 500
+            """, (product_tmpl_id,))
+
+            variant_by_id = {v.id: v for v in variants}
+            for (date_order, ticket, magasin, societe, pid, qty,
+                 list_price, sous_total_ht, ca) in request.env.cr.fetchall():
+                qty = int(qty or 0)
+                # Prix en TTC (décision utilisateur) : le montant que le
+                # client règle réellement, sur la même base que le CA.
+                ratio = self._ttc_ratio(sous_total_ht, ca)
+                list_price = float(list_price or 0.0) * ratio
+                prix_paye = self._unit_price_ttc(ca, qty)
+                variant = variant_by_id.get(pid)
+                color, size = resolve_variant_color_size(variant) if variant else (None, None)
+
+                # Un RETOUR (avoir) est encodé en caisse par une quantité ou
+                # un prix négatif. Le critère "prix encaissé < prix
+                # catalogue" l'attrape donc comme une vente en solde, avec
+                # une remise absurde (-233 % observé en base). On l'étiquette
+                # pour ce qu'il est plutôt que d'afficher un pourcentage qui
+                # n'a aucun sens.
+                est_retour = qty < 0 or prix_paye < 0
+                soldes.append({
+                    'date': str(date_order)[:16] if date_order else '—',
+                    'ticket': ticket or '—',
+                    'magasin': magasin or '—',
+                    'societe': societe or '—',
+                    'couleur': (color or '—').upper() if color else '—',
+                    'taille': size or '—',
+                    'qty': qty,
+                    'type': 'retour' if est_retour else 'solde',
+                    'prix_catalogue': round(list_price, 2),
+                    'prix_paye': round(prix_paye, 2),
+                    'remise_pct': (
+                        round((list_price - prix_paye) / list_price * 100, 1)
+                        if list_price > 0 and not est_retour else None
+                    ),
+                    'ca': round(float(ca or 0.0), 2),
+                })
+
+            return {
+                'ref': product_tmpl.base_pivot_reference or product_tmpl.default_code or product_tmpl.name,
+                'name': product_tmpl.name,
+                'transfers': transfers,
+                'transfers_count': len(transfers),
+                'transfers_qty': sum(t['qty'] for t in transfers),
+                'transfers_bons': len({t['transfer_id'] for t in transfers}),
+                'soldes': soldes,
+                'soldes_count': len(soldes),
+                'soldes_qty': sum(s['qty'] for s in soldes),
+                'soldes_ca': round(sum(s['ca'] for s in soldes), 2),
+                'retours_count': sum(1 for s in soldes if s['type'] == 'retour'),
+            }
+        except Exception as e:
+            _logger.error(f"Erreur api_product_history: {str(e)}", exc_info=True)
+            return {'error': str(e), 'transfers': [], 'soldes': []}

@@ -959,6 +959,7 @@
                     animation: fadeInOverlay 0.22s ease;
                 }
 
+                #product-history-overlay,
                 #valorisation-overlay,
                 #ecarts-overlay,
                 #ecart-detail-overlay {
@@ -977,6 +978,7 @@
                    paraît ne pas s'ouvrir. */
                 #ecart-detail-overlay { z-index: 9700; }
 
+                #product-history-overlay.active,
                 #valorisation-overlay.active,
                 #ecarts-overlay.active,
                 #ecart-detail-overlay.active {
@@ -1558,6 +1560,7 @@
                                 <span id="detail-family" class="detail-badge">—</span>
                             </div>
                         </div>
+                        <button id="btn-product-history" class="btn-transfer-open" title="Tout l'historique de cette référence : transferts et ventes en solde (date, magasin, état)">📜 Historique</button>
                         <button id="btn-export-detail" class="btn-transfer-open" title="Exporter cette fiche produit en Excel (.xlsx), photo incrustée">📊 Exporter Excel</button>
                         <button id="btn-open-transfer" class="btn-transfer-open" title="Proposer un transfert inter-magasins">🔄 Transférer</button>
                     </div>
@@ -1867,8 +1870,8 @@
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Réf</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Désignation / Article</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Qté en solde</th>
-                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">Prix catalogue</th>
-                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">Prix moyen payé</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">Prix catalogue (TTC)</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">Prix moyen payé (TTC)</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Remise</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">CA en solde</th>
                                 </tr>
@@ -1987,6 +1990,37 @@
                     </h3>
                     <div id="ecart-detail-header" style="font-size:0.9rem; color:#334155; margin-bottom:14px;"></div>
                     <div id="ecart-detail-body" style="max-height:60vh; overflow-y:auto;"></div>
+                </div>
+            </div>
+
+            <!-- ══════════════════════════════════════════════════════
+                 HISTORIQUE D'UNE RÉFÉRENCE — transferts & soldes
+                 Ouvert par le bouton "Historique" de la fiche produit.
+                 Contrairement à la section Historique du tableau de bord,
+                 celle-ci montre TOUS les transferts de la référence, quel
+                 que soit le canal de création.
+            ═══════════════════════════════════════════════════════ -->
+            <div id="product-history-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-product-history-btn" title="Fermer">✕</button>
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; padding-right:30px; flex-wrap:wrap; gap:10px;">
+                        <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700; display:flex; align-items:center; gap:8px;">
+                            <span>📜</span> Historique — <span id="product-history-ref">référence</span>
+                        </h3>
+                        <div style="display:flex; align-items:center; gap:8px; margin-left:auto;">
+                            <button type="button" id="product-history-tab-transferts" class="chart-mode-btn active">🔄 Transferts</button>
+                            <button type="button" id="product-history-tab-soldes" class="chart-mode-btn">🏷️ Soldes</button>
+                        </div>
+                    </div>
+                    <div id="product-history-summary" style="font-size:0.85rem; color:#64748B; margin-bottom:12px;"></div>
+                    <div style="max-height:60vh; overflow:auto;">
+                        <table style="width:100%; border-collapse:collapse;">
+                            <thead>
+                                <tr id="product-history-thead-row" style="border-bottom:2px solid #E2E8F0; text-align:left; background:#F1F5F9; position:sticky; top:0; z-index:10;"></tr>
+                            </thead>
+                            <tbody id="product-history-tbody"></tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
             <script t-attf-src="/mavie_dashboard/static/src/js/dashboard.js?v=#{js_version}"></script>

@@ -83,6 +83,9 @@ var lastEcartsList = [];
 // Historique transferts / soldes affiché sous les cartes.
 var lastHistory = { transfers: [], soldes: [] };
 var historyTab = 'transferts';
+// Historique d'UNE référence, ouvert depuis la fiche produit.
+var lastProductHistory = { transfers: [], soldes: [] };
+var productHistoryTab = 'transferts';
 var _searchDebounce = null;
 
 // ── Anti-réponse-périmée ──────────────────────────────────────────────
@@ -94,7 +97,7 @@ var _searchDebounce = null;
 // résultat correct. D'où le "parfois ça marche, parfois non".
 // On numérote chaque appel et on ignore toute réponse qui n'est plus la
 // dernière demandée.
-var _reqSeq = { kpis: 0, salesDaily: 0, history: 0 };
+var _reqSeq = { kpis: 0, salesDaily: 0, history: 0, productHistory: 0 };
 
 function el(id) { return document.getElementById(id); }
 
@@ -1494,6 +1497,10 @@ function _renderVerification(verification) {
 function closeDetail() {
     var overlay = el('detail-overlay');
     if (overlay) overlay.classList.remove('active');
+    // L'historique s'ouvre par-dessus la fiche : le laisser ouvert alors que
+    // sa fiche a disparu le rendrait orphelin (et il porte encore l'ancienne
+    // référence).
+    closeProductHistory();
     state.detail.article_id = null;
 }
 
@@ -2984,7 +2991,7 @@ function _renderHistory() {
     tbody.innerHTML = '';
 
     var columns = historyTab === 'soldes'
-        ? ['Date', 'Ticket', 'Magasin', 'Réf', 'Produit', 'Qté', 'Prix catalogue', 'Prix payé', 'Remise', 'CA encaissé']
+        ? ['Date', 'Ticket', 'Magasin', 'Réf', 'Produit', 'Qté', 'Prix catalogue (TTC)', 'Prix payé (TTC)', 'Remise', 'CA encaissé (TTC)']
         : ['Bon', 'Date', 'État', 'Société source', 'Magasin source', 'Société cible', 'Magasin cible',
            'Type', 'Réf.', 'Qté'];
     columns.forEach(function(label) {
@@ -3087,6 +3094,179 @@ function _buildExportParams(extra) {
     return params;
 }
 // ═══════════════════════════════════════════════════════════
+// HISTORIQUE D'UNE RÉFÉRENCE — transferts & soldes
+//
+// Ouvert depuis la fiche produit. Montre TOUS les transferts de la
+// référence, y compris ceux créés hors dashboard — contrairement à la
+// section Historique du tableau de bord, volontairement limitée aux bons
+// lancés depuis le dashboard.
+// ═══════════════════════════════════════════════════════════
+async function openProductHistory() {
+    if (!state.detail.article_id) return;
+    var overlay = el('product-history-overlay');
+    if (!overlay) return;
+
+    productHistoryTab = 'transferts';
+    _syncProductHistoryTabs();
+    overlay.classList.add('active');
+
+    var refEl = el('product-history-ref');
+    if (refEl) refEl.textContent = '…';
+    var summaryEl = el('product-history-summary');
+    if (summaryEl) summaryEl.textContent = 'Chargement de l\'historique…';
+    var tbody = el('product-history-tbody');
+    if (tbody) tbody.innerHTML = '';
+
+    var seq = ++_reqSeq.productHistory;
+    var data = await rpc('/mavie/api/product-history', { article_id: state.detail.article_id });
+    if (seq !== _reqSeq.productHistory) return;
+
+    if (!data || data.error) {
+        if (summaryEl) summaryEl.textContent = 'Erreur : ' + ((data && data.error) || 'inconnue');
+        return;
+    }
+    lastProductHistory = data;
+    if (refEl) refEl.textContent = data.ref || '';
+    _renderProductHistory();
+}
+
+function closeProductHistory() {
+    var overlay = el('product-history-overlay');
+    if (overlay) overlay.classList.remove('active');
+}
+
+function _syncProductHistoryTabs() {
+    var tabT = el('product-history-tab-transferts');
+    var tabS = el('product-history-tab-soldes');
+    if (tabT) tabT.classList.toggle('active', productHistoryTab === 'transferts');
+    if (tabS) tabS.classList.toggle('active', productHistoryTab === 'soldes');
+}
+
+function setProductHistoryTab(tab) {
+    productHistoryTab = tab;
+    _syncProductHistoryTabs();
+    _renderProductHistory();
+}
+
+function _renderProductHistory() {
+    var theadRow = el('product-history-thead-row');
+    var tbody = el('product-history-tbody');
+    var summaryEl = el('product-history-summary');
+    if (!theadRow || !tbody) return;
+
+    theadRow.innerHTML = '';
+    tbody.innerHTML = '';
+
+    var isSoldes = productHistoryTab === 'soldes';
+    var columns = isSoldes
+        ? ['Date', 'Ticket', 'Magasin', 'Couleur', 'Taille', 'Qté',
+           'Prix catalogue (TTC)', 'Prix payé (TTC)', 'Remise', 'CA encaissé (TTC)']
+        : ['Bon', 'Date', 'État', 'Origine', 'Magasin source', 'Magasin cible',
+           'Couleur', 'Taille', 'Qté'];
+    columns.forEach(function(label) {
+        var th = document.createElement('th');
+        th.textContent = label;
+        th.style.cssText = 'padding:10px 8px;font-size:0.72rem;font-weight:700;'
+            + 'color:#475569;text-transform:uppercase;';
+        theadRow.appendChild(th);
+    });
+
+    var data = lastProductHistory || {};
+    var rows = isSoldes ? (data.soldes || []) : (data.transfers || []);
+
+    if (summaryEl) {
+        summaryEl.textContent = isSoldes
+            ? formatNumber(data.soldes_count || 0) + ' ligne(s) sous le prix catalogue · '
+              + formatNumber(data.soldes_qty || 0) + ' pièces · '
+              + formatMAD(data.soldes_ca || 0) + ' encaissés'
+              + (data.retours_count
+                 ? ' · dont ' + formatNumber(data.retours_count) + ' retour(s) client'
+                 : '')
+            : formatNumber(data.transfers_bons || 0) + ' bon(s) de transfert · '
+              + formatNumber(data.transfers_count || 0) + ' ligne(s) · '
+              + formatNumber(data.transfers_qty || 0) + ' pièces déplacées';
+    }
+
+    if (!rows.length) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = columns.length;
+        td.textContent = isSoldes
+            ? 'Cette référence n\'a jamais été vendue en solde.'
+            : 'Cette référence n\'a jamais fait l\'objet d\'un transfert.';
+        td.style.cssText = 'text-align:center;padding:24px;color:#94A3B8;';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    function cell(text, color, weight, align) {
+        var td = document.createElement('td');
+        td.textContent = text;
+        td.style.padding = '9px 8px';
+        td.style.fontSize = '0.84rem';
+        if (color) td.style.color = color;
+        if (weight) td.style.fontWeight = weight;
+        if (align) td.style.textAlign = align;
+        return td;
+    }
+
+    rows.forEach(function(r) {
+        var tr = document.createElement('tr');
+        tr.style.borderBottom = '1px solid #F1F5F9';
+
+        if (isSoldes) {
+            var estRetour = r.type === 'retour';
+            if (estRetour) tr.style.background = '#FFF7ED';
+            tr.appendChild(cell(r.date, '#64748B'));
+            tr.appendChild(cell(r.ticket, '#64748B'));
+            tr.appendChild(cell(r.magasin, '#0F172A', '600'));
+            tr.appendChild(cell(r.couleur));
+            tr.appendChild(cell(r.taille, '#64748B'));
+            tr.appendChild(cell(formatNumber(r.qty), estRetour ? '#EA580C' : null, '700', 'center'));
+            tr.appendChild(cell(formatMAD(r.prix_catalogue), '#64748B', null, 'right'));
+            tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
+            // Un retour n'a pas de "remise" : afficher un pourcentage ici
+            // donnait des valeurs absurdes (-233 % relevé en base).
+            var remiseCell = estRetour
+                ? cell('Retour', '#EA580C', '700', 'center')
+                : cell('-' + (r.remise_pct || 0).toFixed(1).replace('.', ',') + ' %',
+                       '#DC2626', '700', 'center');
+            if (estRetour) {
+                remiseCell.title = 'Avoir / retour client : quantité ou prix négatif en caisse. '
+                    + 'Ce n\'est pas une vente en solde.';
+            }
+            tr.appendChild(remiseCell);
+            tr.appendChild(cell(formatMAD(r.ca), null, null, 'right'));
+        } else {
+            var stateColor = r.state === 'done' ? '#10B981'
+                : (r.state === 'submitted' ? '#F59E0B' : '#94A3B8');
+            tr.appendChild(cell(r.name, '#0F172A', '700'));
+            tr.appendChild(cell(r.date, '#64748B'));
+            tr.appendChild(cell(r.state_label, stateColor, '600'));
+            // D'où vient le bon : le dashboard, ou le formulaire Odoo.
+            var origine = cell(r.depuis_dashboard ? 'Dashboard' : 'Odoo',
+                               r.depuis_dashboard ? '#7C3AED' : '#94A3B8');
+            origine.title = r.intra_societe
+                ? 'Transfert au sein d\'une même société'
+                : 'Transfert entre deux sociétés (' + r.source_societe + ' → ' + r.dest_societe + ')';
+            tr.appendChild(origine);
+            var src = cell(r.source_magasin, '#0F172A', '600');
+            src.title = r.source_societe;
+            tr.appendChild(src);
+            var dst = cell(r.dest_magasin, '#0F172A', '600');
+            dst.title = r.dest_societe;
+            tr.appendChild(dst);
+            tr.appendChild(cell(r.couleur));
+            tr.appendChild(cell(r.taille, '#64748B'));
+            tr.appendChild(cell(formatNumber(r.qty), null, '700', 'center'));
+        }
+
+        tbody.appendChild(tr);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════
 // EVENT LISTENERS
 // ═══════════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', function() {
@@ -3186,6 +3366,29 @@ document.addEventListener('DOMContentLoaded', function() {
             var nameEl = el('detail-name');
             openTransferPanel(state.detail.article_id, nameEl ? nameEl.textContent : '');
         });
+    }
+
+    // ── Historique d'une référence (bouton de la fiche produit) ──
+    var productHistoryBtn = el('btn-product-history');
+    if (productHistoryBtn) productHistoryBtn.addEventListener('click', openProductHistory);
+
+    var closeProductHistoryBtn = el('close-product-history-btn');
+    if (closeProductHistoryBtn) closeProductHistoryBtn.addEventListener('click', closeProductHistory);
+
+    var productHistoryOverlay = el('product-history-overlay');
+    if (productHistoryOverlay) {
+        productHistoryOverlay.addEventListener('click', function(e) {
+            if (e.target === productHistoryOverlay) closeProductHistory();
+        });
+    }
+
+    var prodHistTabT = el('product-history-tab-transferts');
+    if (prodHistTabT) {
+        prodHistTabT.addEventListener('click', function() { setProductHistoryTab('transferts'); });
+    }
+    var prodHistTabS = el('product-history-tab-soldes');
+    if (prodHistTabS) {
+        prodHistTabS.addEventListener('click', function() { setProductHistoryTab('soldes'); });
     }
 
     var exportDetailBtn = el('btn-export-detail');

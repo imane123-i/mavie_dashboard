@@ -2990,8 +2990,12 @@ function _renderHistory() {
     theadRow.innerHTML = '';
     tbody.innerHTML = '';
 
+    // Même ordre que le pop-up historique d'une référence : catalogue,
+    // remise, prix payé. "CA encaissé" retiré de l'écran — le total reste
+    // dans le résumé au-dessus et dans l'export CSV.
     var columns = historyTab === 'soldes'
-        ? ['Date', 'Ticket', 'Magasin', 'Réf', 'Produit', 'Qté', 'Prix catalogue (TTC)', 'Prix payé (TTC)', 'Remise', 'CA encaissé (TTC)']
+        ? ['Date', 'Ticket', 'Magasin', 'Réf', 'Produit', 'Qté',
+           'Prix catalogue (TTC)', 'Remise', 'Prix payé (TTC)']
         : ['Bon', 'Date', 'État', 'Société source', 'Magasin source', 'Société cible', 'Magasin cible',
            'Type', 'Réf.', 'Qté'];
     columns.forEach(function(label) {
@@ -3056,10 +3060,9 @@ function _renderHistory() {
             tr.appendChild(cell(r.name, '#0F172A', '600'));
             tr.appendChild(cell(formatNumber(r.qty), null, '700', 'center'));
             tr.appendChild(cell(formatMAD(r.prix_catalogue), '#64748B', null, 'right'));
-            tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
             tr.appendChild(cell('-' + (r.remise_pct || 0).toFixed(1).replace('.', ',') + ' %',
                                 '#DC2626', '700', 'center'));
-            tr.appendChild(cell(formatMAD(r.ca), null, null, 'right'));
+            tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
         } else {
             var stateColor = r.state === 'done' ? '#10B981'
                 : (r.state === 'submitted' ? '#F59E0B' : '#94A3B8');
@@ -3158,9 +3161,12 @@ function _renderProductHistory() {
     tbody.innerHTML = '';
 
     var isSoldes = productHistoryTab === 'soldes';
+    // Ordre demandé : le prix catalogue, la remise appliquée, puis le prix
+    // réellement payé — on lit la démarque de gauche à droite. La colonne
+    // "CA encaissé" a été retirée : son total reste dans le résumé au-dessus.
     var columns = isSoldes
         ? ['Date', 'Ticket', 'Magasin', 'Couleur', 'Taille', 'Qté',
-           'Prix catalogue (TTC)', 'Prix payé (TTC)', 'Remise', 'CA encaissé (TTC)']
+           'Prix catalogue (TTC)', 'Remise', 'Prix payé (TTC)']
         : ['Bon', 'Date', 'État', 'Origine', 'Magasin source', 'Magasin cible',
            'Couleur', 'Taille', 'Qté'];
     columns.forEach(function(label) {
@@ -3225,7 +3231,6 @@ function _renderProductHistory() {
             tr.appendChild(cell(r.taille, '#64748B'));
             tr.appendChild(cell(formatNumber(r.qty), estRetour ? '#EA580C' : null, '700', 'center'));
             tr.appendChild(cell(formatMAD(r.prix_catalogue), '#64748B', null, 'right'));
-            tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
             // Un retour n'a pas de "remise" : afficher un pourcentage ici
             // donnait des valeurs absurdes (-233 % relevé en base).
             var remiseCell = estRetour
@@ -3237,7 +3242,7 @@ function _renderProductHistory() {
                     + 'Ce n\'est pas une vente en solde.';
             }
             tr.appendChild(remiseCell);
-            tr.appendChild(cell(formatMAD(r.ca), null, null, 'right'));
+            tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
         } else {
             var stateColor = r.state === 'done' ? '#10B981'
                 : (r.state === 'submitted' ? '#F59E0B' : '#94A3B8');

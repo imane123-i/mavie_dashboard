@@ -4489,13 +4489,17 @@ class MaVieDashboardController(http.Controller):
             if kind == 'soldes':
                 writer.writerow(['Historique des ventes en solde'])
                 writer.writerow([])
+                # Même ordre qu'à l'écran (catalogue → remise → prix payé).
+                # Le CA encaissé, retiré de l'écran, reste dans l'export :
+                # un extrait a vocation à être complet.
                 writer.writerow(['Date', 'Ticket', 'Magasin', 'Réf', 'Produit', 'Qté',
-                                 'Prix catalogue (TTC)', 'Prix payé (TTC)', 'Remise (%)', 'CA encaissé (TTC)'])
+                                 'Prix catalogue (TTC)', 'Remise (%)', 'Prix payé (TTC)',
+                                 'CA encaissé (TTC)'])
                 for row in self._solde_history_rows(kw):
                     writer.writerow([
                         row['date'], row['ticket'], row['magasin'], row['ref'], row['name'],
-                        row['qty'], row['prix_catalogue'], row['prix_paye'],
-                        row['remise_pct'], row['ca'],
+                        row['qty'], row['prix_catalogue'], row['remise_pct'],
+                        row['prix_paye'], row['ca'],
                     ])
                 filename = 'mavie_historique_soldes.csv'
             else:

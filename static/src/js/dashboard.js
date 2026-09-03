@@ -1507,7 +1507,7 @@ function closeDetail() {
 // ═══════════════════════════════════════════════════════════
 // EXTRACTION / TRANSFERT INTER-MAGASINS
 // ═══════════════════════════════════════════════════════════
-function openTransferPanel(articleId, productName, presetColor) {
+function openTransferPanel(articleId, productName, presetColor, targetShopField) {
     var overlay = el('transfer-overlay');
     if (!overlay || !articleId) return;
 
@@ -1521,11 +1521,16 @@ function openTransferPanel(articleId, productName, presetColor) {
     if (nameEl) nameEl.textContent = productName || '—';
 
     var destSel = el('transfer-dest-shop');
-    if (destSel) destSel.value = state.shop_field || '';
+    if (destSel) {
+        if (targetShopField) {
+            destSel.value = targetShopField;
+        } else if (state.shop_field) {
+            destSel.value = state.shop_field;
+        } else if (destSel.options.length > 1 && !destSel.value) {
+            destSel.value = destSel.options[1].value;
+        }
+    }
 
-    // Liste des couleurs de ce produit — dérivée de state.detail.variants,
-    // déjà chargé pour le tableau "Variantes Couleurs" (pas de nouvel appel
-    // serveur nécessaire pour peupler ce filtre).
     var colorSel = el('transfer-color-filter');
     if (colorSel) {
         while (colorSel.options.length > 1) colorSel.remove(1);
@@ -1615,6 +1620,7 @@ async function _loadTransferSuggestions() {
     }
 
     _renderTransferSuggestions(data.suggestions || [], destShopField);
+    _renderTransferAllStores(data.all_stores || [], destShopField);
 
     if (msgEl) {
         var suggestions = data.suggestions || [];
@@ -1669,6 +1675,98 @@ function _renderTransferSuggestions(suggestions, destShopField) {
             openTransferMatrix(s.shop_field, s.shop_label, destShopField);
         };
         tdAction.appendChild(chooseBtn);
+        tr.appendChild(tdAction);
+
+        tbody.appendChild(tr);
+    });
+}
+
+function _renderTransferAllStores(allStores, destShopField) {
+    var tbody = el('transfer-all-stores-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    if (!allStores || !allStores.length) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 6;
+        td.textContent = 'Aucune donnée de magasin disponible.';
+        td.style.cssText = 'text-align:center;padding:16px;color:#94A3B8;';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    allStores.forEach(function(s) {
+        var tr = document.createElement('tr');
+        var isTarget = s.shop_field === destShopField;
+        if (isTarget) {
+            tr.style.background = '#F8FAFC';
+        }
+
+        var tdName = document.createElement('td');
+        tdName.style.fontWeight = '600';
+        tdName.style.color = '#0F172A';
+        tdName.textContent = s.shop_label;
+        if (isTarget) {
+            var badge = document.createElement('span');
+            badge.style.cssText = 'margin-left:6px; background:#DBEAFE; color:#1E40AF; font-size:0.7rem; font-weight:700; padding:2px 6px; border-radius:4px;';
+            badge.textContent = 'Cible';
+            tdName.appendChild(badge);
+        }
+        tr.appendChild(tdName);
+
+        var tdCity = document.createElement('td');
+        tdCity.textContent = s.city || '—';
+        tdCity.style.color = '#64748B';
+        tr.appendChild(tdCity);
+
+        var tdDisp = document.createElement('td');
+        tdDisp.style.textAlign = 'center';
+        tdDisp.style.fontWeight = '600';
+        tdDisp.style.color = '#2563EB';
+        tdDisp.textContent = formatNumber(s.dispatched || 0);
+        tr.appendChild(tdDisp);
+
+        var tdSold = document.createElement('td');
+        tdSold.style.textAlign = 'center';
+        tdSold.style.fontWeight = '600';
+        tdSold.style.color = '#7C3AED';
+        tdSold.textContent = formatNumber(s.sold || 0);
+        tr.appendChild(tdSold);
+
+        var tdStock = document.createElement('td');
+        tdStock.style.textAlign = 'center';
+        tdStock.style.fontWeight = '700';
+        tdStock.style.color = s.stock > 0 ? '#059669' : '#DC2626';
+        tdStock.textContent = formatNumber(s.stock || 0);
+        tr.appendChild(tdStock);
+
+        var tdAction = document.createElement('td');
+        tdAction.style.textAlign = 'center';
+        if (isTarget) {
+            var targetLabel = document.createElement('span');
+            targetLabel.style.fontSize = '0.8rem';
+            targetLabel.style.color = '#94A3B8';
+            targetLabel.textContent = 'Magasin cible';
+            tdAction.appendChild(targetLabel);
+        } else if (s.stock > 0) {
+            var chooseBtn = document.createElement('button');
+            chooseBtn.className = 'btn-transfer-create';
+            chooseBtn.style.padding = '4px 10px';
+            chooseBtn.style.fontSize = '0.78rem';
+            chooseBtn.textContent = 'Choisir →';
+            chooseBtn.onclick = function() {
+                openTransferMatrix(s.shop_field, s.shop_label, destShopField);
+            };
+            tdAction.appendChild(chooseBtn);
+        } else {
+            var noStock = document.createElement('span');
+            noStock.style.fontSize = '0.8rem';
+            noStock.style.color = '#CBD5E1';
+            noStock.textContent = 'Pas de stock';
+            tdAction.appendChild(noStock);
+        }
         tr.appendChild(tdAction);
 
         tbody.appendChild(tr);
@@ -2636,7 +2734,7 @@ function _renderStockAlerts(alertes) {
             tBtn.className = 'btn-transfer-row-icon';
             tBtn.title = 'Proposer un transfert';
             tBtn.textContent = '🔄';
-            tBtn.onclick = function() { openTransferPanel(a.id, a.name || ''); };
+            tBtn.onclick = function() { openTransferPanel(a.id, a.name || '', null, a.shop_field); };
             div.appendChild(tBtn);
         }
 
@@ -3104,12 +3202,15 @@ function _buildExportParams(extra) {
 // section Historique du tableau de bord, volontairement limitée aux bons
 // lancés depuis le dashboard.
 // ═══════════════════════════════════════════════════════════
+var productHistorySubTab = 'all'; // 'all', 'lances', 'remises'
+
 async function openProductHistory() {
     if (!state.detail.article_id) return;
     var overlay = el('product-history-overlay');
     if (!overlay) return;
 
     productHistoryTab = 'transferts';
+    productHistorySubTab = 'all';
     _syncProductHistoryTabs();
     overlay.classList.add('active');
 
@@ -3143,10 +3244,28 @@ function _syncProductHistoryTabs() {
     var tabS = el('product-history-tab-soldes');
     if (tabT) tabT.classList.toggle('active', productHistoryTab === 'transferts');
     if (tabS) tabS.classList.toggle('active', productHistoryTab === 'soldes');
+
+    var subtabsContainer = el('product-history-soldes-subtabs');
+    if (subtabsContainer) {
+        subtabsContainer.style.display = (productHistoryTab === 'soldes') ? 'flex' : 'none';
+    }
+
+    var subAll = el('product-history-subtab-all');
+    var subLances = el('product-history-subtab-lances');
+    var subRemises = el('product-history-subtab-remises');
+    if (subAll) subAll.classList.toggle('active', productHistorySubTab === 'all');
+    if (subLances) subLances.classList.toggle('active', productHistorySubTab === 'lances');
+    if (subRemises) subRemises.classList.toggle('active', productHistorySubTab === 'remises');
 }
 
 function setProductHistoryTab(tab) {
     productHistoryTab = tab;
+    _syncProductHistoryTabs();
+    _renderProductHistory();
+}
+
+function setProductHistorySubTab(subTab) {
+    productHistorySubTab = subTab;
     _syncProductHistoryTabs();
     _renderProductHistory();
 }
@@ -3161,9 +3280,6 @@ function _renderProductHistory() {
     tbody.innerHTML = '';
 
     var isSoldes = productHistoryTab === 'soldes';
-    // Ordre demandé : le prix catalogue, la remise appliquée, puis le prix
-    // réellement payé — on lit la démarque de gauche à droite. La colonne
-    // "CA encaissé" a été retirée : son total reste dans le résumé au-dessus.
     var columns = isSoldes
         ? ['Date', 'Ticket', 'Magasin', 'Couleur', 'Taille', 'Qté',
            'Prix catalogue (TTC)', 'Remise', 'Prix payé (TTC)']
@@ -3178,19 +3294,33 @@ function _renderProductHistory() {
     });
 
     var data = lastProductHistory || {};
-    var rows = isSoldes ? (data.soldes || []) : (data.transfers || []);
+    var rawRows = isSoldes ? (data.soldes || []) : (data.transfers || []);
+    var rows = rawRows;
+
+    if (isSoldes) {
+        if (productHistorySubTab === 'lances') {
+            rows = rawRows.filter(function(r) { return r.solde_kind === 'solde_lance' || r.solde_kind === 'retour'; });
+        } else if (productHistorySubTab === 'remises') {
+            rows = rawRows.filter(function(r) { return r.solde_kind === 'remise_magasin' || r.solde_kind === 'retour'; });
+        }
+    }
 
     if (summaryEl) {
-        summaryEl.textContent = isSoldes
-            ? formatNumber(data.soldes_count || 0) + ' ligne(s) sous le prix catalogue · '
-              + formatNumber(data.soldes_qty || 0) + ' pièces · '
-              + formatMAD(data.soldes_ca || 0) + ' encaissés'
-              + (data.retours_count
-                 ? ' · dont ' + formatNumber(data.retours_count) + ' retour(s) client'
-                 : '')
-            : formatNumber(data.transfers_bons || 0) + ' bon(s) de transfert · '
-              + formatNumber(data.transfers_count || 0) + ' ligne(s) · '
-              + formatNumber(data.transfers_qty || 0) + ' pièces déplacées';
+        if (isSoldes) {
+            var totalQty = rows.reduce(function(acc, r) { return acc + (r.qty || 0); }, 0);
+            var totalCa = rows.reduce(function(acc, r) { return acc + (r.ca || 0); }, 0);
+            var retoursCount = rows.filter(function(r) { return r.solde_kind === 'retour'; }).length;
+            var labelType = productHistorySubTab === 'lances' ? ' (Soldes lancés)'
+                          : (productHistorySubTab === 'remises' ? ' (Remises magasin)' : '');
+            summaryEl.textContent = formatNumber(rows.length) + ' ligne(s)' + labelType + ' · '
+                + formatNumber(totalQty) + ' pièces · '
+                + formatMAD(totalCa) + ' encaissés'
+                + (retoursCount ? ' · dont ' + formatNumber(retoursCount) + ' retour(s) client' : '');
+        } else {
+            summaryEl.textContent = formatNumber(data.transfers_bons || 0) + ' bon(s) de transfert · '
+                + formatNumber(data.transfers_count || 0) + ' ligne(s) · '
+                + formatNumber(data.transfers_qty || 0) + ' pièces déplacées';
+        }
     }
 
     if (!rows.length) {
@@ -3394,6 +3524,18 @@ document.addEventListener('DOMContentLoaded', function() {
     var prodHistTabS = el('product-history-tab-soldes');
     if (prodHistTabS) {
         prodHistTabS.addEventListener('click', function() { setProductHistoryTab('soldes'); });
+    }
+    var prodHistSubAll = el('product-history-subtab-all');
+    if (prodHistSubAll) {
+        prodHistSubAll.addEventListener('click', function() { setProductHistorySubTab('all'); });
+    }
+    var prodHistSubLances = el('product-history-subtab-lances');
+    if (prodHistSubLances) {
+        prodHistSubLances.addEventListener('click', function() { setProductHistorySubTab('lances'); });
+    }
+    var prodHistSubRemises = el('product-history-subtab-remises');
+    if (prodHistSubRemises) {
+        prodHistSubRemises.addEventListener('click', function() { setProductHistorySubTab('remises'); });
     }
 
     var exportDetailBtn = el('btn-export-detail');

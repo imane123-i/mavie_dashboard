@@ -3419,7 +3419,8 @@ class MaVieDashboardController(http.Controller):
                 ('product_id', 'in', variants.ids),
                 ('location_id', 'child_of', m.warehouse_id.lot_stock_id.id),
             ])
-            result[m.shop_field] = sum(quants.mapped('quantity')) if quants else 0.0
+            available = sum(max(0.0, float(q.quantity or 0.0) - float(q.reserved_quantity or 0.0)) for q in quants) if quants else 0.0
+            result[m.shop_field] = available
         return result
 
     def _notify_transfer_responsible(self, transfer, source_mapping, dest_mapping):
@@ -3505,10 +3506,73 @@ class MaVieDashboardController(http.Controller):
             tier_order = {'same_city': 0, 'nearby': 1, 'other': 2}
             suggestions.sort(key=lambda s: (tier_order.get(s['tier'], 3), -s['available_qty']))
 
-            return {'suggestions': suggestions, 'dest_city': dest_city or None}
+            # ── Répartition et Stock pour TOUS les magasins (Dispatché, Vendu, Stock) ──
+            all_stores = []
+            variants = request.env['product.product'].sudo().search(
+                [('product_tmpl_id', '=', product_tmpl_id)]
+            )
+            if color:
+                color_upper = color.upper().strip()
+                variants = variants.filtered(
+                    lambda v: (resolve_variant_color_size(v)[0] or '').upper().strip() == color_upper
+                )
+
+            all_stock_by_field = self._stock_by_mapping_for_template(product_tmpl_id, mappings, color=color)
+
+            sold_by_field = {}
+            if variants:
+                pos_lines = request.env['pos.order.line'].sudo().search([
+                    ('product_id', 'in', variants.ids),
+                    ('order_id.state', 'in', ['paid', 'done', 'invoiced'])
+                ])
+                for pline in pos_lines:
+                    cfg = pline.order_id.session_id.config_id
+                    if cfg and cfg.picking_type_id and cfg.picking_type_id.warehouse_id:
+                        wh_id = cfg.picking_type_id.warehouse_id.id
+                        for sm in mappings:
+                            if sm.warehouse_id and sm.warehouse_id.id == wh_id:
+                                sold_by_field[sm.shop_field] = sold_by_field.get(sm.shop_field, 0) + int(pline.qty)
+                                break
+
+            dispatched_by_field = {}
+            if variants:
+                po_lines = request.env['purchase.order.line'].sudo().search([
+                    ('product_id', 'in', variants.ids),
+                    ('order_id.state', 'in', ['purchase', 'done'])
+                ])
+                for pol in po_lines:
+                    wh = pol.order_id.picking_type_id.warehouse_id
+                    if wh:
+                        for sm in mappings:
+                            if sm.warehouse_id and sm.warehouse_id.id == wh.id:
+                                dispatched_by_field[sm.shop_field] = dispatched_by_field.get(sm.shop_field, 0) + int(pol.product_qty)
+                                break
+
+            for m in mappings:
+                if not m.warehouse_id or not m.warehouse_id.lot_stock_id:
+                    continue
+                stk = all_stock_by_field.get(m.shop_field, 0.0)
+                disp = dispatched_by_field.get(m.shop_field, 0)
+                sold = sold_by_field.get(m.shop_field, 0)
+                city = (m.city or '').strip()
+                all_stores.append({
+                    'shop_field': m.shop_field,
+                    'shop_label': m.warehouse_id.name if m.warehouse_id else (m.shop_label or m.shop_field),
+                    'city': city or '—',
+                    'company': m.company_id.name if m.company_id else '—',
+                    'dispatched': int(disp),
+                    'sold': int(sold),
+                    'stock': int(stk),
+                    'is_target': m.shop_field == dest_shop_field,
+                    'has_responsible': bool(m.responsible_user_id),
+                })
+
+            all_stores.sort(key=lambda s: (0 if s['is_target'] else 1, -s['stock'], s['shop_label']))
+
+            return {'suggestions': suggestions, 'dest_city': dest_city or None, 'all_stores': all_stores}
         except Exception as e:
             _logger.error(f"Erreur api_transfer_suggestions: {str(e)}", exc_info=True)
-            return {'error': str(e), 'suggestions': []}
+            return {'error': str(e), 'suggestions': [], 'all_stores': []}
 
     @http.route('/mavie/api/transfer-variant-stock', type='json', auth='user', methods=['POST'], csrf=False)
     def api_transfer_variant_stock(self, **kw):
@@ -4608,11 +4672,14 @@ class MaVieDashboardController(http.Controller):
                 _logger.warning("Historique transferts indisponible pour %s: %s", product_tmpl_id, e)
 
             # ── Ventes en solde (sous le prix catalogue) ──
-            # Même critère que le compteur "articles vendus en solde" du
-            # tableau de bord : prix réellement encaissé (remise déduite)
-            # strictement inférieur au prix catalogue.
             soldes = []
-            request.env.cr.execute("""
+            has_promo_campaign = 'promo_campaign_id' in request.env['pos.order']._fields
+            has_reward_id = 'reward_id' in request.env['pos.order.line']._fields
+
+            promo_col = "po.promo_campaign_id" if has_promo_campaign else "NULL AS promo_campaign_id"
+            reward_col = "pol.reward_id" if has_reward_id else "NULL AS reward_id"
+
+            query = f"""
                 SELECT po.date_order,
                        po.name,
                        pc.name AS magasin,
@@ -4621,47 +4688,55 @@ class MaVieDashboardController(http.Controller):
                        pol.qty,
                        pt.list_price,
                        pol.price_subtotal,
-                       pol.price_subtotal_incl
+                       pol.price_subtotal_incl,
+                       COALESCE(pol.discount, 0) AS line_discount,
+                       pl.name AS pricelist_name,
+                       {promo_col},
+                       {reward_col}
                 FROM pos_order_line pol
                 JOIN pos_order po ON po.id = pol.order_id
                 JOIN pos_session ps ON ps.id = po.session_id
                 JOIN pos_config pc ON pc.id = ps.config_id
                 LEFT JOIN res_company rc ON rc.id = po.company_id
+                LEFT JOIN product_pricelist pl ON pl.id = po.pricelist_id
                 JOIN product_product pp ON pp.id = pol.product_id
                 JOIN product_template pt ON pt.id = pp.product_tmpl_id
                 WHERE pp.product_tmpl_id = %s
                   AND po.state IN ('paid', 'done', 'invoiced')
-                  -- PIÈGE SQL : is_reward_line est NULL sur 417 249 lignes
-                  -- (vérifié en base) et seulement `false` sur 213.
-                  -- `= false` écarte donc les NULL et vidait complètement
-                  -- l'historique. Le domaine ORM ('is_reward_line','=',False)
-                  -- utilisé ailleurs, lui, couvre bien le cas NULL.
                   AND pol.is_reward_line IS NOT TRUE
                   AND pt.list_price > 0
                   AND pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0) < pt.list_price * 0.999
                 ORDER BY po.date_order DESC
                 LIMIT 500
-            """, (product_tmpl_id,))
+            """
+            request.env.cr.execute(query, (product_tmpl_id,))
 
             variant_by_id = {v.id: v for v in variants}
             for (date_order, ticket, magasin, societe, pid, qty,
-                 list_price, sous_total_ht, ca) in request.env.cr.fetchall():
+                 list_price, sous_total_ht, ca, line_discount, pricelist_name,
+                 promo_campaign_id, reward_id) in request.env.cr.fetchall():
                 qty = int(qty or 0)
-                # Prix en TTC (décision utilisateur) : le montant que le
-                # client règle réellement, sur la même base que le CA.
                 ratio = self._ttc_ratio(sous_total_ht, ca)
                 list_price = float(list_price or 0.0) * ratio
                 prix_paye = self._unit_price_ttc(ca, qty)
                 variant = variant_by_id.get(pid)
                 color, size = resolve_variant_color_size(variant) if variant else (None, None)
 
-                # Un RETOUR (avoir) est encodé en caisse par une quantité ou
-                # un prix négatif. Le critère "prix encaissé < prix
-                # catalogue" l'attrape donc comme une vente en solde, avec
-                # une remise absurde (-233 % observé en base). On l'étiquette
-                # pour ce qu'il est plutôt que d'afficher un pourcentage qui
-                # n'a aucun sens.
                 est_retour = qty < 0 or prix_paye < 0
+                is_from_promo_campaign = bool(promo_campaign_id) or bool(reward_id)
+                is_from_special_pricelist = False
+                if pricelist_name:
+                    pl_name_lower = str(pricelist_name).lower().strip()
+                    if 'par défaut' not in pl_name_lower and 'public pricelist' not in pl_name_lower:
+                        is_from_special_pricelist = True
+
+                if est_retour:
+                    solde_kind = 'retour'
+                elif is_from_promo_campaign or is_from_special_pricelist or (float(line_discount or 0.0) <= 0.01 and prix_paye < list_price * 0.999):
+                    solde_kind = 'solde_lance'
+                else:
+                    solde_kind = 'remise_magasin'
+
                 soldes.append({
                     'date': str(date_order)[:16] if date_order else '—',
                     'ticket': ticket or '—',
@@ -4670,7 +4745,9 @@ class MaVieDashboardController(http.Controller):
                     'couleur': (color or '—').upper() if color else '—',
                     'taille': size or '—',
                     'qty': qty,
-                    'type': 'retour' if est_retour else 'solde',
+                    'type': 'retour' if est_retour else solde_kind,
+                    'solde_kind': solde_kind,
+                    'line_discount': round(float(line_discount or 0.0), 1),
                     'prix_catalogue': round(list_price, 2),
                     'prix_paye': round(prix_paye, 2),
                     'remise_pct': (
@@ -4679,6 +4756,10 @@ class MaVieDashboardController(http.Controller):
                     ),
                     'ca': round(float(ca or 0.0), 2),
                 })
+
+            lances_items = [s for s in soldes if s['solde_kind'] == 'solde_lance']
+            remises_items = [s for s in soldes if s['solde_kind'] == 'remise_magasin']
+            retours_items = [s for s in soldes if s['solde_kind'] == 'retour']
 
             return {
                 'ref': product_tmpl.base_pivot_reference or product_tmpl.default_code or product_tmpl.name,
@@ -4691,7 +4772,13 @@ class MaVieDashboardController(http.Controller):
                 'soldes_count': len(soldes),
                 'soldes_qty': sum(s['qty'] for s in soldes),
                 'soldes_ca': round(sum(s['ca'] for s in soldes), 2),
-                'retours_count': sum(1 for s in soldes if s['type'] == 'retour'),
+                'soldes_lances_count': len(lances_items),
+                'soldes_lances_qty': sum(s['qty'] for s in lances_items),
+                'soldes_lances_ca': round(sum(s['ca'] for s in lances_items), 2),
+                'remises_magasin_count': len(remises_items),
+                'remises_magasin_qty': sum(s['qty'] for s in remises_items),
+                'remises_magasin_ca': round(sum(s['ca'] for s in remises_items), 2),
+                'retours_count': len(retours_items),
             }
         except Exception as e:
             _logger.error(f"Erreur api_product_history: {str(e)}", exc_info=True)

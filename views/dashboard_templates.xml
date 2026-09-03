@@ -1726,6 +1726,27 @@
                         </table>
                     </div>
 
+                    <!-- ══ Répartition et Stock dans Tous les Magasins ══ -->
+                    <div class="detail-section" id="transfer-all-stores-section" style="margin-top:20px;">
+                        <h3 style="color:#0F172A; font-size:1.05rem; font-weight:700; display:flex; align-items:center; gap:8px; margin-bottom:10px;">
+                            <span>🏪</span> Répartition et stock tous les magasins (Dispatché / Vendu / Stock)
+                        </h3>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Magasin</th>
+                                    <th>Ville</th>
+                                    <th style="text-align:center;">Dispatché</th>
+                                    <th style="text-align:center;">Vendu</th>
+                                    <th style="text-align:center;">Stock dispo</th>
+                                    <th style="text-align:center;">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="transfer-all-stores-tbody"></tbody>
+                        </table>
+                    </div>
+
+
                     <!-- ══ Matrice couleur/taille pour le magasin source choisi ══ -->
                     <div class="detail-section" id="transfer-matrix-section" style="display:none;">
                         <h3>
@@ -2011,6 +2032,12 @@
                             <button type="button" id="product-history-tab-transferts" class="chart-mode-btn active">🔄 Transferts</button>
                             <button type="button" id="product-history-tab-soldes" class="chart-mode-btn">🏷️ Soldes</button>
                         </div>
+                    </div>
+                    <div id="product-history-soldes-subtabs" style="display:none; align-items:center; gap:8px; margin-bottom:12px; padding:6px 12px; background:#F8FAFC; border-radius:8px; border:1px solid #E2E8F0; flex-wrap:wrap;">
+                        <span style="font-size:0.8rem; font-weight:700; color:#475569; margin-right:4px;">Type :</span>
+                        <button type="button" id="product-history-subtab-all" class="chart-mode-btn active" style="font-size:0.78rem; padding:4px 12px;">📋 Tous</button>
+                        <button type="button" id="product-history-subtab-lances" class="chart-mode-btn" style="font-size:0.78rem; padding:4px 12px;">🏷️ Soldes lancés</button>
+                        <button type="button" id="product-history-subtab-remises" class="chart-mode-btn" style="font-size:0.78rem; padding:4px 12px;">✂️ Remises magasin</button>
                     </div>
                     <div id="product-history-summary" style="font-size:0.85rem; color:#64748B; margin-bottom:12px;"></div>
                     <div style="max-height:60vh; overflow:auto;">

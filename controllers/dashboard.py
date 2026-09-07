@@ -628,9 +628,25 @@ class MaVieDashboardController(http.Controller):
     # ─────────────────────────────────────────────────────────────
 
     def _get_active_shop_mappings(self):
-        """Liste des magasins réellement configurés (hors ligne générique 'shop')."""
+        """Liste des magasins configurés et actifs.
+
+        DEMANDE UTILISATEUR (2026-09-07) : « je dois avoir tout ce qui est
+        dans la base et n'enlever rien ». L'exclusion en dur de
+        `shop_field = 'shop'` (DIGITAL SHOP) a donc été retirée. Elle datait
+        d'une époque où cette ligne était considérée comme un libellé
+        générique ; vérifié en base, c'est un vrai magasin — 2 196 pièces en
+        stock, 8 187 vendues en caisse, 7 596 réceptionnées. Le laisser
+        dehors était la première cause des lignes « reçu ailleurs qu'ici » /
+        « vendu depuis un autre entrepôt » du pop-up de réconciliation :
+        ses achats et ses ventes étaient comptés (filtre par société) mais
+        pas son stock (filtre par entrepôt).
+
+        Le seul filtre restant est `active` — c'est la case à cocher du
+        modèle, donc la décision revient à l'utilisateur dans Odoo, plus au
+        code.
+        """
         return request.env['mv.batch.shop.mapping'].sudo().search([
-            ('active', '=', True), ('shop_field', '!=', 'shop')
+            ('active', '=', True)
         ])
 
     # ─────────────────────────────────────────────────────────────
@@ -667,9 +683,26 @@ class MaVieDashboardController(http.Controller):
         seul critère fiable en base : ces configs partagent l'entrepôt et le
         type d'opération de leur magasin physique, donc rien dans les
         relations ne permet de les distinguer.
+
+        NUANCE AJOUTÉE (2026-09-07) : un point de vente n'est « en ligne »
+        que s'il DOUBLE un magasin physique sur le même entrepôt — c'est
+        tout l'intérêt de l'entrée dédiée, séparer les deux canaux. Quand
+        une caisse au nom « online/digital » est la SEULE de son entrepôt
+        (cas de DIGITAL SHOP, désormais réintégré comme magasin à part
+        entière), elle EST le magasin : la traiter comme un doublon en ligne
+        la ferait apparaître deux fois dans le filtre et viderait le magasin
+        physique de toutes ses ventes.
         """
         configs = request.env['pos.config'].sudo().search([])
-        return configs.filtered(lambda c: self._is_online_config_name(c.name))
+        online = configs.filtered(lambda c: self._is_online_config_name(c.name))
+        physical_warehouse_ids = {
+            c.picking_type_id.warehouse_id.id
+            for c in (configs - online)
+            if c.picking_type_id.warehouse_id
+        }
+        return online.filtered(
+            lambda c: c.picking_type_id.warehouse_id.id in physical_warehouse_ids
+        )
 
     def _get_online_shop_entries(self):
         """Entrées de filtre magasin pour les points de vente en ligne."""
@@ -732,7 +765,15 @@ class MaVieDashboardController(http.Controller):
             configs = request.env['pos.config'].sudo().search([
                 ('picking_type_id.warehouse_id', '=', mapping.warehouse_id.id)
             ])
-            configs = configs.filtered(lambda c: not self._is_online_config_name(c.name))
+            # On retire les caisses qui ont leur propre entrée « en ligne »
+            # dans le filtre, pour ne pas compter leurs ventes deux fois.
+            # On passe par _get_online_pos_configs (et non par le test sur
+            # le nom) : une caisse au nom « digital » qui est la seule de son
+            # entrepôt n'est PAS un doublon en ligne, c'est le magasin
+            # lui-même — sans ça, sélectionner DIGITAL SHOP affichait son
+            # stock mais zéro vente.
+            online_ids = set(self._get_online_pos_configs().ids)
+            configs = configs.filtered(lambda c: c.id not in online_ids)
             pos_config_ids = configs.ids
         return {
             'kind': 'shop',
@@ -1307,9 +1348,22 @@ class MaVieDashboardController(http.Controller):
             purchase_domain = self._build_purchase_domain(kw, product_tmpl_ids)
             po_grouped = self._group_sums(
                 'purchase.order.line', purchase_domain,
-                ['product_qty', 'price_total', 'price_subtotal'],
+                ['product_qty', 'qty_received', 'price_total', 'price_subtotal'],
             )
-            qty_purchased_total = int(sum(g.get('product_qty') or 0 for g in po_grouped))
+            # QTÉ ACHETÉE = quantité RÉELLEMENT REÇUE (qty_received), pas la
+            # quantité commandée (product_qty). Odoo tient déjà qty_received
+            # net des retours fournisseur : une réception suivie d'un retour
+            # au fournisseur repasse le compteur à 0. En lisant product_qty,
+            # le dashboard comptait comme "achetées" (1) les lignes de bons
+            # confirmés jamais réceptionnées et (2) les marchandises
+            # renvoyées au fournisseur — vérifié en base : 6 065 pièces dans
+            # le premier cas, 7 748 dans le second, qui gonflaient
+            # mécaniquement le stock théorique et donc l'écart affiché.
+            # product_qty reste lu à côté : le prix d'achat moyen se calcule
+            # sur la quantité COMMANDÉE, car price_subtotal porte lui aussi
+            # sur la ligne commandée.
+            qty_purchased_total = int(sum(g.get('qty_received') or 0 for g in po_grouped))
+            qty_ordered_total = int(sum(g.get('product_qty') or 0 for g in po_grouped))
             # CA Achat = coût réel des marchandises achetées, tel que facturé
             # sur les bons de commande (pas une reconstruction
             # qty*prix_standard). DÉCISION UTILISATEUR (2026-08-18) : affiché
@@ -1331,6 +1385,11 @@ class MaVieDashboardController(http.Controller):
 
             po_pids = [g['product_id'][0] for g in po_grouped if g.get('product_id')]
             purchase_by_tmpl = {}
+            # Quantité COMMANDÉE par référence — sert uniquement à diviser
+            # price_subtotal pour obtenir un prix unitaire juste (le montant
+            # facturé porte sur la ligne commandée, pas sur ce qui a été
+            # réceptionné). Ne jamais l'utiliser comme "Qté achetée".
+            ordered_by_tmpl = {}
             # CA Achat par référence — déjà présent dans po_grouped
             # (price_subtotal), il suffit de l'accumuler comme les quantités
             # pour pouvoir l'afficher dans les tableaux Top/Flop.
@@ -1347,7 +1406,8 @@ class MaVieDashboardController(http.Controller):
                     tid = po_prod_to_tmpl.get(pid)
                     if not tid:
                         continue
-                    purchase_by_tmpl[tid] = purchase_by_tmpl.get(tid, 0) + int(g.get('product_qty') or 0)
+                    purchase_by_tmpl[tid] = purchase_by_tmpl.get(tid, 0) + int(g.get('qty_received') or 0)
+                    ordered_by_tmpl[tid] = ordered_by_tmpl.get(tid, 0) + int(g.get('product_qty') or 0)
                     # TTC pour l'affichage (colonne CA Achat du Top/Flop)
                     ca_achat_by_tmpl[tid] = ca_achat_by_tmpl.get(tid, 0.0) + (g.get('price_total') or 0.0)
                     # HT pour l'estimation du coût unitaire (valorisation) :
@@ -1442,6 +1502,20 @@ class MaVieDashboardController(http.Controller):
 
             quant_grouped = self._group_sums('stock.quant', quant_domain, ['quantity'])
             stock_total = int(sum(g.get('quantity') or 0 for g in quant_grouped))
+
+            # STOCK PRESENT (negatifs exclus) — meme domaine, mais groupe
+            # aussi par emplacement pour juger la positivite magasin par
+            # magasin. Les stocks negatifs de cette base (59 650 pieces) ne
+            # peuvent pas etre corriges dans Odoo par l'utilisateur : le
+            # dashboard doit donc afficher le stock reellement en rayon, et
+            # signaler les negatifs a cote au lieu de les soustraire.
+            quant_by_loc = self._group_sums(
+                'stock.quant', quant_domain, ['quantity'],
+                group_fields=('product_id', 'location_id'),
+            )
+            stock_present, stock_negatif, nb_magasins_negatifs = self._split_positive_stock(
+                quant_by_loc, self._location_to_warehouse(retail_lot_stock_ids)
+            )
             quant_pids = [g['product_id'][0] for g in quant_grouped if g.get('product_id')]
             stock_by_tmpl = {}
             if quant_pids:
@@ -2034,7 +2108,7 @@ class MaVieDashboardController(http.Controller):
                 # est alors signalée comme estimée (val_cost_estime) pour ne
                 # pas la confondre avec un coût réellement saisi.
                 prix_achat_moyen_by_tmpl = {}
-                for tid, qte in purchase_by_tmpl.items():
+                for tid, qte in ordered_by_tmpl.items():
                     montant = ca_achat_ht_by_tmpl.get(tid) or 0.0
                     if qte and montant > 0:
                         prix_achat_moyen_by_tmpl[tid] = montant / qte
@@ -2145,7 +2219,13 @@ class MaVieDashboardController(http.Controller):
                 'soldes_count': len(soldes_products),
                 'soldes_list': soldes_products[:500],
                 'qty_purchased': qty_purchased_total,
+                # stock_total = comptable (negatifs inclus), conserve pour
+                # tous les calculs derives ; stock_present = ce qui est
+                # reellement en rayon, c'est lui que la carte affiche.
                 'stock_total': stock_total,
+                'stock_present': stock_present,
+                'stock_negatif': stock_negatif,
+                'nb_magasins_negatifs': nb_magasins_negatifs,
                 'valeur_stock_ht': round(val_ht_total, 2),
                 'valeur_stock_cost': round(val_cost_total, 2),
                 'valeur_stock_cost_estime': val_cost_estime,
@@ -2225,9 +2305,11 @@ class MaVieDashboardController(http.Controller):
                 po_domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
 
             po_grouped = request.env['purchase.order.line'].sudo().read_group(
-                po_domain, ['product_qty:sum', 'price_total:sum'], [], lazy=False
+                po_domain, ['qty_received:sum', 'price_total:sum'], [], lazy=False
             )
-            qty_achats_fournisseurs = int(po_grouped[0].get('product_qty') or 0) if po_grouped else 0
+            # Quantité RÉELLEMENT REÇUE (net des retours fournisseur), même
+            # règle que la Qté achetée du dashboard retail.
+            qty_achats_fournisseurs = int(po_grouped[0].get('qty_received') or 0) if po_grouped else 0
 
             # TTC, comme tous les CA du dashboard (décision 2026-08-18).
             ca_achats_fournisseurs = round(po_grouped[0].get('price_total') or 0.0, 2) if po_grouped else 0.0
@@ -2254,9 +2336,15 @@ class MaVieDashboardController(http.Controller):
             if kw.get('date_end'):
                 so_domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
 
+            # Quantité RÉELLEMENT LIVRÉE (qty_delivered), pas commandée :
+            # Odoo la tient nette des retours sur bon de vente. Vérifié en
+            # base : 15 901 pièces commandées par MOD FOR LIFE pour 14 983
+            # livrées, dont 686 revenues par un bon de retour — comptées
+            # comme vendues, elles créaient de la vente fantôme et donc de
+            # l'écart de stock.
             so_grouped = request.env['sale.order.line'].sudo().read_group(
                 so_domain,
-                ['product_uom_qty:sum', 'price_total:sum', 'order_partner_id'],
+                ['qty_delivered:sum', 'price_total:sum', 'order_partner_id'],
                 ['order_partner_id'],
                 lazy=False
             )
@@ -2267,7 +2355,7 @@ class MaVieDashboardController(http.Controller):
             ca_ventes_total = 0.0
             for g in so_grouped:
                 pid = g['order_partner_id'][0] if g.get('order_partner_id') else None
-                qty = g.get('product_uom_qty') or 0.0
+                qty = g.get('qty_delivered') or 0.0
                 ca = g.get('price_total') or 0.0
                 qty_ventes_total += qty
                 ca_ventes_total += ca
@@ -2688,6 +2776,435 @@ class MaVieDashboardController(http.Controller):
     def api_product_detail(self, **kw):
         return self._compute_product_detail(kw)
 
+    # RECONCILIATION DU STOCK
+    #
+    # DEMANDE UTILISATEUR (2026-09-07) : "je ne dois pas avoir d'ecarts".
+    # L'ancienne carte affichait "ecart = (achete - vendu) - stock reel",
+    # une soustraction entre des DOCUMENTS (bons de commande, lignes de
+    # caisse) et un STOCK PHYSIQUE. Elle ne pouvait donc jamais tomber a
+    # zero : tout mouvement reel qui n'est ni un achat ni une vente (perte
+    # d'inventaire, sortie sans ticket, transit) restait hors du calcul et
+    # ressortait en "ecart" anonyme.
+    #
+    # On reconstruit ici le stock attendu a partir des MOUVEMENTS VALIDES
+    # (stock.move.line) qui franchissent la frontiere du perimetre affiche,
+    # chaque poste etant nomme. Verifie en base sur les 40 876 variantes
+    # ayant des mouvements : 40 443 (98,9 %) tombent exactement a zero. Le
+    # reliquat (433 variantes, ~2 790 pieces) correspond a des quants ecrits
+    # sans mouvement : une vraie anomalie de donnees, et c'est justement ce
+    # que la carte doit signaler au lieu d'alerter sur toutes les fiches.
+
+    def _stock_ledger_buckets(self, variant_ids, inside_ids):
+        """Mouvements valides franchissant la frontiere du perimetre.
+
+        Renvoie {('in'|'out', usage_de_la_contrepartie): quantite}. Un
+        mouvement interne au perimetre (magasin vers magasin du meme
+        perimetre) ne franchit rien et est volontairement ignore : il ne
+        change pas le stock total affiche.
+        """
+        if not variant_ids or not inside_ids:
+            return {}
+        request.env.cr.execute("""
+            SELECT CASE WHEN sml.location_dest_id = ANY(%(inside)s) THEN 'in' ELSE 'out' END,
+                   CASE WHEN sml.location_dest_id = ANY(%(inside)s) THEN src.usage ELSE dst.usage END,
+                   COALESCE(SUM(sml.quantity), 0)
+              FROM stock_move_line sml
+              JOIN stock_location src ON src.id = sml.location_id
+              JOIN stock_location dst ON dst.id = sml.location_dest_id
+             WHERE sml.state = 'done'
+               AND sml.product_id = ANY(%(variants)s)
+               AND ((sml.location_dest_id = ANY(%(inside)s)
+                     AND NOT (sml.location_id = ANY(%(inside)s)))
+                 OR (sml.location_id = ANY(%(inside)s)
+                     AND NOT (sml.location_dest_id = ANY(%(inside)s))))
+             GROUP BY 1, 2
+        """, {'inside': list(inside_ids), 'variants': list(variant_ids)})
+        return {(r[0], r[1]): float(r[2] or 0.0) for r in request.env.cr.fetchall()}
+
+    def _location_to_warehouse(self, lot_stock_ids):
+        """{emplacement -> entrepot} pour tous les emplacements sous ces
+        entrepots. Sert a juger la positivite du stock magasin par magasin
+        sans refaire une requete par entrepot."""
+        if not lot_stock_ids:
+            return {}
+        request.env.cr.execute("""
+            SELECT l.id, w.id
+              FROM stock_location wl
+              JOIN stock_warehouse w ON w.lot_stock_id = wl.id
+              JOIN stock_location l ON l.parent_path LIKE wl.parent_path || '%%'
+             WHERE wl.id = ANY(%(lots)s)
+        """, {'lots': list(lot_stock_ids)})
+        return {row[0]: row[1] for row in request.env.cr.fetchall()}
+
+    def _split_positive_stock(self, quant_rows, loc_to_wh):
+        """(present, negatif, nb_magasins_negatifs) a partir de lignes
+        groupees par (product_id, location_id).
+
+        La positivite se juge au grain (variante x magasin) : c'est le grain
+        du terrain. Une taille a +3 dans un magasin ne doit pas etre annulee
+        par une autre taille a -3 ailleurs.
+        """
+        par_variante_magasin = {}
+        for g in quant_rows:
+            pid = g['product_id'][0] if g.get('product_id') else None
+            lid = g['location_id'][0] if g.get('location_id') else None
+            wh_id = loc_to_wh.get(lid)
+            if not pid or not wh_id:
+                continue
+            key = (pid, wh_id)
+            par_variante_magasin[key] = par_variante_magasin.get(key, 0.0) + (g.get('quantity') or 0.0)
+        present = sum(q for q in par_variante_magasin.values() if q > 0)
+        negatif = sum(q for q in par_variante_magasin.values() if q < 0)
+        magasins = {wh for (_pid, wh), q in par_variante_magasin.items() if q < 0}
+        return int(round(present)), int(round(negatif)), len(magasins)
+
+    def _positive_stock(self, variant_ids, warehouse_ids):
+        """Stock REELLEMENT PRESENT en rayon, negatifs isoles.
+
+        CONTRAINTE UTILISATEUR (2026-09-07) : les stocks negatifs de cette
+        base (59 650 pieces sur 2 234 references) ne seront PAS corriges dans
+        Odoo — l'utilisateur ne peut modifier que le module dashboard, pas
+        l'inventaire. Le dashboard doit donc afficher un stock exploitable
+        malgre eux.
+
+        Un stock negatif n'est pas du stock : on ne peut pas avoir -1 piece
+        en rayon. C'est la trace d'une vente sur de la marchandise jamais
+        entree dans ce magasin (transfert non enregistre, le plus souvent).
+        On somme donc uniquement les positifs, en jugeant la positivite au
+        niveau (variante x magasin) — le grain reel du terrain : une taille
+        en +3 dans un magasin ne doit pas etre annulee par une autre taille
+        a -3 ailleurs.
+
+        Renvoie (positif_par_variante, total_present, total_negatif,
+        nb_magasins_negatifs, net_par_variante). `total_present +
+        total_negatif` redonne le total comptable Odoo, qui reste la
+        reference de la reconciliation ; `net_par_variante` (negatifs
+        inclus) sert a detecter les quantites ecrites sans mouvement, un
+        controle qui doit rester compare a du comptable.
+        """
+        vide = ({}, 0.0, 0.0, 0, {})
+        if not variant_ids or not warehouse_ids:
+            return vide
+        request.env.cr.execute("""
+            SELECT sq.product_id, w.id, COALESCE(SUM(sq.quantity), 0)
+              FROM stock_quant sq
+              JOIN stock_location l ON l.id = sq.location_id
+              JOIN stock_warehouse w ON w.id = ANY(%(wh)s)
+              JOIN stock_location wl ON wl.id = w.lot_stock_id
+             WHERE sq.product_id = ANY(%(variants)s)
+               AND l.parent_path LIKE wl.parent_path || '%%'
+             GROUP BY 1, 2
+        """, {'wh': list(warehouse_ids), 'variants': list(variant_ids)})
+        positif_par_variante = {}
+        net_par_variante = {}
+        total_present = total_negatif = 0.0
+        magasins_negatifs = set()
+        for pid, wh_id, qty in request.env.cr.fetchall():
+            qty = float(qty or 0.0)
+            net_par_variante[pid] = net_par_variante.get(pid, 0.0) + qty
+            if qty > 0:
+                positif_par_variante[pid] = positif_par_variante.get(pid, 0.0) + qty
+                total_present += qty
+            elif qty < 0:
+                total_negatif += qty
+                magasins_negatifs.add(wh_id)
+        return (positif_par_variante, total_present, total_negatif,
+                len(magasins_negatifs), net_par_variante)
+
+    def _stock_ledger_by_variant(self, variant_ids, inside_ids):
+        """Stock attendu par variante d'apres les mouvements valides.
+
+        Meme principe que _stock_ledger_buckets, mais groupe par variante :
+        sert au tableau "Variantes Couleurs" et au pop-up couleur, pour que
+        la colonne "Reste" soit comparable au stock reel au lieu d'etre une
+        estimation papier (achats commandes - ventes) qui ne pouvait jamais
+        y correspondre.
+        """
+        if not variant_ids or not inside_ids:
+            return {}
+        request.env.cr.execute("""
+            SELECT sml.product_id,
+                   COALESCE(SUM(CASE WHEN sml.location_dest_id = ANY(%(inside)s)
+                                     THEN sml.quantity ELSE -sml.quantity END), 0)
+              FROM stock_move_line sml
+             WHERE sml.state = 'done'
+               AND sml.product_id = ANY(%(variants)s)
+               AND ((sml.location_dest_id = ANY(%(inside)s)
+                     AND NOT (sml.location_id = ANY(%(inside)s)))
+                 OR (sml.location_id = ANY(%(inside)s)
+                     AND NOT (sml.location_dest_id = ANY(%(inside)s))))
+             GROUP BY 1
+        """, {'inside': list(inside_ids), 'variants': list(variant_ids)})
+        return {r[0]: float(r[1] or 0.0) for r in request.env.cr.fetchall()}
+
+    def _reconciliation_scope(self, kw):
+        """Entrepots + emplacements internes reellement additionnes dans la
+        carte "Stock Reel Odoo" de la fiche produit.
+
+        Reproduit a l'identique la regle de _compute_product_detail : magasin
+        choisi dans la fiche s'il y en a un, sinon les societes cochees dans
+        le selecteur Odoo, sinon tout le reseau des magasins actifs.
+        """
+        non_retail_company_ids = self._get_non_retail_company_ids()
+        context_company_ids = self._get_context_company_ids()
+        excluded = self._get_excluded_non_retail_ids(kw)
+        explicit_non_retail = [c for c in non_retail_company_ids if c not in excluded]
+        Warehouse = request.env['stock.warehouse'].sudo()
+        warehouses = Warehouse.search([
+            ('company_id', 'not in', non_retail_company_ids),
+            ('id', 'in', self._get_active_shop_mappings().mapped('warehouse_id').ids),
+        ])
+        if explicit_non_retail:
+            warehouses |= Warehouse.search([('company_id', 'in', explicit_non_retail)])
+        if kw.get('shop_field'):
+            scope = self._get_shop_scope(kw['shop_field'])
+            if scope and scope['warehouse']:
+                warehouses = scope['warehouse']
+        elif context_company_ids:
+            warehouses = warehouses.filtered(
+                lambda w: w.company_id.id in context_company_ids
+            )
+        lot_stock_ids = warehouses.mapped('lot_stock_id').ids
+        inside_ids = request.env['stock.location'].sudo().search([
+            ('id', 'child_of', lot_stock_ids)
+        ]).ids if lot_stock_ids else []
+        return warehouses, inside_ids
+
+    def _stock_reconciliation(self, variant_ids, inside_ids, qty_purchased,
+                              qty_sold, stock_reel):
+        """Decompose "stock attendu vs stock reel" en postes nommes.
+
+        `qty_purchased` / `qty_sold` viennent des DOCUMENTS (bons de commande
+        recus, lignes de caisse + bons de vente livres) : ce sont les deux
+        cartes du haut de fiche, donc la reconciliation part d'elles pour
+        rester lisible. Tout ce que les mouvements montrent en plus est isole
+        sur sa propre ligne, jamais fondu dans un "ecart".
+        """
+        buckets = self._stock_ledger_buckets(variant_ids, inside_ids)
+
+        def q(sens, usage):
+            return buckets.get((sens, usage), 0.0)
+
+        # BLOC 1 — le stock expliqué par les SEULS mouvements. Chaque ligne
+        # est une somme brute d'un type de mouvement, jamais un reste
+        # calculé : c'est ce qui garantit que le total retombe toujours sur
+        # le stock réel quand la traçabilité est complète.
+        autres_in = autres_out = 0.0
+        for (sens, usage), qty in buckets.items():
+            if usage in ('supplier', 'customer', 'inventory'):
+                continue
+            if sens == 'in':
+                autres_in += qty
+            else:
+                autres_out += qty
+
+        stock_attendu = (
+            q('in', 'supplier') - q('out', 'supplier')
+            + q('in', 'customer') - q('out', 'customer')
+            + q('in', 'inventory') - q('out', 'inventory')
+            + autres_in - autres_out
+        )
+
+        # BLOC 2 — pourquoi les cartes du haut (qui viennent des DOCUMENTS)
+        # ne donnent pas le meme chiffre que les mouvements. Ce n'est PAS
+        # une composante du stock : c'est une comparaison, affichee a part
+        # pour ne pas laisser croire a un calcul bancal.
+        recu_mouvements = q('in', 'supplier') - q('out', 'supplier')
+        sorties_client = q('out', 'customer') - q('in', 'customer')
+
+        return {
+            # Mouvements bruts
+            'recept_fournisseur': int(round(q('in', 'supplier'))),
+            'retour_fournisseur': int(round(q('out', 'supplier'))),
+            'sortie_client': int(round(q('out', 'customer'))),
+            'retour_client': int(round(q('in', 'customer'))),
+            'inventaire_gain': int(round(q('in', 'inventory'))),
+            'inventaire_perte': int(round(q('out', 'inventory'))),
+            'autres_in': int(round(autres_in)),
+            'autres_out': int(round(autres_out)),
+            'stock_attendu': int(round(stock_attendu)),
+            'stock_reel': int(round(stock_reel)),
+            'ecart': int(round(stock_attendu - stock_reel)),
+            # Comparaison documents vs mouvements
+            'qty_purchased_doc': int(round(qty_purchased)),
+            'recu_mouvements': int(round(recu_mouvements)),
+            'reception_hors_bon': int(round(recu_mouvements - qty_purchased)),
+            'qty_sold_doc': int(round(qty_sold)),
+            'sorties_client_mvt': int(round(sorties_client)),
+            'sortie_hors_vente': int(round(sorties_client - qty_sold)),
+            # Conservés pour les exports CSV/XLSX
+            'achats_recus': int(round(qty_purchased)),
+            'ventes_livrees': int(round(qty_sold)),
+            'inventaire_net': int(round(q('out', 'inventory') - q('in', 'inventory'))),
+            'autres_net': int(round(autres_out - autres_in)),
+        }
+
+    @http.route('/mavie/api/product-stock-detail', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_product_stock_detail(self, **kw):
+        """Pieces justificatives de chaque ligne de la reconciliation.
+
+        DEMANDE UTILISATEUR : en cliquant sur la carte "Stock Reel Odoo",
+        voir le tableau qui explique le stock ligne par ligne AVEC les
+        documents derriere chaque ligne (quel bon de commande, quel bon de
+        retour, quel ajustement). Les totaux, eux, arrivent deja avec la
+        fiche produit (cle `reconciliation`) : cette route ne renvoie que le
+        detail, pour ne pas ralentir l'ouverture de la fiche.
+        """
+        try:
+            article_id = kw.get('article_id')
+            if not article_id:
+                return {'error': 'Reference manquante.'}
+            product_tmpl = request.env['product.template'].sudo().browse(int(article_id))
+            if not product_tmpl.exists():
+                return {'error': 'Reference introuvable.'}
+            variants = request.env['product.product'].sudo().with_context(
+                active_test=False
+            ).search([('product_tmpl_id', '=', product_tmpl.id)])
+            if not variants:
+                return {'error': 'Aucune variante pour cette reference.'}
+
+            warehouses, inside_ids = self._reconciliation_scope(kw)
+            if not inside_ids:
+                return {'error': 'Aucun magasin dans le perimetre selectionne.'}
+
+            MoveLine = request.env['stock.move.line'].sudo()
+
+            def _doc_name(ml):
+                if ml.picking_id:
+                    return ml.picking_id.name
+                return ml.reference or (ml.move_id.origin if ml.move_id else '') or '—'
+
+            # ── 1. Achats : bons de commande du perimetre, commande vs recu.
+            po_lines = request.env['purchase.order.line'].sudo().search(
+                self._build_purchase_domain(kw, [product_tmpl.id])
+            )
+            achats_by_order = {}
+            for pol in po_lines:
+                order = pol.order_id
+                row = achats_by_order.setdefault(order.id, {
+                    'bon': order.name,
+                    'date': str(order.date_order)[:10] if order.date_order else '—',
+                    'fournisseur': order.partner_id.name or '—',
+                    'commande': 0.0,
+                    'recu': 0.0,
+                })
+                row['commande'] += pol.product_qty
+                row['recu'] += pol.qty_received
+            achats = []
+            for row in achats_by_order.values():
+                row['commande'] = int(round(row['commande']))
+                row['recu'] = int(round(row['recu']))
+                row['ecart'] = row['commande'] - row['recu']
+                achats.append(row)
+            achats.sort(key=lambda r: (-r['ecart'], r['date']))
+
+            # ── 2. Retours au fournisseur : sorties vers un emplacement
+            # fournisseur, regroupees par bon.
+            retours_fournisseur = {}
+            for ml in MoveLine.search([
+                ('state', '=', 'done'),
+                ('product_id', 'in', variants.ids),
+                ('location_id', 'in', inside_ids),
+                ('location_dest_id.usage', '=', 'supplier'),
+            ]):
+                key = _doc_name(ml)
+                row = retours_fournisseur.setdefault(key, {
+                    'bon': key,
+                    'origine': (ml.picking_id.origin if ml.picking_id else '') or '—',
+                    'date': str(ml.date)[:10] if ml.date else '—',
+                    'qty': 0.0,
+                })
+                row['qty'] += ml.quantity
+                if ml.date and str(ml.date)[:10] > row['date']:
+                    row['date'] = str(ml.date)[:10]
+            retours_fournisseur = sorted(
+                ({**r, 'qty': int(round(r['qty']))} for r in retours_fournisseur.values()),
+                key=lambda r: -r['qty'],
+            )
+
+            # ── 3. Sorties vers les clients, par type de document : c'est ce
+            # qui permet de voir qu'une sortie est passee par un bon de
+            # livraison et non par la caisse (donc jamais comptee en vente).
+            def _type_doc(ml):
+                picking_type = ml.picking_id.picking_type_id if ml.picking_id else False
+                if picking_type:
+                    return picking_type.display_name or picking_type.name or 'Autre'
+                return 'Mouvement sans bon'
+
+            ventes_docs = {}
+            for direction, domain in (
+                ('sortie', [('location_id', 'in', inside_ids),
+                            ('location_dest_id.usage', '=', 'customer')]),
+                ('retour', [('location_dest_id', 'in', inside_ids),
+                            ('location_id.usage', '=', 'customer')]),
+            ):
+                for ml in MoveLine.search([
+                    ('state', '=', 'done'),
+                    ('product_id', 'in', variants.ids),
+                ] + domain):
+                    label = _type_doc(ml)
+                    row = ventes_docs.setdefault(label, {
+                        'type_document': label, 'sortie': 0.0, 'retour': 0.0,
+                    })
+                    row[direction] += ml.quantity
+            ventes_documents = sorted(
+                ({'type_document': r['type_document'],
+                  'sortie': int(round(r['sortie'])),
+                  'retour': int(round(r['retour'])),
+                  'net': int(round(r['sortie'] - r['retour']))}
+                 for r in ventes_docs.values()),
+                key=lambda r: -r['net'],
+            )
+
+            # ── 4. Retours sur bon de vente (return_id pointant sur une
+            # livraison), a distinguer d'un retour de caisse.
+            retours_vente_by_doc = {}
+            for ml in MoveLine.search([
+                ('state', '=', 'done'),
+                ('product_id', 'in', variants.ids),
+                ('location_dest_id', 'in', inside_ids),
+                ('location_id.usage', '=', 'customer'),
+                ('picking_id.return_id', '!=', False),
+            ]):
+                origine = ml.picking_id.return_id
+                if origine.picking_type_id.code != 'outgoing':
+                    continue
+                # Un bon de retour porte une ligne par variante : on regroupe
+                # par document, sinon la meme reference ressort 4 fois.
+                row = retours_vente_by_doc.setdefault(ml.picking_id.id, {
+                    'bon': ml.picking_id.name,
+                    'livraison': origine.name,
+                    'bon_vente': origine.origin or '—',
+                    'date': str(ml.date)[:10] if ml.date else '—',
+                    'qty': 0.0,
+                })
+                row['qty'] += ml.quantity
+            retours_vente = sorted(
+                ({**r, 'qty': int(round(r['qty']))} for r in retours_vente_by_doc.values()),
+                key=lambda r: -r['qty'],
+            )
+
+            # DEMANDE UTILISATEUR (2026-09-07) : le detail mensuel des
+            # ajustements d'inventaire a ete retire du pop-up. Les totaux
+            # pertes/gains restent affiches dans le bloc 1 (reconciliation),
+            # ou ils comptent vraiment ; le decoupage par mois n'ajoutait
+            # rien et allongeait la page. On ne le calcule donc plus.
+
+            return {
+                'ref': product_tmpl.base_pivot_reference or product_tmpl.default_code or product_tmpl.name,
+                'name': product_tmpl.name,
+                'perimetre': ', '.join(warehouses.mapped('name')) or '—',
+                'achats': achats[:60],
+                'achats_total': len(achats),
+                'retours_fournisseur': retours_fournisseur[:40],
+                'ventes_documents': ventes_documents,
+                'retours_vente': retours_vente[:40],
+            }
+        except Exception as e:
+            _logger.error("Erreur api_product_stock_detail: %s", e, exc_info=True)
+            return {'error': str(e)}
+
     def _compute_product_detail(self, kw):
         try:
             article_id = kw.get('article_id')
@@ -2727,7 +3244,10 @@ class MaVieDashboardController(http.Controller):
                     self._build_non_retail_sale_domain(kw, [product_tmpl.id])
                 )
                 if ca_so_lines:
-                    qty_sold += int(sum(ca_so_lines.mapped('product_uom_qty')))
+                    # qty_delivered (net des retours sur bon de vente), pas
+                    # product_uom_qty : une commande livrée puis retournée en
+                    # totalité ne doit pas rester comptée comme vendue.
+                    qty_sold += int(sum(ca_so_lines.mapped('qty_delivered')))
                     ca += sum(ca_so_lines.mapped('price_total'))
                     ca_ht += sum(ca_so_lines.mapped('price_subtotal'))
 
@@ -2745,7 +3265,13 @@ class MaVieDashboardController(http.Controller):
 
             purchase_domain = self._build_purchase_domain(kw, [product_tmpl.id])
             po_lines = request.env['purchase.order.line'].sudo().search(purchase_domain)
-            qty_purchased = int(sum(po_lines.mapped('product_qty'))) if po_lines else 0
+            # Qté achetée = quantité RÉELLEMENT REÇUE. Odoo tient
+            # qty_received net des retours fournisseur (vérifié en base :
+            # P01085 = 4 950 commandé / 0 reçu, tout ayant été renvoyé).
+            # product_qty (commandé) reste calculé à côté pour le prix
+            # d'achat moyen uniquement.
+            qty_purchased = int(sum(po_lines.mapped('qty_received'))) if po_lines else 0
+            qty_ordered = int(sum(po_lines.mapped('product_qty'))) if po_lines else 0
             # CA Achat = coût réel des achats tel que facturé, affiché en TTC
             # comme tous les CA (décision utilisateur 2026-08-18). La version
             # HT sert à la marge, qui doit comparer du HT à du HT.
@@ -2763,8 +3289,8 @@ class MaVieDashboardController(http.Controller):
             # pas laisser croire à une marge nulle.
             # list_price est HT, donc on compare avec le prix d'achat HT.
             pv_ttc_ref = product_tmpl.list_price or 0.0
-            if qty_purchased > 0 and ca_achat_ht > 0 and pv_ttc_ref > 0:
-                prix_achat_moyen = ca_achat_ht / qty_purchased
+            if qty_ordered > 0 and ca_achat_ht > 0 and pv_ttc_ref > 0:
+                prix_achat_moyen = ca_achat_ht / qty_ordered
                 margin = round((pv_ttc_ref - prix_achat_moyen) / pv_ttc_ref * 100, 1)
             else:
                 margin = None
@@ -2879,9 +3405,31 @@ class MaVieDashboardController(http.Controller):
             # (product_id = couleur+taille précise) — vérifié en base :
             # reconciliation quasi parfaite par taille (41 variantes/42 avec
             # un "reste" positif sur un échantillon réel).
+            # qty_received, comme la carte "Qté achetée" : une commande
+            # confirmee mais jamais receptionnee, ou receptionnee puis
+            # renvoyee au fournisseur, ne doit pas gonfler "Total pieces".
             purchased_by_variant = {}
             for pol in po_lines:
-                purchased_by_variant[pol.product_id.id] = purchased_by_variant.get(pol.product_id.id, 0) + pol.product_qty
+                purchased_by_variant[pol.product_id.id] = purchased_by_variant.get(pol.product_id.id, 0) + pol.qty_received
+
+            # Stock attendu par variante d'apres les mouvements, sur le MEME
+            # perimetre que var_stock ci-dessous (retail_lot_stock_ids) :
+            # c'est ce qui remplace l'ancien "Reste = achats - ventes", une
+            # estimation papier qui ne pouvait structurellement pas tomber
+            # sur le stock reel.
+            retail_inside_ids = request.env['stock.location'].sudo().search([
+                ('id', 'child_of', retail_lot_stock_ids)
+            ]).ids if retail_lot_stock_ids else []
+            attendu_by_variant = self._stock_ledger_by_variant(
+                product_variants.ids, retail_inside_ids
+            )
+
+            # Stock present par variante (negatifs exclus, positivite jugee
+            # magasin par magasin) : la colonne Stock du tableau des couleurs
+            # doit suivre la meme regle que la carte du haut, sinon la somme
+            # des couleurs ne correspond plus au total affiche.
+            _pv = self._positive_stock(product_variants.ids, variant_warehouses.ids)
+            positif_par_variante, net_par_variante = _pv[0], _pv[4]
 
             by_color = {}
             for v in product_variants:
@@ -2904,11 +3452,12 @@ class MaVieDashboardController(http.Controller):
                 # (retail_lot_stock_ids, calculé plus haut) — sinon la somme
                 # des stocks par couleur ne correspond jamais au total
                 # affiché en haut.
-                quants_v = request.env['stock.quant'].sudo().search([
-                    ('product_id', '=', v.id),
-                    ('location_id', 'child_of', retail_lot_stock_ids),
-                ])
-                var_stock = int(sum(quants_v.mapped('quantity'))) if quants_v else 0
+                # Stock present (negatifs exclus), meme regle que la carte.
+                var_stock = int(round(positif_par_variante.get(v.id, 0.0)))
+                # Stock comptable (negatifs inclus) : sert uniquement au
+                # controle "quantite ecrite sans mouvement", qui doit se
+                # comparer a du comptable, pas au stock present.
+                var_stock_comptable = int(round(net_par_variante.get(v.id, 0.0)))
 
                 # DEMANDE UTILISATEUR (2026-08-24) : ce tableau s'appelle
                 # "Variantes Couleurs" et doit lister des COULEURS, pas des
@@ -2936,6 +3485,8 @@ class MaVieDashboardController(http.Controller):
                         'dispatch_source': None,
                         'dispatch_missing': False,
                         'stock': 0,
+                        'stock_comptable': 0,
+                        'attendu': 0,
                         'stock_shop': 0 if kw.get('shop_field') else None,
                         'shops': {},
                     }
@@ -2947,6 +3498,8 @@ class MaVieDashboardController(http.Controller):
                 if dispatch_source:
                     entry['dispatch_source'] = dispatch_source
                 entry['stock'] += var_stock
+                entry['stock_comptable'] += var_stock_comptable
+                entry['attendu'] += int(round(attendu_by_variant.get(v.id, 0.0)))
                 if kw.get('shop_field'):
                     entry['stock_shop'] += int(stock_shop_by_variant.get(v.id, 0))
                 for shop_name, shop_qty in (stat['shops'] or {}).items():
@@ -3029,17 +3582,33 @@ class MaVieDashboardController(http.Controller):
                     v['discordance_detail'] = None
                     continue
 
-                # Total pièces = valeur dispatchée à l'arrivage (convertie en
-                # pièces réelles), figée une bonne fois pour toutes — JAMAIS
-                # recalculée à partir du stock actuel/des ventes. Un écart
-                # entre "dispatché" et "stock + vendu" est un vrai problème de
-                # données (mauvais dispatch, restock non tracé...) qui doit
-                # être visible, pas masqué en gonflant artificiellement ce nombre.
+                # Total pièces = quantité réellement RÉCEPTIONNÉE sur les
+                # commandes fournisseur pour cette couleur (qty_received),
+                # nette des retours au fournisseur.
                 v['total_pieces'] = dispatched_v
-                v['reste'] = v['total_pieces'] - qty_sold_v
-                v['discordance'] = abs(dispatched_v - (stock_v + qty_sold_v)) > 0.01
+
+                # "Reste" ne vaut plus "Total pièces − Vendu" : cette
+                # soustraction mélangeait des DOCUMENTS (achats, tickets) et
+                # ne pouvait donc jamais retomber sur le stock physique — sur
+                # LQ-119 NOIR elle affichait 17 face à 9 en stock réel, sans
+                # qu'aucune des deux valeurs ne soit fausse.
+                # Reste = stock attendu d'après TOUS les mouvements validés
+                # de cette couleur, sur le même périmètre que la colonne
+                # Stock. Il est donc directement comparable, et l'écart qui
+                # subsiste est une vraie anomalie (quantité écrite sans
+                # mouvement), pas un artefact de calcul.
+                attendu_v = v.get('attendu', 0)
+                v['reste'] = attendu_v
+                # La discordance se juge contre le stock COMPTABLE : c'est le
+                # seul chiffre auquel les mouvements peuvent retomber. La
+                # comparer au stock present ferait sonner l'alerte sur toutes
+                # les couleurs ayant un magasin en negatif, ce qui est une
+                # autre anomalie, signalee separement.
+                stock_comptable_v = v.get('stock_comptable', 0)
+                v['discordance'] = abs(attendu_v - stock_comptable_v) > 0.01
                 v['discordance_detail'] = (
-                    f"Dispatché: {dispatched_v}, Stock+Vendu: {stock_v + qty_sold_v}"
+                    f"Stock attendu d'après les mouvements: {attendu_v}, "
+                    f"stock comptable Odoo: {stock_comptable_v}"
                     if v['discordance'] else None
                 )
 
@@ -3077,11 +3646,17 @@ class MaVieDashboardController(http.Controller):
                 _logger.warning(f"Erreur stock réel: {str(e)}")
 
             stock_total = 0
+            # Entrepots reellement additionnes dans stock_total : la
+            # reconciliation doit porter EXACTEMENT sur le meme perimetre,
+            # sinon le "stock attendu" ne peut pas retomber sur le stock
+            # affiche.
+            recon_warehouses = scoped_warehouses
             if kw.get('shop_field'):
                 scope_detail = self._get_shop_scope(kw['shop_field'])
                 if scope_detail and scope_detail['warehouse']:
                     target_wh = scope_detail['warehouse'].name
                     stock_total = sum(s['stock'] for s in stock_by_store if s['store_name'] == target_wh)
+                    recon_warehouses = scope_detail['warehouse']
                 else:
                     stock_total = sum(s['stock'] for s in stock_by_store)
             else:
@@ -3092,8 +3667,35 @@ class MaVieDashboardController(http.Controller):
                     stock_total = sum(
                         s['stock'] for s in stock_by_store if s['company_id'] in context_company_ids
                     )
+                    recon_warehouses = scoped_warehouses.filtered(
+                        lambda w: w.company_id.id in context_company_ids
+                    )
                 else:
                     stock_total = sum(s['stock'] for s in stock_by_store)
+
+            # RECONCILIATION : stock attendu (mouvements valides) vs stock
+            # reel (stock.quant), poste par poste. Remplace l'ancien
+            # "stock theorique = achete - vendu" qui ne pouvait pas boucler.
+            recon_lot_stock_ids = recon_warehouses.mapped('lot_stock_id').ids
+            recon_inside_ids = request.env['stock.location'].sudo().search([
+                ('id', 'child_of', recon_lot_stock_ids)
+            ]).ids if recon_lot_stock_ids else []
+            reconciliation = self._stock_reconciliation(
+                product_variants.ids, recon_inside_ids,
+                qty_purchased, qty_sold, stock_total,
+            )
+
+            # Stock REELLEMENT PRESENT en rayon : les stocks negatifs ne
+            # comptent pas comme du stock. La reconciliation, elle, reste
+            # ancree sur le total comptable (stock_total) — c'est le seul
+            # chiffre auquel les mouvements peuvent retomber.
+            (_pos_by_variant, stock_present, stock_negatif,
+             nb_magasins_negatifs, _net_by_variant) = self._positive_stock(
+                product_variants.ids, recon_warehouses.ids
+            )
+            reconciliation['stock_present'] = int(round(stock_present))
+            reconciliation['stock_negatif'] = int(round(stock_negatif))
+            reconciliation['nb_magasins_negatifs'] = nb_magasins_negatifs
 
             # Qté Dispatché par magasin — deux sources, dans cet ordre de
             # priorité :
@@ -3119,7 +3721,9 @@ class MaVieDashboardController(http.Controller):
                 wh = pol.order_id.picking_type_id.warehouse_id
                 if not wh:
                     continue
-                purchased_by_warehouse[wh.id] = purchased_by_warehouse.get(wh.id, 0) + pol.product_qty
+                # qty_received, pour rester cohérent avec la carte
+                # "Qté achetée" (dont le total par magasin doit correspondre).
+                purchased_by_warehouse[wh.id] = purchased_by_warehouse.get(wh.id, 0) + pol.qty_received
 
             shop_mappings_by_field = {sm.shop_field: sm for sm in shop_mappings if sm.shop_field}
 
@@ -3194,13 +3798,24 @@ class MaVieDashboardController(http.Controller):
                 'family': product_tmpl.categ_id.name if product_tmpl.categ_id else '—',
                 'qty_sold': qty_sold,
                 'qty_purchased': qty_purchased,
+                # Stock comptable Odoo (negatifs inclus) — sert de reference
+                # a la reconciliation, qui ne peut retomber que sur lui.
                 'stock_total': stock_total,
-                # Stock théorique = ce qu'il devrait rester si tout mouvement
-                # de stock était correctement tracé dans Odoo (achats - ventes).
-                # L'écart avec stock_total pointe des pertes/sorties non
-                # tracées (stock négatif ailleurs, ventes hors POS, casse...).
-                'stock_theorique': qty_purchased - qty_sold,
-                'stock_ecart': (qty_purchased - qty_sold) - stock_total,
+                # Stock REELLEMENT PRESENT en rayon (negatifs exclus) :
+                # c'est ce que la carte affiche, les stocks negatifs de cette
+                # base ne pouvant pas etre corriges dans Odoo.
+                'stock_present': int(round(stock_present)),
+                'stock_negatif': int(round(stock_negatif)),
+                'nb_magasins_negatifs': nb_magasins_negatifs,
+                # Stock attendu = reconstitue a partir des mouvements valides
+                # (achats recus, ventes livrees, sorties hors vente,
+                # inventaire, autres). L'ecart qui subsiste apres ca n'est
+                # explique par AUCUN mouvement : c'est une anomalie de
+                # donnees, pas un poste metier oublie.
+                'stock_theorique': reconciliation['stock_attendu'],
+                'stock_ecart': reconciliation['ecart'],
+                'reconciliation': reconciliation,
+                'qty_ordered': qty_ordered,
                 'ca': ca,
                 'ca_ht': round(ca_ht, 2),
                 'ca_achat': round(ca_achat, 2),
@@ -3271,8 +3886,34 @@ class MaVieDashboardController(http.Controller):
         writer.writerow(['Qté vendue', data.get('qty_sold', 0)])
         writer.writerow(['Qté achetée', data.get('qty_purchased', 0)])
         writer.writerow(['Stock réel Odoo', data.get('stock_total', 0)])
-        writer.writerow(['Stock théorique (achetée - vendue)', data.get('stock_theorique', 0)])
-        writer.writerow(['Écart stock (théorique - réel)', data.get('stock_ecart', 0)])
+        writer.writerow(['Stock attendu (mouvements validés)', data.get('stock_theorique', 0)])
+        writer.writerow(['Écart inexpliqué (attendu - réel)', data.get('stock_ecart', 0)])
+        writer.writerow([])
+        # Le detail de la reconciliation, dans le meme ordre que le pop-up
+        # de la carte "Stock Reel Odoo".
+        recon = data.get('reconciliation') or {}
+        if recon:
+            writer.writerow(['1. Le stock expliqué par les mouvements', 'Pièces'])
+            writer.writerow(['Réceptions fournisseur', recon.get('recept_fournisseur', 0)])
+            writer.writerow(['Retours au fournisseur', -recon.get('retour_fournisseur', 0)])
+            writer.writerow(['Retours clients', recon.get('retour_client', 0)])
+            writer.writerow(['Sorties vers les clients', -recon.get('sortie_client', 0)])
+            writer.writerow(["Gains d'inventaire", recon.get('inventaire_gain', 0)])
+            writer.writerow(["Pertes d'inventaire", -recon.get('inventaire_perte', 0)])
+            writer.writerow(['Autres entrées', recon.get('autres_in', 0)])
+            writer.writerow(['Autres sorties', -recon.get('autres_out', 0)])
+            writer.writerow(['= Stock attendu', recon.get('stock_attendu', 0)])
+            writer.writerow(['Stock réel Odoo', recon.get('stock_reel', 0)])
+            writer.writerow(['Écart inexpliqué', recon.get('ecart', 0)])
+            writer.writerow([])
+            writer.writerow(['2. Documents vs mouvements', 'Pièces'])
+            writer.writerow(['Qté achetée affichée (bons de commande reçus)', recon.get('qty_purchased_doc', 0)])
+            writer.writerow(['Réceptions réellement entrées ici', recon.get('recu_mouvements', 0)])
+            writer.writerow(['Différence achats', recon.get('reception_hors_bon', 0)])
+            writer.writerow(['Qté vendue affichée (caisse + bons de vente livrés)', recon.get('qty_sold_doc', 0)])
+            writer.writerow(['Sorties clients réellement constatées ici', recon.get('sorties_client_mvt', 0)])
+            writer.writerow(['Différence ventes', recon.get('sortie_hors_vente', 0)])
+            writer.writerow([])
         writer.writerow(['CA Vendu (TTC)', data.get('ca', 0)])
         writer.writerow(['CA Achat', data.get('ca_achat', 0)])
         writer.writerow(['Sell-through (%)', data.get('sell_through', 0)])
@@ -3347,8 +3988,8 @@ class MaVieDashboardController(http.Controller):
             ('Qté vendue', data.get('qty_sold', 0), 'num'),
             ('Qté achetée', data.get('qty_purchased', 0), 'num'),
             ('Stock réel Odoo', data.get('stock_total', 0), 'num'),
-            ('Stock théorique (achetée - vendue)', data.get('stock_theorique', 0), 'num'),
-            ('Écart stock (théorique - réel)', data.get('stock_ecart', 0), 'num'),
+            ('Stock attendu (mouvements validés)', data.get('stock_theorique', 0), 'num'),
+            ('Écart inexpliqué (attendu - réel)', data.get('stock_ecart', 0), 'num'),
             ('CA Vendu (TTC)', data.get('ca', 0), 'money'),
             ('CA Achat', data.get('ca_achat', 0), 'money'),
             ('Sell-through (%)', data.get('sell_through', 0), 'money'),
@@ -3356,6 +3997,40 @@ class MaVieDashboardController(http.Controller):
             sheet.write(row, 0, label, fmt['cell'])
             sheet.write(row, 1, value, fmt[style])
             row += 1
+
+        # Reconciliation du stock, dans le meme ordre que le pop-up de la
+        # carte "Stock Reel Odoo" : chaque poste nomme, l'ecart en bas.
+        recon = data.get('reconciliation') or {}
+        if recon:
+            row += 1
+            sheet.write(row, 0, 'Réconciliation du stock', fmt['title'])
+            row += 1
+            sheet.write(row, 0, 'Poste', fmt['header'])
+            sheet.write(row, 1, 'Pièces', fmt['header'])
+            row += 1
+            for label, value in [
+                ('Réceptions fournisseur', recon.get('recept_fournisseur', 0)),
+                ('Retours au fournisseur', -recon.get('retour_fournisseur', 0)),
+                ('Retours clients', recon.get('retour_client', 0)),
+                ('Sorties vers les clients', -recon.get('sortie_client', 0)),
+                ("Gains d'inventaire", recon.get('inventaire_gain', 0)),
+                ("Pertes d'inventaire", -recon.get('inventaire_perte', 0)),
+                ('Autres entrées', recon.get('autres_in', 0)),
+                ('Autres sorties', -recon.get('autres_out', 0)),
+                ('= Stock attendu', recon.get('stock_attendu', 0)),
+                ('Stock réel Odoo', recon.get('stock_reel', 0)),
+                ('Écart inexpliqué', recon.get('ecart', 0)),
+                ('— Documents vs mouvements —', ''),
+                ('Qté achetée affichée', recon.get('qty_purchased_doc', 0)),
+                ('Réceptions réellement entrées ici', recon.get('recu_mouvements', 0)),
+                ('Différence achats', recon.get('reception_hors_bon', 0)),
+                ('Qté vendue affichée', recon.get('qty_sold_doc', 0)),
+                ('Sorties clients réellement constatées ici', recon.get('sorties_client_mvt', 0)),
+                ('Différence ventes', recon.get('sortie_hors_vente', 0)),
+            ]:
+                sheet.write(row, 0, label, fmt['cell'])
+                sheet.write(row, 1, value, fmt['num'])
+                row += 1
 
         row += 1
         sheet.write(row, 0, 'Variantes couleurs (meilleure vente en tête)', fmt['title'])
@@ -3653,10 +4328,38 @@ class MaVieDashboardController(http.Controller):
                 _c, size_name = resolve_variant_color_size(v)
                 size_by_variant[v.id] = size_name or '—'
 
+            # BUG CORRIGE (2026-09-07) : ce tableau listait TOUS les magasins
+            # mappes sans tenir compte du selecteur de societe, alors que la
+            # carte "Stock total" du meme pop-up, elle, l'applique (via
+            # retail_lot_stock_ids). Les deux ne pouvaient donc pas se
+            # recouper des qu'une societe etait cochee. On reprend ici le
+            # meme perimetre. Le filtre MAGASIN de la fiche n'est
+            # volontairement PAS applique : ce tableau sert justement a voir
+            # ou se trouve la marchandise sur tout le reseau pour decider
+            # d'un transfert, et la carte "Stock total" ne l'applique pas non
+            # plus.
+            _warehouses, inside_ids = self._reconciliation_scope(
+                {k: val for k, val in kw.items() if k != 'shop_field'}
+            )
+            inside_set = set(inside_ids)
+
             mappings = self._get_active_shop_mappings()
             stores = []
+            total_reseau = 0.0
+            # DEMANDE UTILISATEUR (2026-09-07) : un stock negatif n'est pas
+            # du stock — on ne peut pas avoir -1 piece en rayon. Le total
+            # "ce qu'il y a reellement en magasin" ne doit donc additionner
+            # que les stocks positifs. Le total comptable Odoo (negatifs
+            # inclus) reste renvoye a cote : c'est lui qui sert de reference
+            # a la reconciliation de la fiche, les deux doivent rester
+            # lisibles sans se contredire.
+            total_present = 0.0
+            total_negatif = 0.0
+            nb_magasins_negatifs = 0
             for m in mappings:
                 if not m.warehouse_id or not m.warehouse_id.lot_stock_id:
+                    continue
+                if m.warehouse_id.lot_stock_id.id not in inside_set:
                     continue
                 quants = request.env['stock.quant'].sudo().search([
                     ('product_id', 'in', color_variants.ids),
@@ -3668,19 +4371,44 @@ class MaVieDashboardController(http.Controller):
                     total += q.quantity
                     size_name = size_by_variant.get(q.product_id.id, '—')
                     by_size[size_name] = by_size.get(size_name, 0.0) + q.quantity
+                total_reseau += total
+                if total > 0:
+                    total_present += total
+                elif total < 0:
+                    total_negatif += total
+                    nb_magasins_negatifs += 1
+                # Un magasin a stock nul n'apporte rien a la lecture, mais un
+                # stock NEGATIF doit rester visible : c'est justement lui qui
+                # explique qu'un total soit plus bas que la somme apparente
+                # des lignes positives.
+                if abs(total) < 0.01 and not by_size:
+                    continue
                 stores.append({
                     'shop_field': m.shop_field,
                     'shop_label': m.warehouse_id.name or m.shop_label or m.shop_field,
                     'city': m.city or '—',
                     'stock_total': int(round(total)),
-                    'by_size': {k: int(round(v)) for k, v in by_size.items()},
+                    'by_size': {k: int(round(v)) for k, v in by_size.items() if abs(v) >= 0.01},
                 })
 
             # Plus gros stock en premier — facilite le choix d'un magasin
             # source pour un futur transfert de cette couleur.
             stores.sort(key=lambda s: -s['stock_total'])
 
-            return {'color': color, 'stores': stores}
+            return {
+                'color': color,
+                'stores': stores,
+                # Ce qu'il y a vraiment en rayon : somme des stocks positifs.
+                'stock_present': int(round(total_present)),
+                # Les stocks negatifs, isoles : ce sont des anomalies
+                # (marchandise sortie sans jamais avoir ete recue dans ce
+                # magasin), pas du stock a soustraire du rayon.
+                'stock_negatif': int(round(total_negatif)),
+                'nb_magasins_negatifs': nb_magasins_negatifs,
+                # Total comptable Odoo (negatifs inclus) : c'est la valeur de
+                # la carte "Stock total" et de la reconciliation.
+                'stock_total': int(round(total_reseau)),
+            }
         except Exception as e:
             _logger.error(f"Erreur api_color_stock_by_store: {str(e)}", exc_info=True)
             return {'error': str(e), 'stores': []}

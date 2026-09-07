@@ -962,6 +962,7 @@
                 #product-history-overlay,
                 #valorisation-overlay,
                 #ecarts-overlay,
+                #stock-recon-overlay,
                 #ecart-detail-overlay {
                     position: fixed;
                     inset: 0;
@@ -978,13 +979,34 @@
                    paraît ne pas s'ouvrir. */
                 #ecart-detail-overlay { z-index: 9700; }
 
+                /* La réconciliation s'ouvre depuis la fiche produit, qui est
+                   elle-même un panneau : z-index au-dessus. */
+                #stock-recon-overlay { z-index: 9700; }
+
                 #product-history-overlay.active,
                 #valorisation-overlay.active,
                 #ecarts-overlay.active,
+                #stock-recon-overlay.active,
                 #ecart-detail-overlay.active {
                     display: flex;
                     animation: fadeInOverlay 0.22s ease;
                 }
+
+                /* Carte "Stock Réel Odoo" cliquable : elle ouvre le détail
+                   ligne par ligne du stock attendu. */
+                .detail-kpi-card.is-clickable {
+                    cursor: pointer;
+                    transition: box-shadow .15s ease, transform .15s ease;
+                }
+                .detail-kpi-card.is-clickable:hover {
+                    box-shadow: 0 6px 18px rgba(99,102,241,0.25);
+                    transform: translateY(-1px);
+                }
+                .recon-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+                .recon-table td { padding: 8px 10px; border-bottom: 1px solid #F1F5F9; }
+                .recon-table td.num { text-align: right; font-weight: 700; white-space: nowrap; }
+                .recon-table tr.recon-total td { border-top: 2px solid #CBD5E1; font-weight: 800; }
+                .recon-sub { color: #64748B; font-size: 0.78rem; }
 
                 .ruptures-panel {
                     background: var(--surface);
@@ -1259,15 +1281,16 @@
                         <div class="kpi-value" id="kpi-qty-sold">—</div>
                         <div class="kpi-subtext" id="kpi-qty-sold-solde"></div>
                     </div>
-                    <div class="kpi-card kpi-blue" id="card-qty-purchased">
+                    <div class="kpi-card kpi-blue" id="card-qty-purchased" title="Quantité RÉELLEMENT REÇUE sur les commandes fournisseur confirmées (qty_received), nette des retours au fournisseur : une commande confirmée mais jamais réceptionnée, ou reçue puis renvoyée, ne compte pas.">
                         <span class="kpi-icon">📥</span>
-                        <div class="kpi-label">Qté Achetée</div>
+                        <div class="kpi-label">Qté Achetée <span style="opacity:.6;font-weight:400">(reçue)</span></div>
                         <div class="kpi-value" id="kpi-qty-purchased">—</div>
                     </div>
-                    <div class="kpi-card kpi-amber" id="card-stock-total">
+                    <div class="kpi-card kpi-amber" id="card-stock-total" title="Stock réellement présent en rayon dans les magasins actifs. Les emplacements en stock négatif sont exclus : un stock négatif n'est pas de la marchandise, c'est la trace d'une vente sur un article jamais entré dans ce magasin. Le détail est rappelé sous le chiffre.">
                         <span class="kpi-icon">📦</span>
-                        <div class="kpi-label">Stock Réel Odoo</div>
+                        <div class="kpi-label">Stock en magasin</div>
                         <div class="kpi-value" id="kpi-stock-total">—</div>
+                        <div class="kpi-subtext" id="kpi-stock-negatif"></div>
                     </div>
                     <div class="kpi-card" id="card-sell-through">
                         <span class="kpi-icon">📊</span>
@@ -1447,9 +1470,9 @@
                                     <th>Réf</th>
                                     <th title="Montant TTC des commandes fournisseur confirmées pour cette référence.">CA Achat (TTC)</th>
                                     <th title="Montant toutes taxes comprises encaissé en caisse pour cette référence.">CA Vendu (TTC)</th>
-                                    <th title="Quantité achetée par les magasins (commandes fournisseur confirmées).">Qté achetée</th>
+                                    <th title="Quantité RÉELLEMENT REÇUE par les magasins sur les commandes fournisseur confirmées (qty_received), nette des retours au fournisseur. Une commande confirmée mais jamais réceptionnée ne compte pas.">Qté achetée</th>
                                     <th title="Quantité vendue en caisse (POS).">Qté vendue</th>
-                                    <th title="Reste = Qté achetée − Qté vendue. Estimation « papier » de ce qui devrait rester ; à comparer au stock physique réel.">Reste</th>
+                                    <th title="Reste = Qté reçue − Qté vendue livrée. Estimation « papier » de ce qui devrait rester ; à comparer au stock physique réel.">Reste</th>
                                 </tr>
                             </thead>
                             <tbody id="top-products-tbody"></tbody>
@@ -1472,9 +1495,9 @@
                                     <th>Réf</th>
                                     <th title="Montant TTC des commandes fournisseur confirmées pour cette référence.">CA Achat (TTC)</th>
                                     <th title="Montant toutes taxes comprises encaissé en caisse pour cette référence.">CA Vendu (TTC)</th>
-                                    <th title="Quantité achetée par les magasins (commandes fournisseur confirmées).">Qté achetée</th>
+                                    <th title="Quantité RÉELLEMENT REÇUE par les magasins sur les commandes fournisseur confirmées (qty_received), nette des retours au fournisseur. Une commande confirmée mais jamais réceptionnée ne compte pas.">Qté achetée</th>
                                     <th title="Quantité vendue en caisse (POS).">Qté vendue</th>
-                                    <th title="Reste = Qté achetée − Qté vendue. Estimation « papier » de ce qui devrait rester ; à comparer au stock physique réel.">Reste</th>
+                                    <th title="Reste = Qté reçue − Qté vendue livrée. Estimation « papier » de ce qui devrait rester ; à comparer au stock physique réel.">Reste</th>
                                 </tr>
                             </thead>
                             <tbody id="flop-products-tbody"></tbody>
@@ -1584,13 +1607,15 @@
                             <div class="d-sublabel" id="detail-qty-sold-solde"></div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label" title="Achats des sociétés magasins uniquement. Les achats de MOD FOR LIFE chez le fournisseur externe sont exclus pour ne pas compter deux fois la même marchandise (une fois à l'import, une fois à la revente interne) — c'est pourquoi ce chiffre vaut environ la moitié du bouton « Acheté » de la fiche produit Odoo.">📥 Qté achetée <span style="opacity:.6;font-weight:400">(magasins)</span></div>
+                            <div class="d-label" title="Quantité RÉELLEMENT REÇUE sur les commandes fournisseur confirmées (qty_received), nette des retours au fournisseur : une commande confirmée mais jamais réceptionnée, ou reçue puis renvoyée, ne compte pas. Achats des sociétés magasins uniquement — les achats de MOD FOR LIFE chez le fournisseur externe sont exclus pour ne pas compter deux fois la même marchandise.">📥 Qté achetée <span style="opacity:.6;font-weight:400">(reçue)</span></div>
                             <div class="d-value" id="detail-qty-purchased">—</div>
+                            <div class="d-sublabel" id="detail-qty-purchased-note"></div>
                         </div>
-                        <div class="detail-kpi-card">
+                        <div class="detail-kpi-card is-clickable" id="detail-stock-card" title="Cliquer pour voir le détail : comment on passe des achats reçus au stock réel, ligne par ligne.">
                             <div class="d-label" title="Stock physique présent dans les magasins actifs configurés. Le stock restant dans l'entrepôt MOD FOR LIFE, à DIGITAL SHOP ou dans un entrepôt non rattaché à un magasin actif est exclu — c'est pourquoi ce chiffre peut être inférieur au stock total affiché dans Inventaire.">📦 Stock Réel Odoo <span style="opacity:.6;font-weight:400">(magasins)</span></div>
                             <div class="d-value" id="detail-stock-total">—</div>
                             <div class="d-sublabel" id="detail-stock-ecart" style="display:none"></div>
+                            <div class="d-sublabel" style="color:#6366F1;font-weight:600;margin-top:2px;">🔍 Voir le détail</div>
                         </div>
                         <div class="detail-kpi-card">
                             <div class="d-label" title="Montant TTC facturé sur les commandes fournisseur — colonne « Total » dans Achats → Analyse.">🧾 CA Achat (TTC)</div>
@@ -1615,9 +1640,9 @@
                                 <tr>
                                     <th>#</th>
                                     <th>Couleur</th>
-                                    <th>Total pièces</th>
+                                    <th title="Quantité de cette couleur RÉELLEMENT RÉCEPTIONNÉE sur les commandes fournisseur, nette des retours au fournisseur.">Total pièces</th>
                                     <th>Qté vendue (stock magasin)</th>
-                                    <th>Reste</th>
+                                    <th title="Stock attendu d'après TOUS les mouvements de stock validés de cette couleur (réceptions, ventes, retours, inventaire, transferts). Doit être égal au stock réel — un ⚠️ signale une quantité écrite sans mouvement.">Stock attendu</th>
                                 </tr>
                             </thead>
                             <tbody id="detail-variants-tbody"></tbody>
@@ -1801,13 +1826,16 @@
                             <div class="d-value" id="color-detail-ca">—</div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label">📦 Total pièces</div>
+                            <div class="d-label" title="Quantité de cette couleur RÉELLEMENT RÉCEPTIONNÉE sur les commandes fournisseur, nette des retours au fournisseur.">📦 Total pièces <span style="opacity:.6;font-weight:400">(reçues)</span></div>
                             <div class="d-value" id="color-detail-total-pieces">—</div>
                         </div>
-                        <div class="detail-kpi-card">
-                            <div class="d-label">📊 Reste</div>
-                            <div class="d-value" id="color-detail-reste">—</div>
-                        </div>
+                        <!-- DEMANDE UTILISATEUR (2026-09-07) : la carte
+                             « Stock attendu » a été retirée. Elle affichait
+                             la même valeur que « Stock total » dès que la
+                             traçabilité était complète, donc deux cartes
+                             identiques côte à côte. Un écart entre les deux
+                             reste signalé par le bandeau d'alerte au-dessus
+                             du tableau. -->
                         <div class="detail-kpi-card">
                             <div class="d-label" title="Stock physique de cette couleur sur le périmètre actuellement filtré (sociétés cochées dans le sélecteur Odoo). Le tableau ci-dessous liste, lui, tout le réseau — utile pour repérer d'où faire venir la marchandise.">🏬 Stock total</div>
                             <div class="d-value" id="color-detail-stock-total">—</div>
@@ -1823,7 +1851,7 @@
                                 <tr>
                                     <th>Magasin</th>
                                     <th>Ville</th>
-                                    <th>Stock disponible</th>
+                                    <th title="Quantité physique en stock (stock.quant) pour cette couleur dans ce magasin. Un magasin en stock négatif reste listé : c’est lui qui explique qu’un total soit inférieur à la somme des lignes positives.">Stock</th>
                                     <th>Détail tailles</th>
                                 </tr>
                             </thead>
@@ -2011,6 +2039,25 @@
                     </h3>
                     <div id="ecart-detail-header" style="font-size:0.9rem; color:#334155; margin-bottom:14px;"></div>
                     <div id="ecart-detail-body" style="max-height:60vh; overflow-y:auto;"></div>
+                </div>
+            </div>
+
+            <!-- ══════════════════════════════════════════════════════
+                 RÉCONCILIATION DU STOCK D'UNE RÉFÉRENCE
+                 Ouvert en cliquant sur la carte "Stock Réel Odoo" de la
+                 fiche produit. Montre comment on passe des achats reçus au
+                 stock réel, poste par poste, avec les documents derrière
+                 chaque ligne — pour qu'aucune pièce ne reste dans un
+                 "écart" anonyme.
+            ═══════════════════════════════════════════════════════ -->
+            <div id="stock-recon-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-stock-recon-btn" title="Fermer">✕</button>
+                    <h3 style="margin:0 30px 4px 0; color:#0F172A; font-size:1.2rem; font-weight:700;">
+                        📦 D'où vient le stock réel ?
+                    </h3>
+                    <div id="stock-recon-header" style="font-size:0.9rem; color:#334155; margin-bottom:14px;"></div>
+                    <div id="stock-recon-body" style="max-height:65vh; overflow-y:auto;"></div>
                 </div>
             </div>
 

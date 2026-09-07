@@ -553,7 +553,9 @@ async function loadKPIs() {
             'kpi-panier-moyen':  formatMAD(data.panier_moyen),
             'kpi-qty-sold':      formatNumber(data.qty_sold),
             'kpi-qty-purchased': formatNumber(data.qty_purchased),
-            'kpi-stock-total':   formatNumber(data.stock_total),
+            // Stock réellement présent en rayon (négatifs exclus) — voir le
+            // commentaire de 'detail-stock-total'.
+            'kpi-stock-total':   formatNumber(data.stock_present),
             'kpi-sell-through':  formatPct(data.sell_through),
             'kpi-ruptures':      formatNumber(data.ruptures_count),
         };
@@ -598,6 +600,23 @@ async function loadKPIs() {
             // dans les seules données suivies, sans que ce soit une erreur).
             stEl.title = st > 100
                 ? 'Peut dépasser 100% : une partie du stock vendu provient d\'un stock initial ou d\'un ajustement jamais enregistré comme commande fournisseur suivie.'
+                : '';
+        }
+
+        // Rappel des stocks négatifs sous la carte Stock : ils sont exclus du
+        // chiffre affiché, il faut donc dire combien ils pèsent et où.
+        var stockNegEl = el('kpi-stock-negatif');
+        if (stockNegEl) {
+            var nbMagNeg = data.nb_magasins_negatifs || 0;
+            stockNegEl.textContent = nbMagNeg
+                ? '⚠️ ' + formatNumber(Math.abs(data.stock_negatif || 0)) + ' pièces en négatif ('
+                  + formatNumber(nbMagNeg) + ' magasins)'
+                : '';
+            stockNegEl.title = nbMagNeg
+                ? 'Ces pièces ne sont pas comptées dans le stock affiché : un stock négatif n\'est pas de '
+                  + 'la marchandise. Elles signalent des ventes sur des articles jamais entrés dans le '
+                  + 'magasin — le plus souvent un transfert entre magasins non enregistré. '
+                  + 'Stock comptable Odoo, négatifs inclus : ' + formatNumber(data.stock_total) + '.'
                 : '';
         }
 
@@ -769,12 +788,20 @@ function _renderProductTable(tbodyId, products, isFlop) {
         // Colonnes fixes quelle que soit la page — le tri, lui, continue de
         // dépendre de la page (voir sorted_top/sorted_flop côté serveur).
         var tdCaAchat = document.createElement('td');
-        tdCaAchat.textContent = formatMAD(p.ca_achat || 0);
         if (!p.ca_achat && p.qty_purchased) {
-            // Acheté mais sans prix renseigné sur les commandes : on le
-            // signale plutôt que de laisser croire à un achat gratuit.
+            // Acheté mais sans prix renseigné sur les commandes. On
+            // n'affiche PAS « 0,00 MAD » : ce zéro se lit comme un achat
+            // gratuit et fausse toute comparaison, alors que la donnée est
+            // simplement absente. Vérifié en base : 97,6 % des références
+            // achetées (2 450 sur 2 509) sont dans ce cas, aucun prix
+            // n'ayant été saisi sur les commandes avant mai 2026.
+            tdCaAchat.textContent = 'non renseigné';
             tdCaAchat.style.color = '#B45309';
-            tdCaAchat.title = 'Prix d\'achat non renseigné sur les commandes de cette référence.';
+            tdCaAchat.style.fontStyle = 'italic';
+            tdCaAchat.title = 'Aucun prix d\'achat n\'est saisi sur les commandes fournisseur de cette '
+                + 'référence. Ce n\'est pas un achat à 0 MAD : la donnée manque dans Odoo.';
+        } else {
+            tdCaAchat.textContent = formatMAD(p.ca_achat || 0);
         }
         tr.appendChild(tdCaAchat);
 
@@ -1099,9 +1126,17 @@ async function _fetchAndRenderDetail() {
     var kpiMap = {
         'detail-qty-sold':      formatNumber(data.qty_sold),
         'detail-qty-purchased': formatNumber(data.qty_purchased),
-        'detail-stock-total':   formatNumber(data.stock_total),
+        // Stock RÉELLEMENT PRÉSENT en rayon. Les stocks négatifs ne sont pas
+        // du stock : les soustraire donnait un total plus bas que ce que les
+        // magasins ont vraiment (9 au lieu de 13 sur LQ-119 NOIR). Ils sont
+        // signalés à part, sous la carte.
+        'detail-stock-total':   formatNumber(data.stock_present),
         'detail-ca':            formatMAD(data.ca),
-        'detail-ca-achat':      formatMAD(data.ca_achat),
+        // « 0,00 MAD » se lit comme un achat gratuit alors que la donnée est
+        // simplement absente : on écrit « non renseigné ». Vérifié en base :
+        // 2 450 références sur 2 509 n'ont aucun prix sur leurs commandes.
+        'detail-ca-achat':      (data.ca_achat === 0 && data.qty_purchased > 0)
+                                    ? 'non renseigné' : formatMAD(data.ca_achat),
         'detail-sell-through':  formatPct(data.sell_through),
 
     };
@@ -1121,10 +1156,37 @@ async function _fetchAndRenderDetail() {
     var detailCaHtEl = el('detail-ca-ht');
     if (detailCaHtEl) detailCaHtEl.textContent = '';
 
+    // « Qté achetée 0 » alors qu'il y a du stock n'est pas une incohérence :
+    // la marchandise est entrée par un comptage d'inventaire, pas par un bon
+    // de commande. Vérifié en base : 63 références sont dans ce cas (145
+    // pièces), toutes entrées lors du démarrage d'Odoo (février 2025) ou du
+    // recomptage de septembre 2025. Sans ce rappel, le lecteur croit à un
+    // calcul faux.
+    var qtyPurchasedNoteEl = el('detail-qty-purchased-note');
+    if (qtyPurchasedNoteEl) {
+        var stockSansAchat = (!data.qty_purchased && (data.stock_present || 0) > 0);
+        qtyPurchasedNoteEl.textContent = stockSansAchat
+            ? 'ℹ️ stock entré par inventaire, sans bon de commande'
+            : '';
+        qtyPurchasedNoteEl.title = stockSansAchat
+            ? 'Aucune commande fournisseur n\'existe pour cette référence. Le stock présent est '
+              + 'entré par un ajustement d\'inventaire (stock repris au démarrage d\'Odoo ou '
+              + 'constaté lors d\'un comptage). Le détail est dans « Voir le détail ».'
+            : '';
+    }
+
+    var detailCaAchatEl = el('detail-ca-achat');
+    var caAchatManquant = (data.ca_achat === 0 && data.qty_purchased > 0);
+    if (detailCaAchatEl) {
+        detailCaAchatEl.style.color = caAchatManquant ? '#B45309' : '';
+        detailCaAchatEl.style.fontStyle = caAchatManquant ? 'italic' : '';
+        detailCaAchatEl.style.fontSize = caAchatManquant ? '1.1rem' : '';
+    }
+
     var detailCaAchatNoteEl = el('detail-ca-achat-note');
     if (detailCaAchatNoteEl) {
-        detailCaAchatNoteEl.textContent = (data.ca_achat === 0 && data.qty_purchased > 0)
-            ? '⚠️ prix d\'achat non renseigné'
+        detailCaAchatNoteEl.textContent = caAchatManquant
+            ? '⚠️ aucun prix saisi sur les commandes fournisseur'
             : '';
     }
 
@@ -1137,36 +1199,63 @@ async function _fetchAndRenderDetail() {
             : '';
     }
 
+    // La réconciliation arrive avec la fiche : on la garde pour le pop-up,
+    // qui n'a plus qu'à demander les documents justificatifs.
+    state.detail.reconciliation = data.reconciliation || null;
+
     var ecartEl = el('detail-stock-ecart');
     var stockTotalEl = el('detail-stock-total');
     if (ecartEl) {
         var ecart = data.stock_ecart || 0;
-        var stockTotal = data.stock_total || 0;
-        // Achetée - Vendue = stock théorique. Un écart notable avec le stock
-        // réel Odoo indique des mouvements de stock non tracés (pertes,
-        // ventes hors POS, stock négatif dans un magasin...) — pas un bug
-        // du dashboard, mais un signal à vérifier dans Odoo.
-        if (stockTotal < 0) {
-            // Stock réel négatif = plus vendu en caisse que jamais réceptionné
-            // dans Odoo pour ce(s) magasin(s) : message en clair plutôt que le
-            // seul libellé technique "écart", qui prêtait à confusion.
-            ecartEl.style.display = 'block';
-            ecartEl.textContent = '⚠️ Stock négatif — ventes non couvertes par des réceptions trackées dans Odoo';
-            ecartEl.title = 'Stock réel Odoo = ' + formatNumber(stockTotal) + ' (négatif). '
-                + 'Stock théorique (achetée − vendue) = ' + formatNumber(data.stock_theorique)
-                + '. Cela signifie que plus d\'unités ont été vendues en caisse que de réceptions enregistrées dans Odoo pour ce(s) magasin(s) — à vérifier : réceptions manquantes, transferts non tracés, ou ventes hors POS.';
-        } else if (Math.abs(ecart) >= 1) {
-            ecartEl.style.display = 'block';
-            ecartEl.textContent = '⚠️ écart ' + (ecart > 0 ? '+' : '') + formatNumber(ecart) + ' vs théorique';
-            ecartEl.title = 'Stock théorique (achetée − vendue) = ' + formatNumber(data.stock_theorique)
-                + ', stock réel Odoo = ' + formatNumber(data.stock_total)
-                + '. Écart probable : sorties de stock non tracées.';
+        var nbNeg = data.nb_magasins_negatifs || 0;
+        // Deux anomalies différentes, par ordre de gravité :
+        //  1. des pièces qu'aucun mouvement n'explique (donnée écrite en base) ;
+        //  2. des magasins en stock négatif (marchandise sortie sans être
+        //     entrée — typiquement un transfert non enregistré).
+        // La carte affiche le stock présent ; ces deux lignes disent ce qui
+        // se cache derrière.
+        ecartEl.style.display = 'block';
+        ecartEl.style.color = '';
+        if (Math.abs(ecart) >= 1) {
+            ecartEl.textContent = '⚠️ ' + formatNumber(Math.abs(ecart)) + ' pièce(s) sans mouvement — voir le détail';
+            ecartEl.title = 'Stock attendu d\'après les mouvements validés = ' + formatNumber(data.stock_theorique)
+                + ', stock comptable Odoo = ' + formatNumber(data.stock_total)
+                + '. La différence n\'est expliquée par aucun mouvement de stock : quantité écrite directement '
+                + '(import, correction en base). Cliquer sur la carte pour le détail poste par poste.';
+        } else if (nbNeg) {
+            ecartEl.textContent = '⚠️ ' + formatNumber(Math.abs(data.stock_negatif || 0))
+                + ' pièce(s) en négatif dans ' + formatNumber(nbNeg) + ' magasin(s)';
+            // La chaîne complète depuis les deux cartes voisines : sans
+            // elle, « acheté − vendu » ne tombe jamais sur le stock affiché
+            // et on croit à une erreur de calcul. Les deux étapes qui
+            // manquent sont toujours les mêmes : l'inventaire, puis les
+            // stocks négatifs écartés.
+            var achatsMoinsVentes = (data.qty_purchased || 0) - (data.qty_sold || 0);
+            var recon = data.reconciliation || {};
+            ecartEl.title =
+                'Du panier au rayon :\n'
+                + '  ' + formatNumber(data.qty_purchased) + ' achetée − ' + formatNumber(data.qty_sold)
+                + ' vendue = ' + formatNumber(achatsMoinsVentes) + '\n'
+                + '  + ' + formatNumber(recon.inventaire_gain || 0) + ' gains d\'inventaire − '
+                + formatNumber(recon.inventaire_perte || 0) + ' pertes = '
+                + formatNumber(data.stock_total) + ' (stock comptable Odoo)\n'
+                + '  + ' + formatNumber(Math.abs(data.stock_negatif || 0))
+                + ' pièces écartées (stocks négatifs) = ' + formatNumber(data.stock_present) + ' affiché\n\n'
+                + 'Les stocks négatifs viennent de magasins ayant vendu de la marchandise qui n\'y est '
+                + 'jamais entrée — transfert non enregistré, le plus souvent. Ce n\'est pas de la '
+                + 'marchandise, donc ce n\'est pas déduit du rayon.';
         } else {
-            ecartEl.style.display = 'none';
+            ecartEl.textContent = '✔️ tout est expliqué';
+            ecartEl.style.color = '#059669';
+            ecartEl.title = 'Le stock réel correspond exactement aux mouvements enregistrés '
+                + '(achats reçus, ventes livrées, inventaire, autres sorties). Cliquer pour le détail.';
         }
     }
     if (stockTotalEl) {
-        stockTotalEl.style.color = (data.stock_total || 0) < 0 ? '#EF4444' : '';
+        // Le stock présent ne peut pas être négatif ; plus besoin de le
+        // colorer en rouge. Les magasins en négatif sont signalés par la
+        // ligne au-dessous.
+        stockTotalEl.style.color = '';
     }
 
     state.detail.variants = data.variants || [];
@@ -1194,9 +1283,13 @@ async function _fetchAndRenderDetail() {
             var h3 = variantsSection.querySelector('h3');
             if (h3) h3.insertAdjacentElement('afterend', archivedGapNote);
         }
-        archivedGapNote.textContent = 'ℹ️ ' + formatNumber(archivedGap) + ' vente(s) supplémentaire(s) sur des couleurs aujourd\'hui '
-            + 'désactivées/discontinuées (non listées ci-dessous) sont comptées dans les cartes en haut de fiche — '
-            + 'la somme du tableau ne peut donc pas toujours égaler "Qté vendue".';
+        // Le message ne doit pas affirmer une cause unique : vérifié en base
+        // sur 24P-6011, l'écart venait en réalité des bons de vente livrés
+        // par MOD FOR LIFE, pas de couleurs désactivées. On énonce les deux
+        // origines possibles au lieu d'en inventer une.
+        archivedGapNote.textContent = 'ℹ️ ' + formatNumber(archivedGap) + ' vente(s) comptée(s) dans les cartes du haut '
+            + 'n\'apparaissent dans aucune ligne ci-dessous : ventes sur des couleurs désactivées/discontinuées, '
+            + 'ou livraisons sur bon de vente (hors caisse). La somme du tableau ne peut donc pas toujours égaler "Qté vendue".';
         archivedGapNote.style.display = '';
     } else if (archivedGapNote) {
         archivedGapNote.style.display = 'none';
@@ -1955,18 +2048,17 @@ function openColorDetail(articleId, productName, color) {
     // serveur pour ces totaux, seule la répartition par magasin (ci-dessous)
     // vient d'un nouvel appel.
     var matching = (state.detail.variants || []).filter(function(v) { return v.color === color; });
-    var qtySold = 0, ca = 0, totalPieces = 0, hasTotalPieces = false, stockTotal = 0;
+    var qtySold = 0, ca = 0, totalPieces = 0, hasTotalPieces = false, stockTotal = 0, attendu = 0;
     matching.forEach(function(v) {
         qtySold += v.qty || 0;
         ca += v.ca || 0;
         stockTotal += v.stock || 0;
+        attendu += v.attendu || 0;
         if (v.total_pieces !== null && v.total_pieces !== undefined) {
             totalPieces += v.total_pieces;
             hasTotalPieces = true;
         }
     });
-    var reste = hasTotalPieces ? (totalPieces - qtySold) : null;
-
     var qtySoldEl = el('color-detail-qty-sold');
     if (qtySoldEl) qtySoldEl.textContent = formatNumber(qtySold);
     var caEl = el('color-detail-ca');
@@ -1977,13 +2069,11 @@ function openColorDetail(articleId, productName, color) {
     // stock.quant) mesurent deux choses différentes et ne sont PAS censés
     // être égaux — un écart signale un mouvement de stock hors achats/ventes
     // suivis (stock initial, transfert, ajustement), pas une erreur de calcul.
-    var resteEl = el('color-detail-reste');
-    if (resteEl) {
-        resteEl.textContent = (reste === null) ? '—' : formatNumber(reste);
-        resteEl.title = (reste !== null)
-            ? 'Reste = Total pièces (commandes fournisseur) − Qté vendue (POS). Estimation "papier", à comparer au Stock total physique ci-contre — un écart entre les deux est normal s\'il y a eu un mouvement hors achats/ventes suivis.'
-            : '';
-    }
+    // La carte « Stock attendu » a été retirée du pop-up (demande
+    // utilisateur) : elle affichait la même valeur que « Stock total » dès
+    // que la traçabilité était complète. `attendu` reste calculé — il sert
+    // au bandeau d'alerte ci-dessous, qui est le seul endroit où la
+    // comparaison a de l'intérêt.
     var stockTotalEl = el('color-detail-stock-total');
     if (stockTotalEl) {
         stockTotalEl.textContent = formatNumber(stockTotal);
@@ -2015,9 +2105,19 @@ function openColorDetail(articleId, productName, color) {
             kpiGrid.insertAdjacentElement('afterend', discordanceNote);
         }
         if (discordanceNote) {
-            discordanceNote.textContent = '⚠️ Écart entre Total pièces (' + formatNumber(totalPieces) + ') et Stock total (' +
-                formatNumber(stockTotal) + ') : une partie du stock de cette couleur n\'est pas passée par une commande ' +
-                'fournisseur suivie (ajustement d\'inventaire, stock initial…) — Total pièces ne peut pas la voir par construction.';
+            // Le message compare désormais Stock attendu (mouvements) et
+            // Stock total (stock.quant) : les deux mesurent la même chose,
+            // donc un écart est une vraie anomalie. L'ancien message
+            // comparait Total pièces (achats) au stock, deux grandeurs qui
+            // n'avaient aucune raison d'être égales — il criait au loup sur
+            // toutes les couleurs ayant eu le moindre ajustement.
+            var ecartCouleur = attendu - stockTotal;
+            discordanceNote.textContent = '⚠️ ' + formatNumber(Math.abs(ecartCouleur)) + ' pièce(s) d\'écart sur cette couleur : '
+                + 'stock attendu d\'après les mouvements = ' + formatNumber(attendu) + ', stock réel Odoo = '
+                + formatNumber(stockTotal) + '. '
+                + (ecartCouleur < 0
+                    ? 'Il y a plus de stock que ce que les mouvements justifient : une quantité a été écrite directement sur l\'emplacement.'
+                    : 'Il y a moins de stock que ce que les mouvements justifient : une quantité a été retirée sans mouvement de sortie.');
             discordanceNote.style.display = '';
         }
     } else if (discordanceNote) {
@@ -2053,10 +2153,10 @@ async function _loadColorDetailStores(articleId, color) {
     }
 
     if (msgEl) msgEl.textContent = '';
-    _renderColorDetailStores(data.stores || []);
+    _renderColorDetailStores(data.stores || [], data);
 }
 
-function _renderColorDetailStores(stores) {
+function _renderColorDetailStores(stores, totals) {
     var tbody = el('color-detail-stores-tbody');
     if (!tbody) return;
     tbody.innerHTML = '';
@@ -2103,6 +2203,50 @@ function _renderColorDetailStores(stores) {
 
         tbody.appendChild(tr);
     });
+
+    // Lignes de total. Un stock négatif n'est PAS du stock : on ne peut pas
+    // avoir −1 pièce en rayon. Le total « ce qu'il y a en magasin » ne
+    // somme donc que les stocks positifs (demande utilisateur). Les négatifs
+    // sont isolés sur leur propre ligne — ce sont des anomalies à corriger,
+    // pas de la marchandise à déduire. Le total comptable Odoo n'apparaît
+    // que s'il diffère, pour que la carte « Stock total » du haut reste
+    // rapprochable sans se contredire avec ce tableau.
+    if (!totals) return;
+
+    function _totalRow(label, value, color, hint, strong) {
+        var tr = document.createElement('tr');
+        tr.style.borderTop = strong ? '2px solid #CBD5E1' : '1px solid #F1F5F9';
+        if (strong) tr.style.fontWeight = '800';
+
+        var tdLabel = document.createElement('td');
+        tdLabel.textContent = label;
+        tdLabel.colSpan = 2;
+        tr.appendChild(tdLabel);
+
+        var tdValue = document.createElement('td');
+        tdValue.textContent = formatNumber(value);
+        if (color) tdValue.style.color = color;
+        tr.appendChild(tdValue);
+
+        var tdHint = document.createElement('td');
+        tdHint.innerHTML = hint
+            ? '<span style="font-weight:400;color:#64748B;font-size:0.8rem;">' + hint + '</span>'
+            : '';
+        tr.appendChild(tdHint);
+
+        tbody.appendChild(tr);
+    }
+
+    _totalRow('STOCK PRÉSENT EN MAGASIN', totals.stock_present, '',
+        'Somme des magasins ayant réellement de la marchandise. Ceux à zéro ne sont pas listés.', true);
+
+    if (totals.nb_magasins_negatifs) {
+        _totalRow('dont anomalies (stocks négatifs)', totals.stock_negatif, '#DC2626',
+            totals.nb_magasins_negatifs + ' magasin(s) affichent un stock négatif : de la marchandise en est '
+            + 'sortie sans y être jamais entrée. À corriger par un inventaire, ce n\'est pas du stock manquant en rayon.');
+        _totalRow('Total comptable Odoo', totals.stock_total, '#64748B',
+            'Négatifs inclus. C\'est cette valeur qu\'affiche la carte « Stock total » et qui sert à la réconciliation.');
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -3052,6 +3196,316 @@ function _buildEcartDetailHtml(data) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// RÉCONCILIATION DU STOCK — pop-up de la carte "Stock Réel Odoo"
+//
+// DEMANDE UTILISATEUR : « je ne dois pas avoir d'écarts ». Le pop-up montre
+// comment on passe des achats reçus au stock réel, poste par poste, chaque
+// ligne ayant un nom et des documents derrière. Ce qui reste en bas (l'écart)
+// n'est plus un fourre-tout : c'est ce qu'AUCUN mouvement n'explique.
+// ═══════════════════════════════════════════════════════════
+async function openStockRecon() {
+    var overlay = el('stock-recon-overlay');
+    var headerEl = el('stock-recon-header');
+    var bodyEl = el('stock-recon-body');
+    if (!overlay || !bodyEl) return;
+    if (!state.detail.article_id) return;
+
+    overlay.classList.add('active');
+    var nameEl = el('detail-name');
+    if (headerEl) {
+        headerEl.innerHTML = '<strong>' + _escapeHtml(nameEl ? nameEl.textContent : '') + '</strong>';
+    }
+    // Les totaux sont déjà connus (livrés avec la fiche) : on les affiche
+    // immédiatement, les documents arrivent juste après.
+    bodyEl.innerHTML = _buildReconTableHtml(state.detail.reconciliation)
+        + '<p style="color:#94A3B8;">Chargement des documents…</p>';
+
+    // EXACTEMENT les mêmes paramètres que /mavie/api/product-detail : le
+    // périmètre du pop-up doit être celui de la carte cliquée, sinon les
+    // documents listés ne totalisent pas les lignes affichées au-dessus.
+    var data = await rpc('/mavie/api/product-stock-detail', {
+        article_id: state.detail.article_id,
+        shop_field: state.detail.shop_field,
+        batch_id: state.batch_id,
+        collection_id: state.collection_id,
+    });
+
+    if (!data || data.error) {
+        bodyEl.innerHTML = _buildReconTableHtml(state.detail.reconciliation)
+            + '<p style="color:#EF4444;">Documents indisponibles : '
+            + _escapeHtml((data && data.error) || 'erreur inconnue') + '</p>';
+        return;
+    }
+    if (headerEl) {
+        headerEl.innerHTML = '<strong>' + _escapeHtml(data.ref || '') + '</strong> — '
+            + _escapeHtml(data.name || '') + '<br/>'
+            + '<span style="color:#64748B;">Périmètre : ' + _escapeHtml(data.perimetre || '—') + '</span>';
+    }
+    bodyEl.innerHTML = _buildReconTableHtml(state.detail.reconciliation)
+        + _buildReconDocsHtml(data);
+}
+
+function closeStockRecon() {
+    var overlay = el('stock-recon-overlay');
+    if (overlay) overlay.classList.remove('active');
+}
+
+function _reconRow(label, value, hint, isTotal) {
+    if (value === null || value === undefined) return '';
+    var sign = value > 0 ? '+' : (value < 0 ? '−' : '');
+    var color = value > 0 ? '#059669' : (value < 0 ? '#DC2626' : '#64748B');
+    return '<tr' + (isTotal ? ' class="recon-total"' : '') + '>'
+        + '<td>' + _escapeHtml(label)
+        + (hint ? '<div class="recon-sub">' + _escapeHtml(hint) + '</div>' : '')
+        + '</td>'
+        + '<td class="num" style="color:' + color + ';">'
+        + sign + formatNumber(Math.abs(value)) + '</td></tr>';
+}
+
+// Le tableau est volontairement coupé en DEUX blocs.
+//
+// Bloc 1 = le stock expliqué par les seuls MOUVEMENTS de stock. Chaque ligne
+// y est une somme brute d'un type de mouvement, jamais un reste calculé :
+// c'est pour ça que le total retombe toujours sur le stock réel dès que la
+// traçabilité est complète, et que l'écart du bas ne peut plus être qu'une
+// vraie anomalie.
+//
+// Bloc 2 = pourquoi les cartes du haut de fiche (« Qté achetée », « Qté
+// vendue »), qui viennent des DOCUMENTS, n'affichent pas le même chiffre que
+// les mouvements. Mélanger les deux dans un seul tableau donnait des lignes
+// qui ressemblaient à des erreurs de calcul alors qu'elles comparaient deux
+// sources différentes.
+function _buildReconTableHtml(r) {
+    if (!r) {
+        return '<p style="color:#94A3B8;">Réconciliation indisponible pour cette fiche.</p>';
+    }
+    var html = '<div style="font-weight:800;color:#0F172A;margin:0 0 6px;">'
+        + '1️⃣ Le stock expliqué par les mouvements de stock</div>'
+        + '<div class="recon-sub" style="margin-bottom:8px;">'
+        + 'Uniquement des mouvements validés dans Odoo. Aucun chiffre déduit.</div>'
+        + '<table class="recon-table">';
+
+    html += _reconRow('Réceptions fournisseur', r.recept_fournisseur,
+        'Marchandise entrée dans ces magasins depuis un fournisseur.');
+    if (r.retour_fournisseur) {
+        html += _reconRow('Retours au fournisseur', -r.retour_fournisseur,
+            'Marchandise renvoyée au fournisseur (le plus souvent MOD FOR LIFE).');
+    }
+    if (r.retour_client) {
+        html += _reconRow('Retours clients', r.retour_client,
+            'Marchandise rendue par un client et remise en stock.');
+    }
+    html += _reconRow('Sorties vers les clients', -r.sortie_client,
+        'Ventes en caisse et livraisons : tout ce qui est parti chez un client.');
+    if (r.inventaire_gain) {
+        html += _reconRow('Gains d\'inventaire', r.inventaire_gain,
+            'Pièces retrouvées lors d\'un comptage.');
+    }
+    if (r.inventaire_perte) {
+        html += _reconRow('Pertes d\'inventaire', -r.inventaire_perte,
+            'Pièces manquantes constatées lors d\'un comptage (casse, vol, erreur de saisie).');
+    }
+    if (r.autres_in) {
+        html += _reconRow('Autres entrées', r.autres_in,
+            'Transit inter-sociétés, production, entrepôt hors périmètre affiché.');
+    }
+    if (r.autres_out) {
+        html += _reconRow('Autres sorties', -r.autres_out,
+            'Transferts vers un entrepôt qui n\'est pas dans le périmètre affiché.');
+    }
+    html += _reconRow('= Stock attendu', r.stock_attendu, null, true);
+    html += '<tr><td>Stock comptable Odoo'
+        + '<div class="recon-sub">Somme de tous les emplacements, stocks négatifs compris.</div></td>'
+        + '<td class="num">' + formatNumber(r.stock_reel) + '</td></tr>';
+
+    var ecart = r.ecart || 0;
+    html += '<tr class="recon-total"><td>Écart inexpliqué</td>'
+        + '<td class="num" style="color:' + (ecart ? '#DC2626' : '#059669') + ';">'
+        + (ecart ? formatNumber(ecart) : '0 ✅') + '</td></tr>';
+
+    html += '</table>';
+
+    if (ecart) {
+        // Message volontairement écrit sans jargon : le lecteur n'a pas à
+        // savoir ce qu'est un quant ni un stock.move.line. On dit ce qui
+        // cloche, avec les deux chiffres, puis quoi faire.
+        html += '<div style="background:#FFFBEB;border:1px solid #FEF3C7;border-radius:8px;padding:12px;margin:14px 0;font-size:0.85rem;color:#92400E;line-height:1.7;">'
+            + '<strong>⚠️ ' + formatNumber(Math.abs(ecart)) + ' pièce(s) ne s\'expliquent pas.</strong><br/>'
+            + 'En additionnant toutes les entrées et toutes les sorties enregistrées, on devrait avoir '
+            + '<strong>' + formatNumber(r.stock_attendu) + '</strong> en stock. Odoo en affiche '
+            + '<strong>' + formatNumber(r.stock_reel) + '</strong>. '
+            + (ecart < 0
+                ? 'Il y a donc ' + formatNumber(Math.abs(ecart)) + ' pièce(s) de trop, arrivées sans réception, sans retour et sans inventaire.'
+                : 'Il manque donc ' + formatNumber(ecart) + ' pièce(s), parties sans vente, sans transfert et sans inventaire.')
+            + '<br/><em>Que faire :</em> lancer un inventaire dans Odoo sur les magasins concernés. '
+            + 'Le comptage créera le mouvement d\'ajustement qui manque, et cette ligne repassera à 0. '
+            + 'Toutes les autres lignes du tableau, elles, ont déjà un document derrière (bon de commande, '
+            + 'ticket de caisse, bon de retour, ajustement).'
+            + '</div>';
+    } else if (r.stock_reel < 0) {
+        // Écart nul mais stock négatif : tout est tracé, et pourtant le
+        // résultat est physiquement impossible. Un « ✅ tout va bien » vert
+        // serait trompeur ici — la cause type est un transfert entre
+        // magasins fait dans la réalité mais jamais enregistré dans Odoo :
+        // le magasin qui a reçu la marchandise vend un stock qu'il n'a
+        // jamais reçu, et passe en négatif.
+        html += '<div style="background:#FFFBEB;border:1px solid #FEF3C7;border-radius:8px;padding:12px;margin:14px 0;font-size:0.85rem;color:#92400E;line-height:1.7;">'
+            + '<strong>⚠️ Stock négatif : ' + formatNumber(r.stock_reel) + '.</strong><br/>'
+            + 'Tous les mouvements se recoupent (aucune pièce inexpliquée), mais le résultat est '
+            + 'impossible : il est sorti plus de marchandise de ces magasins qu\'il n\'y en est jamais entré. '
+            + 'Cause la plus fréquente : de la marchandise déplacée d\'un magasin à l\'autre sans que le '
+            + 'transfert ait été enregistré dans Odoo — le magasin qui l\'a reçue la vend, et passe en négatif.'
+            + '<br/><em>Que faire :</em> repérer les magasins en négatif dans le tableau « Stock par magasin », '
+            + 'puis soit enregistrer le transfert manquant, soit lancer un inventaire pour remettre les compteurs à plat.'
+            + '</div>';
+    } else {
+        html += '<div style="background:#F0FDF4;border:1px solid #BBF7D0;border-radius:8px;padding:12px;margin:14px 0;font-size:0.85rem;color:#166534;line-height:1.6;">'
+            + '✅ Aucun écart : chaque pièce du stock réel est justifiée par un mouvement enregistré.'
+            + '</div>';
+    }
+
+    // Passage du stock comptable au stock affiché sur la carte. C'était
+    // auparavant deux lignes ajoutées SOUS le total du tableau : on les
+    // lisait comme la suite de la soustraction, alors que ce sont les deux
+    // morceaux du total. Une phrase avec le calcul explicite lève
+    // l'ambiguïté sans rajouter de chiffres à additionner.
+    if (r.nb_magasins_negatifs) {
+        html += '<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;padding:12px;margin:14px 0;font-size:0.85rem;color:#334155;line-height:1.7;">'
+            + '📦 Ces <strong>' + formatNumber(r.stock_reel) + '</strong> pièces comptables se répartissent en '
+            + '<strong>' + formatNumber(r.stock_present) + '</strong> réellement en rayon et '
+            + '<strong>' + formatNumber(r.stock_negatif) + '</strong> dans '
+            + formatNumber(r.nb_magasins_negatifs) + ' magasin(s) passés en stock négatif '
+            + '(' + formatNumber(r.stock_present) + ' − ' + formatNumber(Math.abs(r.stock_negatif))
+            + ' = ' + formatNumber(r.stock_reel) + ').<br/>'
+            + 'Un stock négatif n\'est pas de la marchandise : la carte « Stock en magasin » affiche donc '
+            + '<strong>' + formatNumber(r.stock_present) + '</strong>.'
+            + '</div>';
+    }
+
+    // ── Bloc 2 : documents vs mouvements ──
+    html += '<div style="font-weight:800;color:#0F172A;margin:18px 0 6px;">'
+        + '2️⃣ Pourquoi les cartes du haut affichent d\'autres chiffres</div>'
+        + '<div class="recon-sub" style="margin-bottom:8px;">'
+        + 'Les cartes comptent des DOCUMENTS (bons de commande, tickets de caisse). Le bloc 1 compte '
+        + 'des MOUVEMENTS de marchandise. Voici l\'écart entre les deux — il ne change pas le stock.</div>'
+        + '<table class="recon-table">';
+
+    html += '<tr><td>Qté achetée affichée <span class="recon-sub">(bons de commande, quantité reçue)</span></td>'
+        + '<td class="num">' + formatNumber(r.qty_purchased_doc) + '</td></tr>';
+    html += '<tr><td>Réceptions réellement entrées ici <span class="recon-sub">(nettes des retours fournisseur)</span></td>'
+        + '<td class="num">' + formatNumber(r.recu_mouvements) + '</td></tr>';
+    html += '<tr><td><em>' + (r.reception_hors_bon < 0
+            ? 'Différence : reçu ailleurs qu\'ici'
+            : 'Différence : entré ici sans bon de commande') + '</em>'
+        + '<div class="recon-sub">' + (r.reception_hors_bon < 0
+            ? 'Bons de commande de ces sociétés réceptionnés dans un entrepôt non listé comme magasin actif (DIGITAL SHOP, entrepôt désactivé), ou sur une couleur aujourd\'hui désactivée.'
+            : 'Marchandise entrée en stock sans ligne de bon de commande rattachée (reprise d\'historique, saisie manuelle).') + '</div></td>'
+        + '<td class="num" style="color:#B45309;">' + formatNumber(Math.abs(r.reception_hors_bon)) + '</td></tr>';
+
+    html += '<tr><td style="padding-top:16px;">Qté vendue affichée <span class="recon-sub">(caisse + bons de vente livrés)</span></td>'
+        + '<td class="num" style="padding-top:16px;">' + formatNumber(r.qty_sold_doc) + '</td></tr>';
+    html += '<tr><td>Sorties clients réellement constatées ici <span class="recon-sub">(nettes des retours clients)</span></td>'
+        + '<td class="num">' + formatNumber(r.sorties_client_mvt) + '</td></tr>';
+    html += '<tr><td><em>' + (r.sortie_hors_vente < 0
+            ? 'Différence : vendu depuis un autre entrepôt'
+            : 'Différence : sorti sans ligne de vente') + '</em>'
+        + '<div class="recon-sub">' + (r.sortie_hors_vente < 0
+            ? 'Ventes comptées dans la carte mais sorties d\'un entrepôt hors périmètre, ou sur une couleur aujourd\'hui désactivée.'
+            : 'Marchandise partie chez un client sans ticket de caisse ni bon de vente en face : bon de livraison, transfert vers un autre magasin, ou quantité livrée différente de la quantité vendue.') + '</div></td>'
+        + '<td class="num" style="color:#B45309;">' + formatNumber(Math.abs(r.sortie_hors_vente)) + '</td></tr>';
+    html += '</table>';
+
+    return html;
+}
+
+function _reconSection(title, columns, rows, cellFn, emptyMsg) {
+    var html = '<div style="margin-bottom:16px;">'
+        + '<div style="font-weight:700;color:#0F172A;margin-bottom:6px;">' + title + '</div>';
+    if (!rows || !rows.length) {
+        return html + '<div style="color:#94A3B8;font-size:0.85rem;">' + emptyMsg + '</div></div>';
+    }
+    html += '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
+        + '<thead><tr style="background:#F8FAFC;text-align:left;">';
+    columns.forEach(function(c) {
+        html += '<th style="padding:8px;' + (c.num ? 'text-align:right;' : '') + '">' + c.label + '</th>';
+    });
+    html += '</tr></thead><tbody>';
+    rows.forEach(function(r) {
+        html += '<tr style="border-bottom:1px solid #F1F5F9;">' + cellFn(r) + '</tr>';
+    });
+    return html + '</tbody></table></div>';
+}
+
+function _td(value, opts) {
+    opts = opts || {};
+    return '<td style="padding:8px;'
+        + (opts.num ? 'text-align:right;font-weight:700;white-space:nowrap;' : '')
+        + (opts.color ? 'color:' + opts.color + ';' : '')
+        + (opts.muted ? 'color:#64748B;' : '')
+        + '">' + _escapeHtml(value === null || value === undefined ? '—' : value) + '</td>';
+}
+
+function _buildReconDocsHtml(data) {
+    var html = '';
+
+    html += _reconSection('📥 Bons de commande d\'achat',
+        [{label: 'Bon'}, {label: 'Date'}, {label: 'Fournisseur'},
+         {label: 'Commandé', num: true}, {label: 'Reçu', num: true}, {label: 'Non reçu', num: true}],
+        data.achats,
+        function(r) {
+            return _td(r.bon) + _td(r.date, {muted: true}) + _td(r.fournisseur, {muted: true})
+                + _td(formatNumber(r.commande), {num: true})
+                + _td(formatNumber(r.recu), {num: true})
+                + _td(r.ecart ? formatNumber(r.ecart) : '—', {num: true, color: r.ecart ? '#DC2626' : '#94A3B8'});
+        },
+        'Aucun bon de commande sur ce périmètre.');
+
+    if (data.achats_total > (data.achats || []).length) {
+        html += '<div class="recon-sub" style="margin:-10px 0 14px;">'
+            + (data.achats_total - data.achats.length) + ' bon(s) supplémentaire(s) non listé(s) — export Excel pour la liste complète.</div>';
+    }
+
+    html += _reconSection('↩️ Retours au fournisseur',
+        [{label: 'Bon de retour'}, {label: 'Réception d\'origine'}, {label: 'Date'}, {label: 'Pièces', num: true}],
+        data.retours_fournisseur,
+        function(r) {
+            return _td(r.bon) + _td(r.origine, {muted: true}) + _td(r.date, {muted: true})
+                + _td(formatNumber(r.qty), {num: true, color: '#DC2626'});
+        },
+        'Aucun retour fournisseur — les achats reçus valent donc les achats commandés.');
+
+    html += _reconSection('📤 Sorties vers les clients, par type de document',
+        [{label: 'Type de document'}, {label: 'Sorties', num: true},
+         {label: 'Retours', num: true}, {label: 'Net', num: true}],
+        data.ventes_documents,
+        function(r) {
+            return _td(r.type_document)
+                + _td(formatNumber(r.sortie), {num: true})
+                + _td(formatNumber(r.retour), {num: true, color: '#059669'})
+                + _td(formatNumber(r.net), {num: true});
+        },
+        'Aucune sortie client enregistrée.');
+
+    html += _reconSection('↩️ Retours sur bon de vente',
+        [{label: 'Bon de retour'}, {label: 'Livraison'}, {label: 'Bon de vente'},
+         {label: 'Date'}, {label: 'Pièces', num: true}],
+        data.retours_vente,
+        function(r) {
+            return _td(r.bon) + _td(r.livraison, {muted: true}) + _td(r.bon_vente, {muted: true})
+                + _td(r.date, {muted: true})
+                + _td(formatNumber(r.qty), {num: true, color: '#059669'});
+        },
+        'Aucun retour sur bon de vente.');
+
+    // DEMANDE UTILISATEUR (2026-09-07) : le tableau « Ajustements
+    // d'inventaire, par mois » a été retiré du pop-up. Les pertes et les
+    // gains restent affichés en haut, dans le bloc 1 — le détail mensuel
+    // n'apportait rien de plus et alourdissait la lecture.
+
+    return html;
+}
+
+// ═══════════════════════════════════════════════════════════
 // HISTORIQUE — TRANSFERTS & SOLDES
 // ═══════════════════════════════════════════════════════════
 async function loadHistory() {
@@ -3725,6 +4179,20 @@ document.addEventListener('DOMContentLoaded', function() {
     if (ecartsOverlay) {
         ecartsOverlay.addEventListener('click', function(e) {
             if (e.target === ecartsOverlay) closeEcarts();
+        });
+    }
+
+    // ── Réconciliation du stock : ouverte par la carte "Stock Réel Odoo" ──
+    var stockCard = el('detail-stock-card');
+    if (stockCard) stockCard.addEventListener('click', openStockRecon);
+
+    var closeStockReconBtn = el('close-stock-recon-btn');
+    if (closeStockReconBtn) closeStockReconBtn.addEventListener('click', closeStockRecon);
+
+    var stockReconOverlay = el('stock-recon-overlay');
+    if (stockReconOverlay) {
+        stockReconOverlay.addEventListener('click', function(e) {
+            if (e.target === stockReconOverlay) closeStockRecon();
         });
     }
 

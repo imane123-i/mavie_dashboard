@@ -88,9 +88,59 @@ class MvBatchShopMappingExt(models.Model):
     responsible_user_id = fields.Many2one(
         'res.users',
         string="Responsable magasin",
-        help="Utilisateur notifié (boîte de réception + email) lors d'un "
-             "transfert de stock impliquant ce magasin.",
+        help="Utilisateur notifié EN PLUS des responsables trouvés "
+             "automatiquement (poste « Manager » + ce magasin dans ses POS "
+             "autorisés) lors d'un transfert de stock impliquant ce magasin. "
+             "Utile pour un magasin qui n'a aucun Manager dans Paramètres → "
+             "Utilisateurs.",
     )
+
+    def _get_store_managers(self):
+        """Responsables à notifier pour ce magasin.
+
+        DEMANDE UTILISATEUR : le responsable d'un magasin se lit dans
+        Paramètres → Utilisateurs & Sociétés → Utilisateurs — c'est
+        l'utilisateur dont l'employé a le poste « Manager » et dont les
+        « POS autorisé(s) » (champ allowed_pos, module pos_restrict)
+        contiennent un point de vente de ce magasin.
+
+        Le magasin est reconnu par l'entrepôt du POS (picking_type_id.
+        warehouse_id), pas par son nom : « MAGASIN AIN SEBAA » et
+        « Online - AIN SEBAA » pointent le même entrepôt, c'est celui du
+        mapping.
+
+        Le poste est comparé exactement, espaces et casse ignorés : il est
+        saisi « Manager » ou « Manager␣» selon les sociétés, et un
+        « Assistant manager » ne doit pas recevoir la notification.
+
+        responsible_user_id, s'il est renseigné, est ajouté au résultat.
+        """
+        self.ensure_one()
+        users = self.responsible_user_id.sudo().filtered('active')
+        Users = self.env['res.users'].sudo()
+        # pos_restrict et hr ne sont pas des dépendances déclarées du module :
+        # sans eux, on se contente du responsable saisi sur le mapping.
+        if (not self.warehouse_id or 'allowed_pos' not in Users._fields
+                or 'hr.employee' not in self.env):
+            return users
+        configs = self.env['pos.config'].sudo().search([
+            ('picking_type_id.warehouse_id', '=', self.warehouse_id.id),
+        ])
+        if not configs:
+            return users
+        candidates = Users.search([
+            ('allowed_pos', 'in', configs.ids),
+            ('share', '=', False),
+        ])
+        if not candidates:
+            return users
+        employees = self.env['hr.employee'].sudo().search([
+            ('user_id', 'in', candidates.ids),
+        ])
+        managers = employees.filtered(
+            lambda e: (e.job_id.name or '').strip().casefold() == 'manager'
+        ).mapped('user_id')
+        return users | managers
 
     @api.model_create_multi
     def create(self, vals_list):

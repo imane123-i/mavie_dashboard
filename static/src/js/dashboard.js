@@ -2008,14 +2008,38 @@ async function _createTransferFromMatrix(btnEl) {
     state.transfer.group_count = (state.transfer.group_count || 0) + 1;
 
     var pdfUrl = '/report/pdf/mavie_dashboard.report_transfer_template/' + data.transfer_id;
-    var html = '<strong>✅ Transfert ' + data.transfer_name + ' créé</strong> — envoyé dans le module Transferts, en attente de validation par le Responsable Approvisionnement.';
+    // Le bon quitte le dashboard vers l'endroit où il sera collecté, qui
+    // dépend des sociétés : Inventaire → Transferts → Interne pour deux
+    // magasins d'une même société, module Transferts sinon.
+    var html = '<strong>✅ Transfert ' + data.transfer_name + ' créé</strong> — ';
+    if (data.picking_name) {
+        html += 'envoyé dans <strong>Inventaire → Transferts → Interne</strong>, opération <strong>'
+             + data.picking_name + '</strong> : le responsable du magasin source n\'a plus qu\'à collecter la marchandise et valider l\'opération.';
+    } else {
+        html += 'envoyé dans le <strong>module Transferts</strong> (transfert entre deux sociétés) : le responsable collecte la marchandise et valide le bon là-bas.';
+    }
     if (state.transfer.group_count > 1) {
         html += ' (regroupé avec ' + (state.transfer.group_count - 1) + ' autre(s) bon(s) créé(s) pour cette même référence + destination — un seul PDF imprimera tout le groupe)';
     }
     html += ' <a href="' + pdfUrl + '" target="_blank">📄 Imprimer le bon (PDF)</a>';
     if (data.warning) html += '<br/><span style="color:#B45309;">' + data.warning + '</span>';
-    if (data.notif_warning) html += '<br/><span style="color:#B45309;">' + data.notif_warning + '</span>';
-    if (!data.notif_warning) html += '<br/><span style="color:#15803D;">📩 Le responsable du magasin source a été notifié.</span>';
+    // Noms de responsables et de magasins viennent de la base : échappés
+    // avant d'entrer dans le HTML.
+    var escHtml = function (s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+            return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+        });
+    };
+    var notified = data.notified || {};
+    if (notified.source && notified.source.length) {
+        html += '<br/><span style="color:#15803D;">📩 Responsable du magasin source notifié (bon PDF joint) : '
+             + escHtml(notified.source.join(', ')) + '</span>';
+    }
+    if (notified.dest && notified.dest.length) {
+        html += '<br/><span style="color:#15803D;">📩 Responsable du magasin cible prévenu pour la réception : '
+             + escHtml(notified.dest.join(', ')) + '</span>';
+    }
+    if (data.notif_warning) html += '<br/><span style="color:#B45309;">' + escHtml(data.notif_warning) + '</span>';
 
     resultEl.style.display = 'block';
     resultEl.style.background = '#F0FDF4';
@@ -3548,8 +3572,8 @@ function _renderHistory() {
     var columns = historyTab === 'soldes'
         ? ['Date', 'Ticket', 'Magasin', 'Réf', 'Produit', 'Qté',
            'Prix catalogue (TTC)', 'Remise', 'Prix payé (TTC)']
-        : ['Bon', 'Date', 'État', 'Société source', 'Magasin source', 'Société cible', 'Magasin cible',
-           'Type', 'Réf.', 'Qté'];
+        : ['Bon', 'Date', 'État', 'Opération', 'Société source', 'Magasin source',
+           'Société cible', 'Magasin cible', 'Type', 'Réf.', 'Qté'];
     columns.forEach(function(label) {
         var th = document.createElement('th');
         th.textContent = label;
@@ -3617,10 +3641,29 @@ function _renderHistory() {
             tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
         } else {
             var stateColor = r.state === 'done' ? '#10B981'
-                : (r.state === 'submitted' ? '#F59E0B' : '#94A3B8');
+                : (r.state === 'transmitted' ? '#2563EB'
+                : (r.state === 'submitted' ? '#F59E0B' : '#94A3B8'));
             tr.appendChild(cell(r.name, '#0F172A', '700'));
             tr.appendChild(cell(r.date, '#64748B'));
             tr.appendChild(cell(r.state_label, stateColor, '600'));
+            // Opération d'inventaire à collecter (transfert intra-société) :
+            // c'est le document que le responsable ouvre pour valider, donc
+            // on ouvre directement le bon dans Odoo. Vide pour un transfert
+            // inter-sociétés, qui reste dans le module Transferts.
+            var opCell = cell(r.picking_name || '—',
+                              r.picking_name ? '#2563EB' : '#94A3B8',
+                              r.picking_name ? '600' : null);
+            if (r.picking_id) {
+                opCell.textContent = '';
+                var lien = document.createElement('a');
+                lien.textContent = r.picking_name;
+                lien.href = '/web#id=' + r.picking_id + '&model=stock.picking&view_type=form';
+                lien.target = '_blank';
+                lien.title = 'Ouvrir l\'opération dans Inventaire → Transferts';
+                lien.style.cssText = 'color:#2563EB;font-weight:600;text-decoration:none;';
+                opCell.appendChild(lien);
+            }
+            tr.appendChild(opCell);
             tr.appendChild(cell(r.source_societe, '#475569'));
             tr.appendChild(cell(r.source_magasin, '#0F172A', '600'));
             tr.appendChild(cell(r.dest_societe, '#475569'));
@@ -3829,10 +3872,18 @@ function _renderProductHistory() {
             tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
         } else {
             var stateColor = r.state === 'done' ? '#10B981'
-                : (r.state === 'submitted' ? '#F59E0B' : '#94A3B8');
+                : (r.state === 'transmitted' ? '#2563EB'
+                : (r.state === 'submitted' ? '#F59E0B' : '#94A3B8'));
             tr.appendChild(cell(r.name, '#0F172A', '700'));
             tr.appendChild(cell(r.date, '#64748B'));
-            tr.appendChild(cell(r.state_label, stateColor, '600'));
+            // Pas de colonne dédiée ici (le pop-up en a déjà neuf) : quand
+            // le bon est parti à l'Inventaire, l'opération à collecter est
+            // donnée en infobulle sur l'état, qui dit déjà « transmis ».
+            var etat = cell(r.state_label, stateColor, '600');
+            if (r.picking_name) {
+                etat.title = 'Opération d\'inventaire à collecter : ' + r.picking_name;
+            }
+            tr.appendChild(etat);
             // D'où vient le bon : le dashboard, ou le formulaire Odoo.
             var origine = cell(r.depuis_dashboard ? 'Dashboard' : 'Odoo',
                                r.depuis_dashboard ? '#7C3AED' : '#94A3B8');

@@ -1,6 +1,6 @@
 {
     'name': 'MaVie Dashboard — Centre d\'Analyse',
-    'version': '17.0.1.1.0',
+    'version': '17.0.1.2.0',
     'category': 'Sales',
     'summary': 'Dashboard analytique connecté aux ventes POS, stock et fournisseurs',
     'description': """

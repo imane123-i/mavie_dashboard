@@ -21,7 +21,68 @@
             <field name="state" position="after">
                 <field name="group_size" invisible="1"/>
                 <field name="group_member_names" optional="show" string="Autres bons du groupe"/>
+                <field name="picking_id" optional="show" string="Opération d'inventaire"/>
             </field>
+        </field>
+    </record>
+
+    <!-- Transfert intra-société transmis à l'Inventaire (état 'transmitted',
+         voir InterInternalTransferExt.action_submit) : le bon n'est plus
+         modifiable ici et n'attend plus aucune validation dans ce module —
+         il faut le dire, et donner l'accès direct à l'opération à collecter,
+         sinon on attend ici une validation qui ne viendra jamais. -->
+    <record id="view_transfert_interne_form_ext" model="ir.ui.view">
+        <field name="name">inter.internal.transfer.form.ext.mavie</field>
+        <field name="model">inter.internal.transfer</field>
+        <field name="inherit_id" ref="transfert_interne.view_transfert_interne_form"/>
+        <field name="arch" type="xml">
+            <field name="state" position="attributes">
+                <attribute name="statusbar_visible">draft,submitted,transmitted,done</attribute>
+            </field>
+
+            <!-- Les conditions d'origine (state in ('submitted','done'))
+                 laisseraient le bon modifiable une fois transmis, alors que
+                 les mouvements de stock sont déjà créés et réservés. -->
+            <field name="name" position="attributes">
+                <attribute name="readonly">state != 'draft'</attribute>
+            </field>
+            <field name="company_source_id" position="attributes">
+                <attribute name="readonly">is_magasin_user or state != 'draft'</attribute>
+            </field>
+            <field name="location_source_id" position="attributes">
+                <attribute name="readonly">is_magasin_user or state != 'draft'</attribute>
+            </field>
+            <field name="company_target_id" position="attributes">
+                <attribute name="readonly">state != 'draft'</attribute>
+            </field>
+            <field name="location_target_id" position="attributes">
+                <attribute name="readonly">state != 'draft'</attribute>
+            </field>
+            <field name="scheduled_date" position="attributes">
+                <attribute name="readonly">state != 'draft'</attribute>
+            </field>
+            <field name="origin" position="attributes">
+                <attribute name="readonly">state != 'draft'</attribute>
+            </field>
+            <field name="line_ids" position="attributes">
+                <attribute name="readonly">state != 'draft'</attribute>
+            </field>
+
+            <xpath expr="//sheet/group[1]" position="before">
+                <div class="alert alert-info" role="alert" invisible="state != 'transmitted'">
+                    Transmis à l'Inventaire. La marchandise se collecte et se valide dans
+                    <strong>Inventaire → Transferts → Interne</strong> — bouton
+                    « Opération ». Ce bon passera automatiquement à « Fait » à la
+                    validation de l'opération.
+                </div>
+            </xpath>
+
+            <xpath expr="//div[@name='button_box']" position="inside">
+                <button name="open_picking" type="object" class="oe_stat_button" icon="fa-exchange"
+                        invisible="not picking_id">
+                    <field name="picking_id" widget="statinfo" string="Opération"/>
+                </button>
+            </xpath>
         </field>
     </record>
 

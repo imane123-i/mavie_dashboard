@@ -10,6 +10,7 @@ import csv
 import io
 from datetime import datetime, timedelta, date
 import logging
+from markupsafe import Markup, escape
 
 from ..models.mv_batch_shop_mapping_ext import CITY_PROXIMITY
 
@@ -4098,45 +4099,144 @@ class MaVieDashboardController(http.Controller):
             result[m.shop_field] = available
         return result
 
+    def _transfer_pdf_attachment(self, transfer):
+        """Le bon de transfert en PDF — le même que « Imprimer le bon » du
+        dashboard — sous forme de pièce jointe (nom, contenu brut)."""
+        try:
+            pdf, _fmt = request.env['ir.actions.report'].sudo()._render_qweb_pdf(
+                'mavie_dashboard.action_report_transfer', [transfer.id]
+            )
+        except Exception as e:
+            _logger.warning(f"PDF du transfert {transfer.name} non généré : {e}", exc_info=True)
+            return None
+        fname = re.sub(r'[^\w.-]+', '_', f"Bon_transfert_{transfer.name}") + '.pdf'
+        return (fname, pdf)
+
     def _notify_transfer_responsible(self, transfer, source_mapping, dest_mapping):
-        """Notifie (boîte de réception Odoo + email selon préférence utilisateur)
-        le responsable du magasin source, avec référence/quantité/photo."""
-        responsible = source_mapping.responsible_user_id
-        if not responsible:
-            label = source_mapping.shop_label or source_mapping.shop_field
-            return f"Aucun responsable configuré pour le magasin {label} : notification non envoyée."
+        """Notifie les responsables des deux magasins dans Odoo UNIQUEMENT
+        (boîte de réception, jamais d'email — voir mail_thread_ext.py), bon de
+        transfert PDF en pièce jointe.
+
+        Responsables = poste « Manager » + magasin dans leurs POS autorisés
+        (voir MvBatchShopMappingExt._get_store_managers) :
+          • magasin source : prépare la marchandise et valide l'opération ;
+          • magasin cible  : est prévenu de l'arrivée, pour contrôler la
+            réception.
+
+        Retourne (notified, warning) : noms notifiés par rôle, et message à
+        afficher dans le dashboard pour ce qui n'a pas pu être envoyé.
+        """
+        def _label(mapping):
+            return mapping.warehouse_id.name or mapping.shop_label or mapping.shop_field
+
+        source_managers = source_mapping._get_store_managers()
+        dest_all = dest_mapping._get_store_managers()
+        # Un même utilisateur responsable des deux magasins ne reçoit que la
+        # notification « à préparer », qui contient déjà tout.
+        dest_managers = dest_all - source_managers
+
+        notified = {'source': [], 'dest': []}
+        warnings = [
+            f"Aucun responsable trouvé pour {_label(m)} (poste « Manager » avec ce "
+            f"magasin dans ses POS autorisés) : notification non envoyée."
+            for m, found in ((source_mapping, source_managers), (dest_mapping, dest_all))
+            if not found
+        ]
+        if not source_managers and not dest_managers:
+            return notified, ' '.join(warnings)
+
+        # Le bon PDF en premier : c'est la pièce que le responsable imprime
+        # pour préparer (source) ou contrôler (cible) la marchandise.
+        attachments = []
+        pdf = self._transfer_pdf_attachment(transfer)
+        if pdf:
+            attachments.append(pdf)
+        else:
+            warnings.append("Le bon PDF n'a pas pu être généré : notification envoyée sans pièce jointe.")
 
         lines_txt = []
-        attachments = []
+        photos = 0
         for line in transfer.line_ids:
+            # escape() sur les valeurs venant des données : un nom de produit
+            # contenant < ou & casserait sinon le corps du message.
             lines_txt.append(
-                f"<li>{line.product_id.display_name} — Réf : {line.reference or '—'} — Qté : {int(line.quantity)}</li>"
+                f"<li>{escape(line.product_id.display_name)} — "
+                f"Réf : {escape(line.reference or '—')} — Qté : {int(line.quantity)}</li>"
             )
             image = line.product_id.image_1920 or line.product_id.product_tmpl_id.image_1920
-            if image and len(attachments) < 5:
+            if image and photos < 5:
                 fname = f"{line.product_id.default_code or line.product_id.id}.png"
                 try:
                     attachments.append((fname, base64.b64decode(image)))
+                    photos += 1
                 except Exception:
                     pass
 
-        source_label = source_mapping.shop_label or source_mapping.shop_field
-        dest_label = dest_mapping.shop_label or dest_mapping.shop_field
-        body = (
-            f"<p><strong>Transfert {transfer.name}</strong> à préparer : "
-            f"<strong>{source_label}</strong> → <strong>{dest_label}</strong></p>"
-            f"<ul>{''.join(lines_txt)}</ul>"
-        )
+        source_label = escape(_label(source_mapping))
+        dest_label = escape(_label(dest_mapping))
 
-        request.env['mail.thread'].sudo().message_notify(
-            partner_ids=[responsible.partner_id.id],
-            subject=f"Transfert {transfer.name} à préparer — {source_label}",
-            body=body,
-            model='inter.internal.transfer',
-            res_id=transfer.id,
-            attachments=attachments,
+        # La notification doit pointer sur le document que le responsable va
+        # réellement ouvrir pour collecter et valider — et il n'est pas au
+        # même endroit selon les sociétés (voir
+        # InterInternalTransferExt.action_submit) :
+        #   • même société      → l'opération interne, dans l'Inventaire ;
+        #   • sociétés ≠        → le bon lui-même, dans le module Transferts.
+        picking = transfer.picking_id
+        if picking:
+            model, res_id = 'stock.picking', picking.id
+            where_txt = (
+                f"à collecter puis valider dans <strong>Inventaire → Transferts → "
+                f"Interne</strong> (opération <strong>{escape(picking.name)}</strong>)"
+            )
+        else:
+            model, res_id = 'inter.internal.transfer', transfer.id
+            where_txt = (
+                "à collecter puis valider dans le <strong>module Transferts</strong> "
+                "(transfert entre deux sociétés)"
+            )
+
+        route_txt = (
+            f"<p><strong>Transfert {escape(transfer.name)}</strong> : "
+            f"<strong>{source_label}</strong> → <strong>{dest_label}</strong></p>"
         )
-        return None
+        items_txt = f"<ul>{''.join(lines_txt)}</ul>"
+        # Boîte de réception Odoo uniquement, même pour les utilisateurs réglés
+        # sur « Notification par email » (demande utilisateur).
+        mail_thread = request.env['mail.thread'].sudo().with_context(mavie_notify_inbox_only=True)
+
+        # Markup() : sans ça, Odoo traite le corps comme du texte brut et
+        # échappe les balises — le responsable reçoit « &lt;p&gt;… » au lieu
+        # du message mis en forme.
+        if source_managers:
+            mail_thread.message_notify(
+                partner_ids=source_managers.mapped('partner_id').ids,
+                subject=f"Transfert {transfer.name} à préparer — {_label(source_mapping)}",
+                body=Markup(
+                    f"{route_txt}"
+                    f"<p>Marchandise {where_txt}. Le bon de transfert est joint en PDF.</p>"
+                    f"{items_txt}"
+                ),
+                model=model,
+                res_id=res_id,
+                attachments=attachments,
+            )
+            notified['source'] = source_managers.mapped('name')
+        if dest_managers:
+            mail_thread.message_notify(
+                partner_ids=dest_managers.mapped('partner_id').ids,
+                subject=f"Transfert {transfer.name} à réceptionner — {_label(dest_mapping)}",
+                body=Markup(
+                    f"{route_txt}"
+                    f"<p>Marchandise en route vers votre magasin : à contrôler à la "
+                    f"réception avec le bon de transfert joint en PDF.</p>"
+                    f"{items_txt}"
+                ),
+                model=model,
+                res_id=res_id,
+                attachments=attachments,
+            )
+            notified['dest'] = dest_managers.mapped('name')
+        return notified, ' '.join(warnings) or None
 
     @http.route('/mavie/api/transfer-suggestions', type='json', auth='user', methods=['POST'], csrf=False)
     def api_transfer_suggestions(self, **kw):
@@ -4175,7 +4275,7 @@ class MaVieDashboardController(http.Controller):
                     'city': city or '—',
                     'available_qty': int(qty),
                     'tier': tier,
-                    'has_responsible': bool(m.responsible_user_id),
+                    'has_responsible': bool(m._get_store_managers()),
                 })
 
             tier_order = {'same_city': 0, 'nearby': 1, 'other': 2}
@@ -4239,7 +4339,7 @@ class MaVieDashboardController(http.Controller):
                     'sold': int(sold),
                     'stock': int(stk),
                     'is_target': m.shop_field == dest_shop_field,
-                    'has_responsible': bool(m.responsible_user_id),
+                    'has_responsible': bool(m._get_store_managers()),
                 })
 
             all_stores.sort(key=lambda s: (0 if s['is_target'] else 1, -s['stock'], s['shop_label']))
@@ -4493,9 +4593,26 @@ class MaVieDashboardController(http.Controller):
                 # created_from_dashboard sur inter.internal.transfer).
                 'created_from_dashboard': True,
             })
+            # action_submit aiguille le bon vers l'endroit où il sera
+            # collecté : Inventaire → Transferts → Interne si les deux
+            # magasins appartiennent à la même société (l'opération y est
+            # créée, réservée, prête à valider), module Transferts sinon.
             transfer.sudo().action_submit()
+            picking = transfer.sudo().picking_id
 
-            notif_warning = self._notify_transfer_responsible(transfer, source_mapping, dest_mapping)
+            # La notification ne doit jamais faire échouer un transfert déjà
+            # créé (et, en intra-société, déjà réservé dans l'Inventaire) :
+            # le dashboard afficherait une erreur alors que le bon existe.
+            # Le savepoint garde la transaction utilisable si l'envoi plante.
+            try:
+                with request.env.cr.savepoint():
+                    notified, notif_warning = self._notify_transfer_responsible(
+                        transfer, source_mapping, dest_mapping
+                    )
+            except Exception as e:
+                _logger.error(f"Notification du transfert {transfer.name} échouée : {e}", exc_info=True)
+                notified = {'source': [], 'dest': []}
+                notif_warning = f"Transfert créé, mais notification non envoyée : {e}"
 
             return {
                 'transfer_id': transfer.id,
@@ -4503,6 +4620,10 @@ class MaVieDashboardController(http.Controller):
                 'group_ref': transfer.group_ref,
                 'warning': warning,
                 'notif_warning': notif_warning,
+                'notified': notified,
+                'intra_societe': source_mapping.company_id.id == dest_mapping.company_id.id,
+                'picking_id': picking.id if picking else None,
+                'picking_name': picking.name if picking else None,
             }
         except UserError as e:
             return {'error': str(e)}
@@ -5171,7 +5292,12 @@ class MaVieDashboardController(http.Controller):
         transfers = request.env['inter.internal.transfer'].sudo().search(
             domain, order='id desc', limit=limit
         )
-        state_labels = {'draft': 'Brouillon', 'submitted': 'En attente de validation', 'done': 'Fait'}
+        state_labels = {
+            'draft': 'Brouillon',
+            'submitted': 'En attente de validation',
+            'transmitted': "Transmis à l'inventaire",
+            'done': 'Fait',
+        }
         rows = []
         for tr in transfers:
             qty = sum(tr.line_ids.mapped('quantity'))
@@ -5189,6 +5315,13 @@ class MaVieDashboardController(http.Controller):
                 # Un transfert au sein d'une même société ne passe plus par
                 # le circuit inter-sociétés : on le signale explicitement.
                 'intra_societe': tr.company_source_id.id == tr.company_target_id.id,
+                # Où le bon se trouve maintenant : pour un transfert
+                # intra-société, il a été transmis à l'Inventaire et c'est
+                # cette opération-là que le responsable doit valider — sans
+                # son nom, l'historique dit « transmis » sans dire à quoi.
+                'picking_name': tr.picking_id.name or '',
+                # Permet d'ouvrir l'opération dans Odoo depuis l'historique.
+                'picking_id': tr.picking_id.id or None,
                 'nb_references': len(refs),
                 'nb_lignes': len(tr.line_ids),
                 'qty': int(qty),
@@ -5297,12 +5430,12 @@ class MaVieDashboardController(http.Controller):
             else:
                 writer.writerow(['Historique des transferts entre magasins'])
                 writer.writerow([])
-                writer.writerow(['Bon', 'Date', 'État', 'Société source', 'Magasin source',
-                                 'Société cible', 'Magasin cible', 'Type', 'Références',
-                                 'Lignes', 'Qté totale', 'Groupe'])
+                writer.writerow(['Bon', 'Date', 'État', 'Opération', 'Société source',
+                                 'Magasin source', 'Société cible', 'Magasin cible',
+                                 'Type', 'Références', 'Lignes', 'Qté totale', 'Groupe'])
                 for row in self._transfer_history_rows(kw):
                     writer.writerow([
-                        row['name'], row['date'], row['state_label'],
+                        row['name'], row['date'], row['state_label'], row['picking_name'],
                         row['source_societe'], row['source_magasin'],
                         row['dest_societe'], row['dest_magasin'],
                         'Intra-société' if row['intra_societe'] else 'Inter-sociétés',
@@ -5365,6 +5498,7 @@ class MaVieDashboardController(http.Controller):
             state_labels = {
                 'draft': 'Brouillon',
                 'submitted': 'En attente de validation',
+                'transmitted': "Transmis à l'inventaire",
                 'done': 'Fait',
             }
             transfers = []
@@ -5392,6 +5526,9 @@ class MaVieDashboardController(http.Controller):
                         'dest_societe': transfer.company_target_id.name or '—',
                         'intra_societe': transfer.company_source_id.id == transfer.company_target_id.id,
                         'depuis_dashboard': bool(transfer.created_from_dashboard),
+                        # Opération d'inventaire à collecter, pour un
+                        # transfert intra-société transmis à l'Inventaire.
+                        'picking_name': transfer.picking_id.name or '',
                         'couleur': (color or '—').upper() if color else '—',
                         'taille': size or '—',
                         'qty': int(line.quantity or 0),

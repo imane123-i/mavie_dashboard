@@ -1186,6 +1186,637 @@
                 .stock-table tbody tr:hover {
                     background-color: #F8FAFC;
                 }
+
+                /* ══ MOD FOR LIFE : compte exact + arbre de dispatch ══ */
+                .mfl-panel {
+                    padding: 24px;
+                    margin-bottom: 20px;
+                }
+                .mfl-equation {
+                    display: flex;
+                    flex-wrap: wrap;
+                    align-items: center;
+                    gap: 10px;
+                    margin: 16px 0 4px;
+                    font-size: 0.95rem;
+                }
+                .mfl-eq-term {
+                    background: #F8FAFC;
+                    border: 1px solid #E2E8F0;
+                    border-radius: 8px;
+                    padding: 8px 14px;
+                    line-height: 1.3;
+                }
+                .mfl-eq-term b {
+                    display: block;
+                    font-size: 1.15rem;
+                    color: #0F172A;
+                }
+                .mfl-eq-term span {
+                    font-size: 0.74rem;
+                    color: #64748B;
+                    text-transform: uppercase;
+                    letter-spacing: 0.03em;
+                }
+                .mfl-eq-op {
+                    font-size: 1.3rem;
+                    font-weight: 700;
+                    color: #94A3B8;
+                }
+                .mfl-eq-ok   { border-color: #10B981; background: #ECFDF5; }
+                .mfl-eq-ko   { border-color: #F59E0B; background: #FFFBEB; }
+                .mfl-eq-ok b { color: #047857; }
+                .mfl-eq-ko b { color: #B45309; }
+
+                .mfl-recon-table {
+                    width: 100%;
+                    border-collapse: collapse;
+                    margin-top: 16px;
+                }
+                .mfl-recon-table th {
+                    text-align: left;
+                    padding: 10px 8px;
+                    font-size: 0.72rem;
+                    font-weight: 700;
+                    color: #64748B;
+                    text-transform: uppercase;
+                    border-bottom: 1px solid #E2E8F0;
+                }
+                .mfl-recon-table td {
+                    padding: 9px 8px;
+                    font-size: 0.85rem;
+                    border-bottom: 1px solid #F1F5F9;
+                    color: #334155;
+                }
+                .mfl-recon-table td.num,
+                .mfl-recon-table th.num {
+                    text-align: right;
+                    font-variant-numeric: tabular-nums;
+                    font-weight: 600;
+                    white-space: nowrap;
+                }
+                .mfl-recon-table tr.mfl-row-total td {
+                    font-weight: 700;
+                    color: #0F172A;
+                    background: #F8FAFC;
+                }
+                .mfl-recon-table tr.mfl-row-ecart td { color: #B45309; font-weight: 700; }
+                .mfl-recon-table tr.mfl-row-zero td  { color: #047857; font-weight: 700; }
+                .mfl-pos { color: #047857; }
+                .mfl-neg { color: #B91C1C; }
+
+                .mfl-anomaly {
+                    margin-top: 18px;
+                    border: 1px solid #FDE68A;
+                    background: #FFFBEB;
+                    border-radius: 10px;
+                    padding: 14px 16px;
+                }
+                .mfl-anomaly-title {
+                    font-weight: 700;
+                    font-size: 0.88rem;
+                    color: #92400E;
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    margin-bottom: 4px;
+                }
+                .mfl-anomaly .mfl-recon-table th { border-bottom-color: #FDE68A; }
+                .mfl-anomaly .mfl-recon-table td { border-bottom-color: #FEF3C7; }
+                .mfl-note {
+                    font-size: 0.8rem;
+                    color: #64748B;
+                    margin-top: 10px;
+                    line-height: 1.5;
+                }
+
+                .mfl-search {
+                    background: #F1F5F9;
+                    border: 1px solid #CBD5E1;
+                    border-radius: 6px;
+                    padding: 6px 10px;
+                    font-size: 0.85rem;
+                    height: 32px;
+                    min-width: 240px;
+                    color: #0F172A;
+                }
+                .mfl-btn {
+                    background: #F1F5F9;
+                    border: 1px solid #CBD5E1;
+                    color: #334155;
+                    font-weight: 600;
+                    padding: 6px 12px;
+                    border-radius: 6px;
+                    font-size: 0.82rem;
+                    cursor: pointer;
+                    height: 32px;
+                }
+                .mfl-btn:hover { background: #E2E8F0; }
+                .mfl-btn-accent {
+                    background: #F3E8FF;
+                    border-color: #C084FC;
+                    color: #6B21A8;
+                }
+
+                .mfl-tree { margin-top: 14px; }
+                .mfl-soc {
+                    border: 1px solid #E2E8F0;
+                    border-radius: 10px;
+                    margin-bottom: 12px;
+                    overflow: hidden;
+                }
+                .mfl-soc-head,
+                .mfl-mag-head {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    cursor: pointer;
+                    user-select: none;
+                    transition: background-color var(--transition);
+                }
+                .mfl-soc-head {
+                    padding: 14px 16px;
+                    background: #F8FAFC;
+                    font-weight: 700;
+                    color: #0F172A;
+                }
+                .mfl-soc-head:hover { background: #F1F5F9; }
+                .mfl-mag-head {
+                    padding: 10px 16px 10px 34px;
+                    border-top: 1px solid #F1F5F9;
+                    font-weight: 600;
+                    color: #334155;
+                    font-size: 0.9rem;
+                }
+                .mfl-mag-head:hover { background: #F8FAFC; }
+                .mfl-caret {
+                    width: 14px;
+                    flex: 0 0 14px;
+                    color: #94A3B8;
+                    font-size: 0.7rem;
+                    transition: transform var(--transition);
+                }
+                .mfl-open > .mfl-caret { transform: rotate(90deg); }
+                .mfl-grow { flex: 1; min-width: 0; }
+                .mfl-qty {
+                    font-variant-numeric: tabular-nums;
+                    font-weight: 700;
+                    white-space: nowrap;
+                }
+                .mfl-ca {
+                    font-variant-numeric: tabular-nums;
+                    color: #64748B;
+                    font-size: 0.85rem;
+                    white-space: nowrap;
+                    min-width: 130px;
+                    text-align: right;
+                }
+                .mfl-chip {
+                    background: #E0F2FE;
+                    color: #0369A1;
+                    border-radius: 999px;
+                    padding: 2px 9px;
+                    font-size: 0.72rem;
+                    font-weight: 700;
+                    white-space: nowrap;
+                }
+                .mfl-chip-warn { background: #FEF3C7; color: #92400E; }
+                .mfl-refs { padding: 0 16px 14px 34px; }
+                .mfl-refs table { width: 100%; border-collapse: collapse; }
+                .mfl-refs th {
+                    text-align: left;
+                    padding: 8px;
+                    font-size: 0.7rem;
+                    font-weight: 700;
+                    color: #64748B;
+                    text-transform: uppercase;
+                    border-bottom: 1px solid #E2E8F0;
+                }
+                .mfl-refs td {
+                    padding: 7px 8px;
+                    font-size: 0.82rem;
+                    border-bottom: 1px solid #F1F5F9;
+                    color: #334155;
+                }
+                .mfl-refs tbody tr:hover { background: #F8FAFC; }
+                .mfl-refs td.num {
+                    text-align: right;
+                    font-variant-numeric: tabular-nums;
+                    font-weight: 700;
+                    white-space: nowrap;
+                }
+                .mfl-color {
+                    display: inline-block;
+                    background: #F1F5F9;
+                    border: 1px solid #E2E8F0;
+                    border-radius: 6px;
+                    padding: 1px 8px;
+                    font-size: 0.75rem;
+                    font-weight: 600;
+                    color: #0F172A;
+                }
+                .mfl-tailles { color: #64748B; font-size: 0.76rem; }
+                .mfl-empty { color: #94A3B8; text-align: center; padding: 20px; }
+
+
+                /* ══ MOD FOR LIFE : réassort dépôt → magasins (refonte 2026-09-19) ══ */
+                .rx { padding: 0; margin-bottom: 20px; overflow: hidden; }
+                .rx-head {
+                    display: flex; align-items: flex-start; justify-content: space-between;
+                    gap: 16px; padding: 20px 24px 16px; border-bottom: 1px solid #EEF2F6;
+                }
+                .rx-title { font-size: 1.05rem; font-weight: 700; color: #0F172A; letter-spacing: -0.01em; }
+                .rx-sub { font-size: 0.8rem; color: #64748B; margin-top: 3px; }
+                .rx-head-actions { display: flex; gap: 8px; flex-shrink: 0; }
+                .rx-btn {
+                    height: 34px; padding: 0 14px; border-radius: 8px; font-size: 0.82rem; font-weight: 600;
+                    border: 1px solid #D5DCE5; background: #FFFFFF; color: #334155; cursor: pointer;
+                    transition: background-color var(--transition), border-color var(--transition);
+                }
+                .rx-btn:hover { background: #F8FAFC; border-color: #C3CDD9; }
+                .rx-btn[aria-expanded="true"] { background: #F1F5F9; }
+                .rx-btn-primary { background: #0F172A; border-color: #0F172A; color: #FFFFFF; }
+                .rx-btn-primary:hover { background: #1E293B; border-color: #1E293B; }
+                .rx-btn-sm { height: 28px; padding: 0 10px; font-size: 0.76rem; }
+
+                .rx-warn {
+                    margin: 14px 24px 0; padding: 9px 12px; border-radius: 8px; font-size: 0.8rem;
+                    background: #FFFBEB; border: 1px solid #FDE68A; color: #92400E;
+                }
+
+                .rx-settings {
+                    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px;
+                    margin: 16px 24px 0; padding: 16px; border-radius: 10px;
+                    background: #F8FAFC; border: 1px solid #E2E8F0;
+                }
+                .rx-field { display: flex; flex-direction: column; gap: 5px; }
+                .rx-field-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #64748B; }
+                .rx-input { display: flex; align-items: center; gap: 6px; }
+                .rx-input input {
+                    width: 72px; height: 32px; border: 1px solid #D5DCE5; border-radius: 7px; background: #FFF;
+                    padding: 0 8px; font-weight: 700; color: #0F172A; font-variant-numeric: tabular-nums;
+                }
+                .rx-input em { font-style: normal; font-size: 0.8rem; color: #475569; }
+                .rx-help { font-size: 0.74rem; color: #64748B; line-height: 1.4; }
+                .rx-help-inline { color: #94A3B8; font-weight: 400; }
+                .rx-settings-foot {
+                    grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between;
+                    gap: 12px; padding-top: 12px; border-top: 1px solid #E2E8F0;
+                }
+                .rx-check { display: flex; align-items: center; gap: 7px; font-size: 0.8rem; color: #334155; font-weight: 600; cursor: pointer; }
+
+                .rx-summary {
+                    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+                    margin: 16px 24px 0; border: 1px solid #E2E8F0; border-radius: 10px; overflow: hidden;
+                }
+                .rx-stat { padding: 14px 18px; border-left: 1px solid #E2E8F0; }
+                .rx-stat:first-child { border-left: none; }
+                .rx-stat-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #64748B; }
+                .rx-stat-value { font-size: 1.6rem; font-weight: 800; color: #0F172A; margin-top: 4px; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+                .rx-stat-sub { font-size: 0.76rem; color: #64748B; margin-top: 2px; }
+                .rx-stat-main { background: #F0FDF4; }
+                .rx-stat-main .rx-stat-value { color: #15803D; }
+
+                .rx-tabs { display: flex; gap: 4px; margin: 20px 24px 0; border-bottom: 1px solid #E2E8F0; overflow-x: auto; scrollbar-width: none; }
+                .rx-tab {
+                    position: relative; display: flex; align-items: center; gap: 8px;
+                    padding: 10px 14px; border: none; background: none; cursor: pointer;
+                    font-size: 0.86rem; font-weight: 600; color: #64748B; white-space: nowrap; flex-shrink: 0;
+                }
+                .rx-tab:hover { color: #0F172A; }
+                .rx-tab.active { color: #0F172A; }
+                .rx-tab.active::after {
+                    content: ''; position: absolute; left: 10px; right: 10px; bottom: -1px;
+                    height: 2px; background: #0F172A; border-radius: 2px;
+                }
+                .rx-count {
+                    min-width: 22px; padding: 1px 7px; border-radius: 999px; background: #F1F5F9;
+                    font-size: 0.72rem; font-weight: 700; color: #475569; text-align: center; font-variant-numeric: tabular-nums;
+                }
+                .rx-tab.active .rx-count { background: #0F172A; color: #FFF; }
+                .rx-tab-help { margin: 10px 24px 0; font-size: 0.8rem; color: #64748B; }
+
+                .rx-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 14px 24px 0; }
+                .rx-toolbar-right { display: flex; gap: 8px; margin-left: auto; }
+                .rx-seg { display: inline-flex; padding: 3px; border-radius: 9px; background: #F1F5F9; }
+                .rx-seg button {
+                    height: 28px; padding: 0 12px; border: none; border-radius: 7px; background: none;
+                    font-size: 0.8rem; font-weight: 600; color: #64748B; cursor: pointer;
+                }
+                .rx-seg button.active { background: #FFF; color: #0F172A; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08); }
+                .rx-seg-sm button { padding: 0 10px; font-size: 0.76rem; }
+                .rx-select {
+                    height: 34px; border: 1px solid #D5DCE5; border-radius: 8px; background: #FFF;
+                    padding: 0 10px; font-size: 0.82rem; color: #0F172A;
+                }
+                .rx-search { width: 260px; }
+
+                .rx-content { margin: 14px 24px 0; }
+                .rx-empty {
+                    padding: 36px 16px; text-align: center; color: #64748B; font-size: 0.86rem;
+                    border: 1px dashed #D5DCE5; border-radius: 10px;
+                }
+                .rx-empty b { display: block; color: #0F172A; font-size: 0.95rem; margin-bottom: 4px; }
+
+                /* Tableau groupé : un seul en-tête de colonnes, chaque magasin
+                   (ou variante) est une ligne de section repliable. */
+                .rx-grouped .rx-grp-row td {
+                    padding: 0; background: #F8FAFC; border-top: 1px solid #E2E8F0;
+                    border-bottom: 1px solid #E2E8F0; cursor: pointer; user-select: none;
+                }
+                .rx-grouped tbody:first-of-type .rx-grp-row td { border-top: none; }
+                .rx-grouped .rx-grp-row:hover td { background: #F1F5F9; }
+                .rx-grp-line { display: flex; align-items: center; gap: 12px; padding: 10px 12px; }
+                .rx-grp-title { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+                .rx-grp-name-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+                .rx-grp-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+                .rx-grp:not(.open) tr:not(.rx-grp-row) { display: none; }
+                .rx-caret { width: 12px; flex-shrink: 0; color: #94A3B8; font-size: 0.65rem; transition: transform var(--transition); }
+                .rx-grp.open .rx-caret { transform: rotate(90deg); }
+                .rx-group-name { font-weight: 700; color: #0F172A; font-size: 0.9rem; }
+                .rx-group-meta { font-size: 0.76rem; color: #64748B; font-weight: 400; }
+                .rx-group-qty { font-weight: 800; color: #15803D; font-variant-numeric: tabular-nums; font-size: 0.9rem; white-space: nowrap; }
+                .rx-group-qty.zero { color: #94A3B8; font-weight: 600; }
+                .rx-rupt { color: #B91C1C; font-weight: 600; }
+                .rx-btn-ghost { background: transparent; border-color: #D5DCE5; color: #475569; }
+                .rx-btn-ghost:hover { background: #FFFFFF; }
+
+                .rx-table { width: 100%; border-collapse: collapse; }
+                .rx-table th {
+                    text-align: left; padding: 9px 10px; font-size: 0.7rem; font-weight: 700; color: #64748B;
+                    text-transform: uppercase; letter-spacing: 0.04em; background: #FAFBFC;
+                    border-bottom: 1px solid #EEF2F6; white-space: nowrap; position: sticky; top: 0; z-index: 1;
+                }
+                .rx-table td { padding: 9px 10px; font-size: 0.83rem; color: #334155; border-bottom: 1px solid #F1F5F9; vertical-align: middle; }
+                .rx-table tr:last-child td { border-bottom: none; }
+                .rx-table tbody tr:hover td { background: #FAFBFC; }
+                .rx-table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+                .rx-scroll { max-height: 640px; overflow: auto; border: 1px solid #E2E8F0; border-radius: 10px; }
+
+                .rx-ref { font-weight: 700; color: #0F172A; cursor: pointer; white-space: nowrap; }
+                .rx-ref:hover { color: #4338CA; text-decoration: underline; }
+                .rx-prod { display: block; font-size: 0.74rem; color: #94A3B8; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                .rx-var { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+                .rx-var-size { color: #64748B; }
+                .rx-var-size::before { content: '·'; margin-right: 6px; color: #CBD5E1; }
+
+                .rx-reste { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+                .rx-bar { width: 44px; height: 6px; border-radius: 999px; background: #EEF2F6; overflow: hidden; }
+                .rx-bar > i { display: block; height: 100%; border-radius: 999px; background: #94A3B8; }
+                .rx-bar.low { background: #FEE2E2; }
+                .rx-bar.low > i { background: #DC2626; }
+                .rx-prod-inline { margin-left: 8px; font-size: 0.76rem; color: #94A3B8; font-weight: 400; }
+                .rx-reste-txt { min-width: 52px; text-align: right; font-variant-numeric: tabular-nums; }
+
+                .rx-days { font-weight: 600; }
+                .rx-days.out { color: #B91C1C; font-weight: 800; }
+                .rx-days.urgent { color: #B91C1C; }
+                .rx-days.soon { color: #B45309; }
+                .rx-days.none { color: #94A3B8; font-weight: 400; }
+
+                .rx-send { font-weight: 800; color: #15803D; font-size: 0.92rem; }
+                .rx-send-part { font-size: 0.74rem; color: #64748B; font-weight: 500; }
+                .rx-muted { color: #94A3B8; }
+
+                .rx-tag {
+                    display: inline-flex; align-items: center; gap: 6px; font-size: 0.76rem; font-weight: 600;
+                    color: #475569; white-space: nowrap;
+                }
+                .rx-tag::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: #CBD5E1; }
+                .rx-tag.pct::before { background: #DC2626; }
+                .rx-tag.vitesse::before { background: #D97706; }
+                .rx-tag.servi::before { background: #16A34A; }
+                .rx-tag.partiel::before { background: #EA580C; }
+                .rx-tag.depot_vide::before { background: #64748B; }
+
+                .rx-foot { margin: 12px 24px 0; font-size: 0.78rem; color: #64748B; }
+                .rx-method { margin: 14px 24px 22px; font-size: 0.8rem; color: #475569; }
+                .rx-method summary { cursor: pointer; font-weight: 600; color: #334155; }
+                .rx-method ul { margin: 10px 0 0; padding-left: 18px; line-height: 1.6; }
+
+                @media (max-width: 900px) {
+                    .rx-settings, .rx-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+                    .rx-stat:nth-child(3) { border-left: none; }
+                    .rx-stat:nth-child(n+3) { border-top: 1px solid #E2E8F0; }
+                    .rx-toolbar-right { margin-left: 0; width: 100%; }
+                    .rx-search { flex: 1; width: auto; min-width: 160px; }
+                    .rx-toolbar-right .rx-select:not(.rx-search) { width: 200px; }
+                }
+
+                /* ══ Panneau « Solder » (ouvert depuis la fiche référence) ══ */
+                #solde-overlay {
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(15,23,42,0.4);
+                    z-index: 9600;
+                    display: none;
+                    align-items: center;
+                    justify-content: center;
+                    backdrop-filter: blur(3px);
+                    padding: 16px;
+                }
+                #solde-overlay.active {
+                    display: flex;
+                    animation: fadeInOverlay 0.22s ease;
+                }
+                .sd-panel { max-width: 920px; }
+                .sd-head { padding-right: 40px; margin-bottom: 16px; }
+                .sd-form {
+                    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px;
+                    padding: 14px; border-radius: 10px; background: #F8FAFC; border: 1px solid #E2E8F0;
+                }
+                .sd-form .rx-input input { width: 120px; }
+                .sd-form .rx-input input[type="date"] { width: 150px; }
+                .sd-preview { margin: 12px 2px 0; font-size: 0.86rem; color: #334155; min-height: 20px; }
+                .sd-preview .sd-old { color: #94A3B8; text-decoration: line-through; }
+                .sd-preview .sd-new { color: #B91C1C; font-weight: 800; font-size: 1rem; }
+                .sd-preview .sd-err { color: #B91C1C; font-weight: 600; }
+                .sd-stores-head { display: flex; align-items: center; justify-content: space-between; margin: 18px 0 8px; gap: 10px; flex-wrap: wrap; }
+                .sd-stores-title { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #64748B; }
+                .sd-stores-actions { display: flex; gap: 6px; }
+                .sd-scroll { max-height: 360px; }
+                .sd-scroll input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
+                .sd-scroll tr.sd-on td { background: #F0FDF4; }
+                .sd-list-name { font-weight: 600; color: #0F172A; }
+                .sd-list-input {
+                    height: 30px; width: 220px; border: 1px solid #D5DCE5; border-radius: 7px;
+                    padding: 0 8px; font-size: 0.82rem; color: #0F172A; background: #FFF;
+                }
+                .sd-badge { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 999px; font-size: 0.7rem; font-weight: 700; }
+                .sd-badge.exist { background: #E0F2FE; color: #0369A1; }
+                .sd-badge.new { background: #FEF3C7; color: #92400E; }
+                .sd-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+                .sd-summary { font-size: 0.82rem; color: #475569; }
+                .sd-result { margin-top: 14px; padding: 12px 14px; border-radius: 10px; font-size: 0.84rem; line-height: 1.6; }
+                .sd-result.ok { background: #F0FDF4; border: 1px solid #BBF7D0; color: #14532D; }
+                .sd-result.ko { background: #FEF2F2; border: 1px solid #FECACA; color: #991B1B; }
+                .rx-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+                @media (max-width: 760px) {
+                    .sd-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+                }
+
+                /* ══ Réassort, refonte 2 : trois blocs empilés (rb = réassort bloc) ══ */
+                .rb { margin: 16px 24px 0; border: 1px solid #E2E8F0; border-radius: 12px; background: #FFFFFF; overflow: hidden; }
+                .rb-head {
+                    display: flex; align-items: center; gap: 14px; padding: 14px 18px;
+                    cursor: pointer; user-select: none; background: #FAFBFC;
+                    transition: background-color var(--transition);
+                }
+                .rb-head:hover { background: #F4F6F9; }
+                .rb[data-open="1"] .rb-head { border-bottom: 1px solid #EEF2F6; }
+                .rb-num {
+                    flex-shrink: 0; width: 28px; height: 28px; border-radius: 50%;
+                    display: inline-flex; align-items: center; justify-content: center;
+                    font-size: 0.82rem; font-weight: 800; color: #FFFFFF;
+                }
+                .rb-num-green { background: #16A34A; }
+                .rb-num-red { background: #DC2626; }
+                .rb-num-grey { background: #94A3B8; }
+                .rx-summary-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+                @media (max-width: 900px) {
+                    .rx-summary.rx-summary-3 { grid-template-columns: 1fr; }
+                    .rx-summary-3 .rx-stat { border-left: none; }
+                    .rx-summary-3 .rx-stat:nth-child(n+2) { border-top: 1px solid #E2E8F0; }
+                }
+                .rb-titles { min-width: 0; flex: 1; }
+                .rb-title { font-size: 0.95rem; font-weight: 700; color: #0F172A; }
+                .rb-title-hint { font-weight: 500; color: #64748B; }
+                .rb-sub { font-size: 0.78rem; color: #64748B; margin-top: 2px; }
+                .rb-count { flex-shrink: 0; font-size: 0.86rem; font-weight: 700; color: #0F172A; white-space: nowrap; font-variant-numeric: tabular-nums; }
+                .rb-caret { flex-shrink: 0; color: #94A3B8; font-size: 0.8rem; transition: transform var(--transition); }
+                .rb[data-open="0"] .rb-caret { transform: rotate(-90deg); }
+                .rb[data-open="0"] .rb-body { display: none; }
+                .rb-body .rx-table th { background: #FFFFFF; }
+                .rb-body .rx-scroll { border: none; border-radius: 0; max-height: 480px; }
+                .rb-empty { padding: 22px 18px; font-size: 0.84rem; color: #64748B; }
+                .rb-more { padding: 10px 18px; font-size: 0.78rem; color: #64748B; border-top: 1px solid #EEF2F6; background: #FAFBFC; }
+                .rb-mag { font-weight: 700; color: #0F172A; white-space: nowrap; }
+                .rb-mag small { display: block; font-weight: 400; color: #94A3B8; font-size: 0.72rem; }
+                .rx-tag.pv::before { background: #DC2626; }
+                .rx-tag.sv::before { background: #D97706; }
+
+                /* ══ Bouton « ← Retour » des fenêtres pop-up (ajouté par JS à gauche du ✕) ══ */
+                .back-popup-btn {
+                    position: absolute;
+                    top: 16px;
+                    right: 60px;
+                    width: 36px;
+                    height: 36px;
+                    border-radius: 50%;
+                    background: #F1F5F9;
+                    color: #334155;
+                    border: 1px solid #CBD5E1;
+                    font-size: 1.05rem;
+                    font-weight: 700;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-family: inherit;
+                    z-index: 2;
+                    transition: background var(--transition);
+                }
+                .back-popup-btn:hover { background: #E2E8F0; }
+                /* L'en-tête qui suit laisse la place aux deux boutons. */
+                .back-popup-btn + .close-detail-btn + * { padding-right: 104px !important; }
+
+                /* ══ Page Action (ac = action) ══
+                   Style aligné sur le reste du dashboard (demande utilisatrice
+                   2026-09-22 : « ma capture n'était qu'un exemple, ça doit
+                   matcher le dashboard ») : violet --brand, en-têtes de
+                   tableau clairs, boutons comme « Transférer / Solder » de la
+                   fiche produit. */
+                .ac-searchrow { position:relative; margin-bottom:16px; }
+                .ac-search { display:flex; align-items:center; flex-wrap:wrap; gap:6px; width:100%;
+                    background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm);
+                    box-shadow:var(--shadow); padding:4px 0 4px 14px; transition:border-color var(--transition), box-shadow var(--transition); }
+                .ac-search:focus-within { border-color:var(--brand); box-shadow:0 0 0 3px rgba(124,58,237,0.18); }
+                .ac-search-ico { font-size:1rem; opacity:0.6; }
+                .ac-facets { display:flex; flex-wrap:wrap; gap:4px; }
+                .ac-facet { display:inline-flex; align-items:center; gap:4px; font-size:0.76rem; font-weight:600; border-radius:6px; padding:3px 4px 3px 8px; background:#F3E8FF; color:var(--brand-dark); white-space:nowrap; }
+                .ac-facet.grp { background:var(--surface2); color:var(--text); }
+                .ac-facet b { font-weight:800; }
+                .ac-facet button { border:none; background:transparent; color:inherit; cursor:pointer; font-size:0.9rem; padding:0 3px; line-height:1; }
+                #ac-q { flex:1; min-width:160px; border:none; outline:none; font-size:0.9rem; padding:8px 4px; background:transparent; color:var(--text); font-family:inherit; }
+                .ac-search-toggle { align-self:stretch; border:none; border-left:1px solid var(--border); background:var(--surface2); color:var(--text-muted); padding:0 14px; cursor:pointer; border-radius:0 var(--radius-sm) var(--radius-sm) 0; font-size:0.9rem; margin:-4px 0; }
+                .ac-search-toggle:hover, .ac-search-toggle.open { background:#E9D5FF; color:var(--brand-dark); }
+                .ac-panel { display:none; position:absolute; top:calc(100% + 6px); right:0; z-index:60; background:var(--surface); border:1px solid var(--border);
+                    border-radius:var(--radius); box-shadow:0 12px 32px rgba(15,23,42,0.12); }
+                .ac-panel.open { display:flex; }
+                .ac-search-panel { left:0; padding:14px 6px; }
+                .ac-col { flex:1; padding:0 14px; min-width:0; }
+                .ac-col + .ac-col { border-left:1px solid var(--border); }
+                .ac-col-title { font-weight:700; font-size:0.9rem; color:var(--text); margin-bottom:8px; display:flex; gap:6px; align-items:center; }
+                .ac-item { padding:6px 8px; font-size:0.86rem; color:var(--text); border-radius:6px; cursor:pointer; display:flex; align-items:center; gap:6px; }
+                .ac-item:hover { background:rgba(124,58,237,0.07); }
+                .ac-item.on { color:var(--brand-dark); font-weight:700; }
+                .ac-item.on::before { content:'✓'; }
+                .ac-sep { height:1px; background:var(--border); margin:6px 0; }
+                .ac-fav { display:flex; align-items:center; justify-content:space-between; gap:6px; }
+                .ac-fav button { border:none; background:none; color:var(--text-muted); cursor:pointer; font-size:0.9rem; }
+                .ac-fav button:hover { color:var(--red); }
+                .ac-fav-empty { font-size:0.8rem; color:var(--text-muted); padding:4px 8px; }
+                .ac-fav-save { display:flex; gap:6px; padding:2px 0; }
+                .ac-fav-save input { flex:1; min-width:0; border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:0.8rem; font-family:inherit; }
+                .ac-fav-save button { border:1px solid #C084FC; background:#F3E8FF; color:#6B21A8; border-radius:6px; padding:5px 10px; font-size:0.78rem; font-weight:600; cursor:pointer; }
+                .ac-head { display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; margin-bottom:14px; }
+                .ac-title { display:flex; align-items:center; gap:10px; font-size:1rem; font-weight:700; color:var(--text); }
+                .ac-count { font-size:0.78rem; font-weight:600; color:var(--text-muted); background:var(--surface2); padding:3px 10px; border-radius:12px; }
+                .ac-tools { display:flex; align-items:center; gap:10px; }
+                .ac-limit { display:flex; align-items:center; gap:6px; font-size:0.82rem; font-weight:600; color:var(--text-muted); }
+                .ac-select { font-size:0.82rem; font-family:inherit; padding:5px 8px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface); color:var(--text); font-weight:600; outline:none; max-width:220px; }
+                .ac-select:focus { border-color:var(--brand); box-shadow:0 0 0 3px rgba(124,58,237,0.18); }
+                .ac-ordre { padding:6px 12px; font-size:0.8rem; }
+                .ac-niv { font-size:0.78rem; margin-left:2px; }
+                .ac-badges { display:inline-flex; gap:4px; margin-left:6px; vertical-align:middle; }
+                .ac-badge { border:none; border-radius:10px; padding:1px 7px; font-size:0.7rem; font-weight:700; cursor:pointer; font-family:inherit; line-height:1.5; }
+                .ac-badge:hover { filter:brightness(0.93); }
+                .act-dots { display:inline-flex; gap:3px; margin-left:5px; vertical-align:middle; }
+                .act-dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+                .act-legend { font-size:0.75rem; color:#475569; display:flex; gap:12px; flex-wrap:wrap; padding:4px 0 6px; }
+                .act-legend span { display:inline-flex; align-items:center; gap:5px; }
+                .ac-colpick { position:relative; }
+                .ac-icon-btn { width:36px; height:32px; display:flex; align-items:center; justify-content:center; border:1px solid var(--border); background:var(--surface); color:var(--text-muted); border-radius:var(--radius-sm); cursor:pointer; }
+                .ac-icon-btn:hover, .ac-icon-btn.open { background:#F3E8FF; color:var(--brand-dark); border-color:#C084FC; }
+                .ac-cols-panel { flex-direction:column; width:230px; max-height:60vh; overflow-y:auto; padding:8px; }
+                .ac-cols-panel label { display:flex; align-items:center; gap:10px; padding:7px 8px; font-size:0.86rem; color:var(--text); border-radius:6px; cursor:pointer; }
+                .ac-cols-panel label:hover { background:rgba(124,58,237,0.07); }
+                .ac-cols-panel input { width:16px; height:16px; accent-color:var(--brand); }
+                .ac-table-wrap { overflow:auto; max-height:72vh; border:1px solid var(--border); border-radius:var(--radius-sm); }
+                .ac-table th { position:sticky; top:0; z-index:5; background:#EFE7FD; white-space:nowrap; }
+                .ac-table th.num, .ac-table td.num { text-align:right; font-variant-numeric:tabular-nums; }
+                .ac-table td { white-space:nowrap; }
+                .ac-table tr.ac-ref td { background:#FAF7FF; font-weight:700; border-top:1px solid #E9D5FF; }
+                .ac-table tr.ac-ref:hover td { background:#F3E8FF; }
+                .ac-table tr.ac-var td { font-weight:400; }
+                .ac-table tr.ac-var td.ac-color-cell { padding-left:24px; }
+                .ac-table tr.ac-grp td { background:var(--surface2); color:var(--brand-dark); font-weight:700; font-size:0.84rem; cursor:default; }
+                .ac-table tr.ac-grp td span { font-weight:500; color:var(--text-muted); margin-left:10px; }
+                .ac-rank { color:var(--brand); font-weight:700; }
+                .ac-caret { display:inline-block; width:14px; color:var(--brand); transition:transform var(--transition); }
+                tr.ac-ref.closed .ac-caret { transform:rotate(-90deg); }
+                .ac-neg { color:var(--red); }
+                .ac-muted { color:#94A3B8; }
+                .ac-cat { display:inline-block; background:var(--surface2); border-radius:6px; padding:2px 8px; font-size:0.76rem; font-weight:600; color:var(--text-muted); }
+                .ac-actions { display:flex; gap:6px; }
+                .ac-btn { background:#F3E8FF; border:1px solid #C084FC; color:#6B21A8; font-weight:600; padding:5px 10px; border-radius:8px; font-size:0.78rem; cursor:pointer; white-space:nowrap; font-family:inherit; }
+                .ac-btn:hover { background:#E9D5FF; }
+                tr.ac-var .ac-btn { padding:3px 8px; font-size:0.72rem; background:var(--surface); }
+                tr.ac-var .ac-btn:hover { background:#F3E8FF; }
+                .ac-photo { width:36px; height:36px; object-fit:cover; border-radius:6px; border:1px solid var(--border); background:var(--surface); display:block; }
+                .ac-nophoto { width:36px; height:36px; border-radius:6px; background:var(--surface2); color:#94A3B8; font-size:0.6rem; display:flex; align-items:center; justify-content:center; text-align:center; line-height:1.1; }
+                .ac-foot { font-size:0.8rem; color:var(--text-muted); margin-top:10px; }
+                .ac-empty { padding:28px; text-align:center; color:var(--text-muted); }
+                #ac-reassort-overlay { position:fixed; inset:0; background:rgba(15,23,42,0.4); z-index:9600; display:none; align-items:center; justify-content:center; padding:16px; }
+                #ac-reassort-overlay.active { display:flex; animation:fadeInOverlay 0.22s ease; }
+                .ac-ra-kpis { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
+                .ac-ra-kpi { flex:1; min-width:140px; border:1px solid var(--border); border-radius:var(--radius-sm); padding:10px 12px; background:var(--surface2); }
+                .ac-ra-kpi b { display:block; font-size:1.2rem; color:var(--text); }
+                .ac-ra-kpi span { font-size:0.75rem; color:var(--text-muted); }
+                @media (max-width: 900px) {
+                    .ac-search-panel { flex-direction:column; }
+                    .ac-col + .ac-col { border-left:none; border-top:1px solid var(--border); padding-top:10px; margin-top:10px; }
+                }
             </style>
         </head>
         <body>
@@ -1307,42 +1938,229 @@
                 <!-- ══════════ VUE DÉDIÉE MOD FOR LIFE (société entrepôt/importateur, pas un magasin) ══════════ -->
                 <div id="modforlife-kpi-grid" style="display:none;">
                     <div class="kpi-grid">
-                        <div class="kpi-card kpi-blue" id="card-mfl-achats">
-                            <span class="kpi-icon">🧾</span>
-                            <div class="kpi-label" title="Montant TTC des commandes fournisseur confirmées de MOD FOR LIFE chez de vrais fournisseurs externes (hors flux inter-sociétés). Vérifiable dans Achats → Analyse, société MOD FOR LIFE.">Achats fournisseurs (TTC)</div>
-                            <div class="kpi-value" id="mfl-ca-achats">—</div>
+                        <div class="kpi-card kpi-blue" id="card-mfl-qty-achats" title="Ce que de vrais fournisseurs externes (Tom&amp;Eva, DIVERS, ABC…) ont vendu à MOD FOR LIFE : quantité RÉCEPTIONNÉE (qty_received) sur bon d&#39;achat confirmé, nette des retours au fournisseur. Un bon confirmé mais jamais réceptionné, ou reçu puis renvoyé, ne compte pas. Les bons où MOD FOR LIFE est le fournisseur sont exclus : c&#39;est le sens inverse. Ce chiffre ne bouge pas quand la marchandise repart vers les magasins.">
+                            <span class="kpi-icon">📥</span>
+                            <div class="kpi-label">Qté achetée <span style="opacity:.6;font-weight:400">(reçue)</span></div>
+                            <div class="kpi-value" id="mfl-qty-achats">—</div>
                             <div class="kpi-subtext" id="mfl-qty-achats-sub"></div>
                         </div>
-                        <div class="kpi-card" id="card-mfl-commandes">
-                            <span class="kpi-icon">📋</span>
-                            <div class="kpi-label">Commandes fournisseurs</div>
-                            <div class="kpi-value" id="mfl-nb-commandes">—</div>
+                        <div class="kpi-card kpi-green" id="card-mfl-qty-dispatch" title="Ce qui est sorti de l'entrepôt vers les magasins : quantité livrée (qty_delivered) sur les bons de vente inter-sociétés de MOD FOR LIFE, nette des retours. Base Pivot crée UN bon de vente PAR MAGASIN ; le magasin destinataire est lu sur le bon d'achat miroir de la société qui reçoit.">
+                            <span class="kpi-icon">🚚</span>
+                            <div class="kpi-label">Dispatché</div>
+                            <div class="kpi-value" id="mfl-qty-dispatch">—</div>
+                            <div class="kpi-subtext" id="mfl-qty-dispatch-sub"></div>
                         </div>
-                        <div class="kpi-card kpi-green" id="card-mfl-ventes">
-                            <span class="kpi-icon">💰</span>
-                            <div class="kpi-label" title="Montant TTC des commandes de vente confirmées de MOD FOR LIFE vers les 3 sociétés magasins, au prix coûtant. Vérifiable dans Ventes → Analyse → Ventes, filtre « Bons de commande », société MOD FOR LIFE.">Envoyé aux sociétés magasins (TTC)</div>
-                            <div class="kpi-value" id="mfl-ca-ventes">—</div>
-                            <div class="kpi-subtext" id="mfl-qty-ventes-sub"></div>
-                        </div>
-                        <div class="kpi-card kpi-amber" id="card-mfl-stock">
+                        <div class="kpi-card kpi-amber" id="card-mfl-stock" title="Stock physique restant dans l'entrepôt MOD FOR LIFE, en pièces (stock.quant, emplacements internes de la société).">
                             <span class="kpi-icon">📦</span>
-                            <div class="kpi-label" title="Stock physique de l'entrepôt MOD FOR LIFE, en pièces.">Stock entrepôt</div>
+                            <div class="kpi-label">Stock entrepôt</div>
                             <div class="kpi-value" id="mfl-stock">—</div>
                             <div class="kpi-subtext" id="mfl-stock-sub"></div>
                         </div>
+                        <div class="kpi-card kpi-blue" id="card-mfl-achats" title="Montant TTC des bons d'achat confirmés de MOD FOR LIFE chez de vrais fournisseurs externes (hors flux inter-sociétés). Vérifiable dans Achats → Analyse, société MOD FOR LIFE.">
+                            <span class="kpi-icon">🧾</span>
+                            <div class="kpi-label">Achats fournisseurs (TTC)</div>
+                            <div class="kpi-value" id="mfl-ca-achats">—</div>
+                            <div class="kpi-subtext" id="mfl-ca-achats-sub"></div>
+                        </div>
+                        <div class="kpi-card" id="card-mfl-ventes" title="Montant TTC des bons de vente confirmés de MOD FOR LIFE vers les 3 sociétés magasins, au prix coûtant. Vérifiable dans Ventes → Analyse → Ventes, filtre « Bons de commande », société MOD FOR LIFE.">
+                            <span class="kpi-icon">💰</span>
+                            <div class="kpi-label">Envoyé aux sociétés (TTC)</div>
+                            <div class="kpi-value" id="mfl-ca-ventes">—</div>
+                            <div class="kpi-subtext" id="mfl-qty-ventes-sub"></div>
+                        </div>
+                        <div class="kpi-card" id="card-mfl-commandes" title="Nombre de bons d'achat fournisseur, et nombre de bons de vente inter-sociétés (un par magasin servi).">
+                            <span class="kpi-icon">📋</span>
+                            <div class="kpi-label">Bons d'achat</div>
+                            <div class="kpi-value" id="mfl-nb-commandes">—</div>
+                            <div class="kpi-subtext" id="mfl-nb-ventes-sub"></div>
+                        </div>
                     </div>
-                    <div class="detail-section">
-                        <h3>Envoyé vers chaque société (au prix coûtant)</h3>
-                        <table>
+
+                    <!-- ════════════════════════════════════════════════════════
+                         BLOCS DÉSACTIVÉS le 2026-09-21 à la demande de
+                         l'utilisatrice : « Le compte exact » et « Dispatché
+                         sans bon d'achat, hors compte ». Retirés de l'écran,
+                         conservés ci-dessous pour pouvoir les récupérer.
+
+                         Pour réactiver un bloc :
+                           1. retirer les balises de commentaire qui
+                              l'entourent (ouverture et fermeture) ;
+                           2. dans static/src/js/dashboard.js, fonction
+                              _renderModForLifeDashboard, décommenter la ligne
+                              « _mflRenderRecon(data); ».
+                         Le serveur calcule toujours ces données (clés
+                         balance_mfl, non_stockables, hors_perimetre) et les
+                         fonctions JS de rendu sont toujours présentes : rien
+                         d'autre à faire.
+                    ════════════════════════════════════════════════════════ -->
+
+                    <!-- BLOC DÉSACTIVÉ : Le compte exact
+                    <div class="section-card full-width mfl-panel" id="mfl-recon-section">
+                        <div class="section-title" style="font-weight:700; font-size:1rem; color:#0F172A; display:flex; align-items:center; gap:8px;">
+                            <span style="color:#6366F1; font-size:1.2rem;">●</span> Le compte exact — Qté achetée = Stock entrepôt + Dispatché
+                        </div>
+                        <div class="mfl-equation" id="mfl-equation"></div>
+                        <table class="mfl-recon-table">
                             <thead>
                                 <tr>
-                                    <th>Société</th>
-                                    <th>Pièces</th>
-                                    <th>CA</th>
+                                    <th>Poste</th>
+                                    <th class="num">Pièces</th>
+                                    <th>D'où vient le chiffre</th>
                                 </tr>
                             </thead>
-                            <tbody id="modforlife-ventes-tbody"></tbody>
+                            <tbody id="mfl-balance-tbody"></tbody>
                         </table>
+                        <div id="mfl-anomalies"></div>
+                        <div class="mfl-note" id="mfl-recon-note"></div>
+                    </div>
+                    FIN DU BLOC DÉSACTIVÉ : Le compte exact -->
+
+                    <!-- BLOC DÉSACTIVÉ : Dispatché sans bon d'achat, hors compte
+                    <div class="section-card full-width mfl-panel" id="mfl-hors-section" style="display:none;">
+                        <div class="section-title" style="font-weight:700; font-size:1rem; color:#0F172A; display:flex; align-items:center; gap:8px;">
+                            <span style="color:#F59E0B; font-size:1.2rem;">●</span> Dispatché sans bon d'achat — hors compte
+                        </div>
+                        <div id="mfl-hors-body"></div>
+                    </div>
+                    FIN DU BLOC DÉSACTIVÉ : Dispatché sans bon d'achat -->
+
+                    <!-- ── Dispatch : société → magasin → référence × couleur ── -->
+                    <div class="section-card full-width mfl-panel" id="mfl-dispatch-section">
+                        <div class="section-header-row" style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+                            <div class="section-title" style="font-weight:700; font-size:1rem; color:#0F172A; display:flex; align-items:center; gap:8px; margin-bottom:0;">
+                                <span style="color:#10B981; font-size:1.2rem;">●</span> Dispatch — société → magasin → référence
+                            </div>
+                            <div class="section-actions" style="display:flex; align-items:center; gap:8px; margin-left:auto;">
+                                <input type="text" id="mfl-dispatch-search" class="mfl-search" placeholder="Filtrer : référence, couleur, magasin…" autocomplete="off"/>
+                                <button id="btn-mfl-expand" class="mfl-btn">Tout déplier</button>
+                                <button id="btn-mfl-collapse" class="mfl-btn">Tout replier</button>
+                                <button id="btn-mfl-export" class="mfl-btn mfl-btn-accent" title="Exporter le dispatch affiché (société, magasin, référence, couleur, tailles, quantité) en CSV">⬇ CSV</button>
+                            </div>
+                        </div>
+                        <div class="mfl-note" id="mfl-dispatch-note"></div>
+                        <div id="mfl-dispatch-tree" class="mfl-tree"></div>
+                    </div>
+
+                    <!-- ── Réassort : que doit envoyer le dépôt, et à quel magasin ──
+                         REFONTE (2026-09-19, « je n'aime pas l'ordre et le
+                         design, je veux quelque chose de professionnel ») :
+                         l'ordre suit celui d'un écran de préparation — ce
+                         qu'il faut faire d'abord, les réglages repliés en
+                         dernier. Source des envois = dépôt MOD FOR LIFE
+                         uniquement. Chargé par /mavie/api/reassort. -->
+                    <div class="section-card full-width rx" id="mfl-reassort-section">
+
+                        <div class="rx-head">
+                            <div>
+                                <div class="rx-title">Réassort dépôt → magasins</div>
+                                <div class="rx-sub" id="ra-periode-note">Calcul en cours…</div>
+                            </div>
+                            <div class="rx-head-actions">
+                                <button type="button" id="btn-ra-settings" class="rx-btn" aria-expanded="false">Réglages</button>
+                                <button type="button" id="btn-ra-export" class="rx-btn rx-btn-primary">Exporter</button>
+                            </div>
+                        </div>
+
+                        <div class="rx-warn" id="ra-warn" style="display:none;"></div>
+
+                        <div class="rx-settings" id="ra-settings" style="display:none;">
+                            <label class="rx-field">
+                                <span class="rx-field-label">Fenêtre de vente</span>
+                                <span class="rx-input"><input type="number" id="ra-fenetre" value="90" min="7" max="365"/><em>jours</em></span>
+                                <span class="rx-help">Période utilisée pour mesurer ce que chaque magasin vend.</span>
+                            </label>
+                            <label class="rx-field">
+                                <span class="rx-field-label">Seuil d'alerte</span>
+                                <span class="rx-input"><input type="number" id="ra-seuil" value="10" min="1" max="90"/><em>% du reçu</em></span>
+                                <span class="rx-help">Alerte quand il reste moins que ce pourcentage de ce que le magasin a reçu.</span>
+                            </label>
+                            <label class="rx-field">
+                                <span class="rx-field-label">Délai de réappro</span>
+                                <span class="rx-input"><input type="number" id="ra-delai" value="21" min="1" max="180"/><em>jours</em></span>
+                                <span class="rx-help">Alerte « vend vite » : le stock ne tiendra pas ce délai au rythme actuel.</span>
+                            </label>
+                            <label class="rx-field">
+                                <span class="rx-field-label">Couverture cible</span>
+                                <span class="rx-input"><input type="number" id="ra-cible" value="30" min="1" max="365"/><em>jours</em></span>
+                                <span class="rx-help">Quantité à envoyer = de quoi tenir ce nombre de jours, moins le stock.</span>
+                            </label>
+                            <div class="rx-settings-foot" style="justify-content:flex-end;">
+                                <button type="button" id="btn-ra-recalc" class="rx-btn rx-btn-primary">Appliquer</button>
+                            </div>
+                        </div>
+
+                        <!-- REFONTE 2 (2026-09-21, choix de l'utilisatrice : « 3 blocs
+                             simples empilés ») : plus d'onglets ni de boutons de vue.
+                             Synthèse, deux filtres, puis trois blocs l'un sous
+                             l'autre, chacun avec son titre et son tableau. -->
+                        <div class="rx-summary rx-summary-3">
+                            <div class="rx-stat rx-stat-main">
+                                <div class="rx-stat-label">À envoyer</div>
+                                <div class="rx-stat-value" id="ra-kpi-pieces">—</div>
+                                <div class="rx-stat-sub">pièces</div>
+                            </div>
+                            <div class="rx-stat">
+                                <div class="rx-stat-label">Manquant au dépôt</div>
+                                <div class="rx-stat-value" id="ra-kpi-vide">—</div>
+                                <div class="rx-stat-sub">articles à acheter</div>
+                            </div>
+                            <div class="rx-stat">
+                                <div class="rx-stat-label">À surveiller</div>
+                                <div class="rx-stat-value" id="ra-kpi-surveiller">—</div>
+                                <div class="rx-stat-sub">rien à envoyer pour l'instant</div>
+                            </div>
+                        </div>
+
+                        <div class="rx-toolbar">
+                            <div class="rx-toolbar-right" style="margin-left:0;">
+                                <select id="ra-f-magasin" class="rx-select"><option value="">Tous les magasins</option></select>
+                                <input type="search" id="ra-f-search" class="rx-select rx-search" placeholder="Rechercher une référence, une couleur, un magasin…" autocomplete="off"/>
+                            </div>
+                        </div>
+
+                        <!-- ① À envoyer maintenant -->
+                        <div class="rb" id="ra-bloc-envoyer" data-open="1">
+                            <div class="rb-head">
+                                <span class="rb-num rb-num-green">1</span>
+                                <div class="rb-titles">
+                                    <div class="rb-title">À envoyer maintenant</div>
+                                    <div class="rb-sub">Ce que le dépôt peut envoyer tout de suite, magasin par magasin.</div>
+                                </div>
+                                <div class="rb-count" id="ra-cnt-envoyer">—</div>
+                                <span class="rb-caret">▾</span>
+                            </div>
+                            <div class="rb-body" id="ra-body-envoyer"></div>
+                        </div>
+
+                        <!-- ② Manquant au dépôt -->
+                        <div class="rb" id="ra-bloc-vide" data-open="1">
+                            <div class="rb-head">
+                                <span class="rb-num rb-num-red">2</span>
+                                <div class="rb-titles">
+                                    <div class="rb-title">Manquant au dépôt <span class="rb-title-hint">— à acheter</span></div>
+                                    <div class="rb-sub">Le magasin en a besoin, mais le dépôt n'a plus cet article.</div>
+                                </div>
+                                <div class="rb-count" id="ra-cnt-vide">—</div>
+                                <span class="rb-caret">▾</span>
+                            </div>
+                            <div class="rb-body" id="ra-body-vide"></div>
+                        </div>
+
+                        <!-- ③ À surveiller (replié par défaut) -->
+                        <div class="rb" id="ra-bloc-surveiller" data-open="0">
+                            <div class="rb-head">
+                                <span class="rb-num rb-num-grey">3</span>
+                                <div class="rb-titles">
+                                    <div class="rb-title">À surveiller</div>
+                                    <div class="rb-sub">Le dépôt a l'article, mais rien n'est à envoyer : pas de vente récente, ou stock suffisant.</div>
+                                </div>
+                                <div class="rb-count" id="ra-cnt-surveiller">—</div>
+                                <span class="rb-caret">▾</span>
+                            </div>
+                            <div class="rb-body" id="ra-body-surveiller"></div>
+                        </div>
+
+                        <div class="rx-foot" id="ra-foot" style="margin-bottom:22px;"></div>
                     </div>
                 </div>
 
@@ -1523,6 +2341,86 @@
                     <div id="sales-daily-legend" class="chart-legend" style="display:none;"></div>
                 </div>
 
+                <!-- ══════════ PAGE ACTION (menu Dashboard → Action) ══════════
+                     Demande utilisatrice (2026-09-22) : le tableau du Top/Flop
+                     Produits en grand, du top au flop, une ligne par référence
+                     et ses couleurs dessous, avec Catégorie, Prix, Qté en dépôt
+                     et trois boutons d'action. Rempli par loadActions()
+                     (dashboard.js). -->
+                <div class="section-card full-width" id="action-page" style="display:none;">
+                    <!-- Recherche + Filtres / Regrouper par / Favoris : tout en
+                         haut de la page (demande utilisatrice 2026-09-22). -->
+                    <div class="ac-searchrow">
+                        <div class="ac-search" id="ac-search">
+                            <span class="ac-search-ico">🔍</span>
+                            <div class="ac-facets" id="ac-facets"></div>
+                            <input type="text" id="ac-q" placeholder="Rechercher une référence, un nom, une catégorie…" autocomplete="off"/>
+                            <button type="button" class="ac-search-toggle" id="ac-search-toggle" title="Filtres, regroupements et favoris">▾</button>
+                        </div>
+                        <div class="ac-panel ac-search-panel" id="ac-search-panel">
+                            <div class="ac-col">
+                                <div class="ac-col-title"><span style="color:var(--brand);">⏷</span> Filtres</div>
+                                <div class="ac-item" data-filtre="vendus">Vendus sur la période</div>
+                                <div class="ac-item" data-filtre="non_vendus">Non vendus</div>
+                                <div class="ac-sep"></div>
+                                <div class="ac-item" data-filtre="en_stock">En stock en magasin</div>
+                                <div class="ac-item" data-filtre="rupture">En rupture en magasin</div>
+                                <div class="ac-sep"></div>
+                                <div class="ac-item" data-filtre="depot">Disponible au dépôt</div>
+                                <div class="ac-item" data-filtre="depot_vide">Manquant au dépôt</div>
+                                <div class="ac-sep"></div>
+                                <div class="ac-item" data-filtre="reste_negatif">Reste négatif</div>
+                            </div>
+                            <div class="ac-col">
+                                <div class="ac-col-title"><span style="color:var(--brand);">☰</span> Regrouper par</div>
+                                <div class="ac-item" data-group="categorie">Catégorie</div>
+                                <div class="ac-item" data-group="collection">Collection</div>
+                            </div>
+                            <div class="ac-col">
+                                <div class="ac-col-title"><span style="color:var(--amber);">★</span> Favoris</div>
+                                <div id="ac-favs"></div>
+                                <div class="ac-sep"></div>
+                                <div class="ac-fav-save">
+                                    <input type="text" id="ac-fav-name" placeholder="Nom de la recherche"/>
+                                    <button type="button" id="ac-fav-save-btn">Enregistrer</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="ac-head">
+                        <div class="section-title" style="margin-bottom:0;">
+                            <span>⚡ Actions</span>
+                            <span class="ac-count" id="ac-count">—</span>
+                        </div>
+                        <div class="ac-tools">
+                            <button type="button" class="ac-btn ac-ordre" id="ac-ordre" title="Affiché du top au flop — cliquer pour afficher du flop au top"><span style="color:#DC2626;">▲</span> Top → Flop</button>
+                            <label class="ac-limit" title="Société sur laquelle porte le classement (parmi les sociétés cochées dans Odoo)">
+                                Société
+                                <select id="ac-societe" class="ac-select"><option value="">Toutes les sociétés cochées</option></select>
+                            </label>
+                            <label class="ac-limit" title="Nombre de références à afficher">
+                                Lignes
+                                <input type="number" id="ac-limit" value="20" min="1" max="500" class="limit-input"/>
+                            </label>
+                            <div class="ac-colpick">
+                                <button type="button" class="ac-icon-btn" id="ac-cols-toggle" title="Choisir les colonnes affichées">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="17" x2="20" y2="17"/><circle cx="9" cy="7" r="2.4" fill="#fff"/><circle cx="15" cy="17" r="2.4" fill="#fff"/></svg>
+                                </button>
+                                <div class="ac-panel ac-cols-panel" id="ac-cols-panel"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="ac-table-wrap">
+                        <table class="ac-table">
+                            <thead><tr id="ac-thead"></tr></thead>
+                            <tbody id="ac-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div class="ac-foot" id="ac-foot"></div>
+                </div>
+
                 <!-- ══════════ HISTORIQUE TRANSFERTS / SOLDES ══════════
                      Demande utilisateur : voir sous les cartes tout ce qui a
                      déjà été fait — les bons de transfert entre magasins
@@ -1542,6 +2440,7 @@
                         <div class="section-actions" style="display:flex; align-items:center; gap:10px; margin-left:auto;">
                             <button type="button" id="history-tab-transferts" class="chart-mode-btn active">🔄 Transferts</button>
                             <button type="button" id="history-tab-soldes" class="chart-mode-btn">🏷️ Soldes</button>
+                            <button type="button" id="btn-refresh-history" class="btn-transfer-open" title="Rafraîchir l'historique (nouveaux transferts, changements d'état)" style="padding:4px 10px;font-size:0.78rem;">↻ Rafraîchir</button>
                             <button id="btn-export-history" class="btn-transfer-open" title="Exporter l'historique affiché en CSV" style="padding:4px 10px;font-size:0.78rem;">📄 CSV</button>
                         </div>
                     </div>
@@ -1586,6 +2485,7 @@
                         <button id="btn-product-history" class="btn-transfer-open" title="Tout l'historique de cette référence : transferts et ventes en solde (date, magasin, état)">📜 Historique</button>
                         <button id="btn-export-detail" class="btn-transfer-open" title="Exporter cette fiche produit en Excel (.xlsx), photo incrustée">📊 Exporter Excel</button>
                         <button id="btn-open-transfer" class="btn-transfer-open" title="Proposer un transfert inter-magasins">🔄 Transférer</button>
+                        <button id="btn-open-solde" class="btn-transfer-open" title="Solder cette référence dans un ou plusieurs magasins (liste de soldes du magasin, créée si besoin)">🏷️ Solder</button>
                     </div>
 
                     <div id="detail-batch-info" style="display:none"></div>
@@ -1601,6 +2501,10 @@
                     </div>
 
                     <div class="detail-kpi-grid">
+                        <div class="detail-kpi-card">
+                            <div class="d-label" title="Prix de vente catalogue TTC de la référence (celui de l'étiquette), avant toute solde ou remise.">🏷️ Prix de vente <span style="opacity:.6;font-weight:400">(TTC)</span></div>
+                            <div class="d-value" id="detail-prix-vente">—</div>
+                        </div>
                         <div class="detail-kpi-card">
                             <div class="d-label" title="Ventes en caisse au client final uniquement (pos.order.line). Les transferts MOD FOR LIFE vers une société magasin (sale.order) ne sont PAS des ventes et sont exclus — c'est pourquoi ce chiffre est inférieur au bouton « Vendu » de la fiche produit Odoo, qui additionne les deux.">📤 Qté vendue <span style="opacity:.6;font-weight:400">(caisse)</span></div>
                             <div class="d-value" id="detail-qty-sold">—</div>
@@ -1635,12 +2539,14 @@
 
                     <div class="detail-section">
                         <h3>🎨 Variantes Couleurs — Meilleure variante en tête</h3>
+                        <div class="act-legend" title="Couleur de « Stock attendu » selon les actions faites sur cette référence"><span><i class="act-dot" style="background:#2563EB;"></i> transféré</span><span><i class="act-dot" style="background:#DC2626;"></i> en solde</span><span><i class="act-dot" style="background:#16A34A;"></i> réassort</span></div>
                         <table>
                             <thead>
                                 <tr>
                                     <th>#</th>
                                     <th>Couleur</th>
                                     <th title="Quantité de cette couleur RÉELLEMENT RÉCEPTIONNÉE sur les commandes fournisseur, nette des retours au fournisseur.">Total pièces</th>
+                                    <th title="Prix de vente catalogue TTC de la couleur (fourchette si les tailles n&#39;ont pas toutes le même prix).">Prix de vente</th>
                                     <th>Qté vendue (stock magasin)</th>
                                     <th title="Stock attendu d'après TOUS les mouvements de stock validés de cette couleur (réceptions, ventes, retours, inventaire, transferts). Doit être égal au stock réel — un ⚠️ signale une quantité écrite sans mouvement.">Stock attendu</th>
                                 </tr>
@@ -1651,6 +2557,7 @@
 
                     <div class="detail-section">
                         <h3>🏪 Dispatch par Société / Magasin (Achats) — du plus dispatché au moins dispatché</h3>
+                        <div class="act-legend" title="Couleur du stock selon les actions faites sur cette référence"><span><i class="act-dot" style="background:#2563EB;"></i> transféré</span><span><i class="act-dot" style="background:#DC2626;"></i> en solde</span><span><i class="act-dot" style="background:#16A34A;"></i> réassort</span></div>
                         <table>
                             <thead>
                                 <tr>
@@ -1701,6 +2608,71 @@
 
                 </div><!-- /detail-panel -->
             </div><!-- /detail-overlay -->
+
+            <!-- ══════════════════════════════════════════════════════
+                 SOLDE OVERLAY — solder une référence depuis le dashboard
+                 (DEMANDE UTILISATEUR 2026-09-21). Écrit dans la liste de
+                 soldes (liste de prix « Solde … ») de chaque magasin choisi,
+                 en la créant si le magasin n'en a pas encore.
+            ═══════════════════════════════════════════════════════ -->
+            <div id="solde-overlay">
+                <div class="detail-panel sd-panel">
+                    <button class="close-detail-btn" id="close-solde-btn" title="Fermer">✕</button>
+
+                    <div class="sd-head">
+                        <div class="rx-title">Solder une référence</div>
+                        <div class="rx-sub"><b id="sd-ref">—</b> · <span id="sd-name">—</span> · prix de vente <b id="sd-catalogue">—</b></div>
+                    </div>
+
+                    <div class="sd-form">
+                        <label class="rx-field">
+                            <span class="rx-field-label">Prix soldé (TTC)</span>
+                            <span class="rx-input"><input type="number" id="sd-prix" step="0.01" min="0"/><em>MAD</em></span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Ou remise</span>
+                            <span class="rx-input"><input type="number" id="sd-remise" step="1" min="1" max="99"/><em>%</em></span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Début</span>
+                            <span class="rx-input"><input type="date" id="sd-debut"/></span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Fin <span class="rx-help-inline">(facultatif)</span></span>
+                            <span class="rx-input"><input type="date" id="sd-fin"/></span>
+                        </label>
+                    </div>
+                    <div class="sd-preview" id="sd-preview"></div>
+
+                    <div class="sd-stores-head">
+                        <div class="sd-stores-title">Magasins</div>
+                        <div class="sd-stores-actions">
+                            <button type="button" id="btn-sd-with-stock" class="rx-btn rx-btn-sm rx-btn-ghost">Cocher ceux qui ont du stock</button>
+                            <button type="button" id="btn-sd-none" class="rx-btn rx-btn-sm rx-btn-ghost">Tout décocher</button>
+                        </div>
+                    </div>
+                    <div class="rx-scroll sd-scroll">
+                        <table class="rx-table">
+                            <thead>
+                                <tr>
+                                    <th style="width:32px;"></th>
+                                    <th>Magasin</th>
+                                    <th class="num">Stock</th>
+                                    <th>Liste de soldes du magasin</th>
+                                    <th class="num">Solde actuelle</th>
+                                </tr>
+                            </thead>
+                            <tbody id="sd-tbody"></tbody>
+                        </table>
+                    </div>
+
+                    <div class="sd-foot">
+                        <div class="sd-summary" id="sd-summary"></div>
+                        <button type="button" id="btn-sd-apply" class="rx-btn rx-btn-primary" disabled="disabled">Appliquer la solde</button>
+                    </div>
+                    <div class="sd-result" id="sd-result" style="display:none;"></div>
+                </div>
+            </div>
 
             <!-- ══════════════════════════════════════════════════════
                  TRANSFER OVERLAY — Extraction inter-magasins
@@ -1864,6 +2836,22 @@
                     </div>
                 </div><!-- /detail-panel -->
             </div><!-- /color-detail-overlay -->
+
+            <!-- ══════════════════════════════════════════════════════
+                 OVERLAY — Réassort d'une référence (page Action)
+            ═══════════════════════════════════════════════════════ -->
+            <div id="ac-reassort-overlay">
+                <div class="ruptures-panel" style="max-width:1000px;">
+                    <button class="close-detail-btn" id="close-ac-reassort-btn" title="Fermer">✕</button>
+                    <div style="margin-bottom:14px; padding-right:30px;">
+                        <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700;">
+                            Réassort — <span id="ac-ra-ref">—</span>
+                        </h3>
+                        <div id="ac-ra-sub" style="font-size:0.82rem; color:#64748B; margin-top:4px;"></div>
+                    </div>
+                    <div id="ac-ra-body"></div>
+                </div>
+            </div>
 
             <!-- ══════════════════════════════════════════════════════
                  OVERLAY — Liste des ruptures de stock
@@ -2086,6 +3074,7 @@
                         <button type="button" id="product-history-subtab-lances" class="chart-mode-btn" style="font-size:0.78rem; padding:4px 12px;">🏷️ Soldes lancés</button>
                         <button type="button" id="product-history-subtab-remises" class="chart-mode-btn" style="font-size:0.78rem; padding:4px 12px;">✂️ Remises magasin</button>
                     </div>
+                    <div id="product-history-programmees" style="display:none; margin-bottom:16px;"></div>
                     <div id="product-history-summary" style="font-size:0.85rem; color:#64748B; margin-bottom:12px;"></div>
                     <div style="max-height:60vh; overflow:auto;">
                         <table style="width:100%; border-collapse:collapse;">

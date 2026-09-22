@@ -31,6 +31,15 @@ export class MaVieDashboardActionStock extends MaVieDashboardAction {
 }
 MaVieDashboardActionStock.template = "mavie_dashboard.IframeView";
 
+// Page « Action » : grand tableau top → flop avec boutons d'action.
+export class MaVieDashboardActionAction extends MaVieDashboardAction {
+    get page() {
+        return 'action';
+    }
+}
+MaVieDashboardActionAction.template = "mavie_dashboard.IframeView";
+
 // Register action components
 registry.category("actions").add("mavie_dashboard.action_sales", MaVieDashboardActionSales);
 registry.category("actions").add("mavie_dashboard.action_stock", MaVieDashboardActionStock);
+registry.category("actions").add("mavie_dashboard.action_action", MaVieDashboardActionAction);

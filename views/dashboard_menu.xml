@@ -12,6 +12,11 @@
             <field name="tag">mavie_dashboard.action_stock</field>
         </record>
 
+        <record id="action_mavie_dashboard_action_client" model="ir.actions.client">
+            <field name="name">Action</field>
+            <field name="tag">mavie_dashboard.action_action</field>
+        </record>
+
         <!-- MENUS -->
         <menuitem id="menu_mavie_dashboard_root_v2"
                   name="Dashboard"
@@ -28,5 +33,11 @@
                   parent="menu_mavie_dashboard_root_v2"
                   action="action_mavie_dashboard_stock_client"
                   sequence="20"/>
+
+        <menuitem id="menu_mavie_dashboard_action_v2"
+                  name="Action"
+                  parent="menu_mavie_dashboard_root_v2"
+                  action="action_mavie_dashboard_action_client"
+                  sequence="30"/>
     </data>
 </odoo>

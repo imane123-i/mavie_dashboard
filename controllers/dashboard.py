@@ -10,6 +10,8 @@ import csv
 import io
 from datetime import datetime, timedelta, date
 import logging
+import math
+import heapq
 from markupsafe import Markup, escape
 
 from ..models.mv_batch_shop_mapping_ext import CITY_PROXIMITY
@@ -182,6 +184,16 @@ class MaVieDashboardController(http.Controller):
                 ids.append(int(part))
             except (ValueError, TypeError):
                 continue
+        # Page Action (et son bouton Réassort) : menu « Société » propre à la
+        # page. Historique (2026-09-22) : avec plusieurs sociétés cochées,
+        # cliquer le nom d'une société dans Odoo ne décoche pas les autres
+        # (elle passe seulement en tête du cookie) ; « société courante seule »
+        # a été essayé puis refusé (« j'ai tout coché mais je n'ai que
+        # SALMEDO ») : Odoo ne distingue pas les deux gestes. La page envoie
+        # donc la société voulue, limitée aux sociétés cochées.
+        forcee = getattr(request, '_mavie_societe_id', None)
+        if forcee and (forcee in ids or not ids):
+            return [forcee]
         return ids
 
     def _get_sachet_collection_ids(self):
@@ -2261,14 +2273,887 @@ class MaVieDashboardController(http.Controller):
             _logger.error(f"Erreur api_kpis: {str(e)}", exc_info=True)
             return {'error': str(e)}
 
+    # ─────────────────────────────────────────────────────────────
+    # MOD FOR LIFE — vue entrepôt / importateur
+    #
+    # DEMANDE UTILISATEUR (2026-09-17) : « la quantité achetée, c'est ce qui
+    # est entré en stock et ça ne doit pas bouger ; elle vient des bons
+    # d'achat validés ET réceptionnés sans retour, chez les fournisseurs qui
+    # ont vendu à MOD FOR LIFE. Je dois avoir le nombre exact de ce qui est
+    # en stock + de ce qui est vendu et dispatché, puis le dispatch par
+    # société, et dans chaque société chaque magasin qui a reçu, avec les
+    # références exactes, la couleur et la quantité. »
+    #
+    # Les deux sources sont celles de Base Pivot (écran Batch, boutons
+    # « Bons d'achat » / « Bons de vente ») :
+    #   • acheté = purchase.order de MOD FOR LIFE chez un fournisseur externe
+    #              -> mv_article_batch.action_generate_purchase_orders
+    #   • vendu  = sale.order de MOD FOR LIFE vers une société magasin,
+    #              1 bon de vente PAR MAGASIN
+    #              -> mv_article_batch.action_generate_sale_orders
+    #
+    # Le magasin destinataire n'est PAS stocké sur le bon de vente : il est
+    # porté par le bon d'achat MIROIR créé dans la société cible par
+    # sale_purchase_inter_company_rules (son `origin` contient le nom du bon
+    # de vente, son `picking_type_id.warehouse_id` est l'entrepôt du
+    # magasin). C'est exactement le « ça vient aussi dans les bons d'achat »
+    # de la demande. Vérifié en base : 37 bons de vente sur 41 se résolvent
+    # ainsi, contre 16/41 par le libellé magasin recopié dans `origin`.
+    # ─────────────────────────────────────────────────────────────
+
+    def _modforlife_shop_by_warehouse(self):
+        """{entrepôt -> libellé magasin} d'après les mappings configurés."""
+        labels = {}
+        for m in self._get_active_shop_mappings():
+            if m.warehouse_id:
+                labels[m.warehouse_id.id] = m.shop_label or m.warehouse_id.name
+        return labels
+
+    def _modforlife_order_to_shop(self, mod_for_life, retail_companies, sale_orders):
+        """{sale_order_id -> (warehouse_id, libellé magasin)}.
+
+        Résolution par le bon d'achat miroir de la société cible : c'est lui
+        qui porte l'entrepôt de réception, donc le magasin. Repli sur le
+        libellé magasin recopié dans `origin` par
+        action_generate_sale_orders, puis sur rien du tout — le bon de vente
+        tombe alors dans une ligne « Magasin non identifié » de sa société,
+        jamais silencieusement écarté du total.
+        """
+        result = {}
+        if not sale_orders:
+            return result
+
+        shop_labels = self._modforlife_shop_by_warehouse()
+        so_by_name = {so.name: so.id for so in sale_orders if so.name}
+
+        if so_by_name:
+            request.env.cr.execute("""
+                SELECT po.origin, sw.id, sw.name
+                  FROM purchase_order po
+                  JOIN stock_picking_type spt ON spt.id = po.picking_type_id
+                  JOIN stock_warehouse sw ON sw.id = spt.warehouse_id
+                 WHERE po.partner_id = %(partner)s
+                   AND po.company_id = ANY(%(companies)s)
+                   AND po.origin IS NOT NULL
+              ORDER BY po.id
+            """, {
+                'partner': mod_for_life.partner_id.id,
+                'companies': retail_companies.ids,
+            })
+            for origin, wh_id, wh_name in request.env.cr.fetchall():
+                for so_name, so_id in so_by_name.items():
+                    if so_id not in result and so_name in origin:
+                        result[so_id] = (wh_id, shop_labels.get(wh_id) or wh_name)
+
+        # Repli : « <batch> — <libellé magasin> » écrit dans l'origine du
+        # bon de vente par Base Pivot.
+        restants = [so for so in sale_orders if so.id not in result]
+        if restants:
+            by_label = {}
+            for m in self._get_active_shop_mappings():
+                if m.shop_label and m.warehouse_id:
+                    by_label[m.shop_label.strip().upper()] = (
+                        m.warehouse_id.id, m.shop_label)
+            for so in restants:
+                origin = (so.origin or '').strip().upper()
+                if not origin:
+                    continue
+                for label, val in by_label.items():
+                    if origin.endswith(label):
+                        result[so.id] = val
+                        break
+        return result
+
+    # Articles de TEST exclus de toute la vue MOD FOR LIFE (achats, stock,
+    # dispatch, réassort) — DEMANDE UTILISATEUR 2026-09-21. Cas trouvé :
+    # « TEST 2026 », créé le 20/02/2026 à 1,00 HT (1,20 TTC), archivé, avec
+    # ses propres bons de test (achats P01471/P01539, ventes S00109 à
+    # S00112 et S00144). Il faussait les cartes (296 pièces achetées, 295 en
+    # stock) et produisait la ligne « Magasin non identifié » à 1,20 MAD.
+    # Règle choisie par l'utilisatrice : le NOM contient « TEST » (plutôt
+    # que « article archivé »). Exclu partout à la fois, pour que acheté −
+    # dispatché = stock reste juste (mesuré : 21 320 − 13 254 = 8 066).
+    def _mfl_sans_test_sql(self, pt_alias):
+        # « %% » : la requête passe par psycopg2 avec des paramètres.
+        return (" AND UPPER(COALESCE(" + pt_alias + ".name->>'fr_FR', "
+                + pt_alias + ".name->>'en_US', '')) NOT LIKE '%%TEST%%'")
+
+    def _mfl_sans_test_domain(self, name_path):
+        return [(name_path, 'not ilike', 'test')]
+
+    def _modforlife_purchase_sql(self, mod_for_life, retail_companies,
+                                 product_tmpl_ids, date_start, date_end,
+                                 stockables):
+        """Filtres communs des lignes d'achat fournisseur de MOD FOR LIFE."""
+        params = {
+            'mfl': mod_for_life.id,
+            'rp': retail_companies.mapped('partner_id').ids or [-1],
+        }
+        filters = " AND pt.type = 'product'" if stockables else " AND pt.type <> 'product'"
+        filters += self._mfl_sans_test_sql('pt')
+        if product_tmpl_ids is not None:
+            filters += ' AND pp.product_tmpl_id = ANY(%(tmpls)s)'
+            params['tmpls'] = list(product_tmpl_ids)
+        sachet_variants = self._get_sachet_variant_ids()
+        if sachet_variants:
+            filters += ' AND NOT (pol.product_id = ANY(%(sachet)s))'
+            params['sachet'] = list(sachet_variants)
+        if date_start:
+            filters += ' AND po.date_order >= %(ds)s'
+            params['ds'] = date_start + ' 00:00:00'
+        if date_end:
+            filters += ' AND po.date_order <= %(de)s'
+            params['de'] = date_end + ' 23:59:59'
+        return filters, params
+
+    # Quantité reçue CONVERTIE EN PIÈCES : `qty_received` est exprimé dans
+    # l'unité du bon d'achat, pas dans celle de l'article. Cas trouvé en
+    # base : P00001 (fournisseur ABC) achète « 1 Douzaine » — qty_received
+    # = 1 alors que 12 pièces sont réellement entrées (mouvement MOD F/IN/
+    # 00001 = 12). Sans conversion, la Qté achetée comptait 1 au lieu de 12.
+    # Même règle que Odoo (uom._compute_quantity) : quantité ÷ facteur de
+    # l'unité du bon × facteur de l'unité de l'article.
+    _MFL_QTY_PIECES = (
+        "SUM(pol.qty_received / NULLIF(pu.factor, 0) * tu.factor)"
+    )
+
+    def _modforlife_purchased_variants(self, mod_for_life, retail_companies,
+                                       product_tmpl_ids=None, date_start=None,
+                                       date_end=None):
+        """LE PÉRIMÈTRE : les variantes réellement achetées par MOD FOR LIFE.
+
+        RÈGLE UTILISATEUR (2026-09-17) : « ne fais pas ajouter au calcul ce
+        qui n'est pas noté dans les bons ; tout doit avoir des bons, validés
+        et aussi livrés ». Une première version ajoutait au compte une ligne
+        « entré sans bon d'achat » pour équilibrer — refusée, et à juste
+        titre : c'était une quantité inventée.
+
+        Le périmètre est donc défini par les BONS D'ACHAT FOURNISSEUR, et
+        eux seuls : un bon d'achat confirmé (`purchase`/`done`), passé par la
+        société MOD FOR LIFE chez un **vrai fournisseur externe** — Tom&Eva,
+        DIVERS, TOM & EVA, ABC dans cette base — et **réceptionné**
+        (`qty_received > 0`, net des retours). Les bons d'achat portant MOD
+        FOR LIFE comme fournisseur sont les miroirs inter-sociétés du sens
+        inverse (MFL -> magasins) : ils sont exclus, ce n'est pas un achat.
+
+        Seuls les articles STOCKABLES en font partie (vérification du
+        2026-09-18 sur l'écart d'1 pièce restant) : pour un consommable ou un
+        service, Odoo ne tient AUCUN stock — la réception est validée mais
+        aucun stock.quant n'est créé. Le comparer au stock ne pourra jamais
+        tomber juste. Ces articles ne sont pas cachés pour autant : voir
+        `_modforlife_non_stockables`, affiché à part.
+
+        Tout ce qui n'a pas de bon sort du compte — pas silencieusement,
+        mais dans un bloc « hors compte » qui le nomme (voir
+        `_modforlife_dispatch`). Mesuré en base : une seule référence
+        concernée, 24P-6015, dispatchée 1 728 pièces vers les 16 magasins
+        sans qu'aucun fournisseur ne l'ait jamais vendue à MOD FOR LIFE.
+
+        Sans dates : périmètre sur TOUT l'historique (une référence achetée
+        l'an dernier et dispatchée cette année reste une référence
+        achetée). Avec dates : les quantités de la période, pour la carte.
+        """
+        filters, params = self._modforlife_purchase_sql(
+            mod_for_life, retail_companies, product_tmpl_ids,
+            date_start, date_end, stockables=True)
+        request.env.cr.execute("""
+            SELECT pol.product_id, {QTY}
+              FROM purchase_order_line pol
+              JOIN purchase_order po ON po.id = pol.order_id
+              JOIN product_product pp ON pp.id = pol.product_id
+              JOIN product_template pt ON pt.id = pp.product_tmpl_id
+              JOIN uom_uom pu ON pu.id = pol.product_uom
+              JOIN uom_uom tu ON tu.id = pt.uom_id
+             WHERE po.state IN ('purchase', 'done')
+               AND po.company_id = %(mfl)s
+               AND NOT (po.partner_id = ANY(%(rp)s))
+               {FILTERS}
+             GROUP BY 1
+            HAVING {QTY} > 0
+        """.replace('{QTY}', self._MFL_QTY_PIECES).replace('{FILTERS}', filters), params)
+        return {r[0]: float(r[1] or 0.0) for r in request.env.cr.fetchall()}
+
+    def _modforlife_non_stockables(self, mod_for_life, retail_companies,
+                                   product_tmpl_ids=None):
+        """Achats fournisseur d'articles NON STOCKABLES (consommable, service).
+
+        Ils ont bien un bon d'achat réceptionné, mais Odoo ne tient pas leur
+        stock : ils ne peuvent pas entrer dans « acheté = stock + dispatché ».
+        On les montre à part, nommés, avec le bon d'achat derrière — c'est
+        souvent un article mal paramétré dans Odoo (type à passer en
+        « Article stockable »). Cas de la base de test : 23-154 MD-A50530,
+        12 pièces sur P00001, qui expliquait à lui seul l'écart d'1 pièce.
+        """
+        filters, params = self._modforlife_purchase_sql(
+            mod_for_life, retail_companies, product_tmpl_ids,
+            None, None, stockables=False)
+        request.env.cr.execute("""
+            SELECT pt.id,
+                   COALESCE(NULLIF(pt.base_pivot_reference, ''),
+                            NULLIF(pt.default_code, ''),
+                            NULLIF(pp.default_code, ''),
+                            pt.name->>'en_US') AS ref,
+                   COALESCE(pt.name->>'fr_FR', pt.name->>'en_US') AS produit,
+                   pt.type,
+                   {QTY},
+                   STRING_AGG(DISTINCT po.name, ', ')
+              FROM purchase_order_line pol
+              JOIN purchase_order po ON po.id = pol.order_id
+              JOIN product_product pp ON pp.id = pol.product_id
+              JOIN product_template pt ON pt.id = pp.product_tmpl_id
+              JOIN uom_uom pu ON pu.id = pol.product_uom
+              JOIN uom_uom tu ON tu.id = pt.uom_id
+             WHERE po.state IN ('purchase', 'done')
+               AND po.company_id = %(mfl)s
+               AND NOT (po.partner_id = ANY(%(rp)s))
+               {FILTERS}
+             GROUP BY 1, 2, 3, 4
+            HAVING {QTY} > 0
+             ORDER BY 5 DESC
+        """.replace('{QTY}', self._MFL_QTY_PIECES).replace('{FILTERS}', filters), params)
+        types = {'consu': 'Consommable', 'service': 'Service'}
+        return [{
+            'article_id': r[0],
+            'reference': r[1] or '—',
+            'produit': r[2] or '—',
+            'type': types.get(r[3], r[3]),
+            'qty': int(round(r[4] or 0)),
+            'bons': r[5] or '',
+        } for r in request.env.cr.fetchall()]
+
+    def _modforlife_dispatch(self, kw, mod_for_life, retail_companies,
+                             product_tmpl_ids, scope_variant_ids):
+        """Arbre société -> magasin -> référence/couleur du dispatch MFL.
+
+        Quantité = `qty_delivered` (réellement sortie de l'entrepôt, nette
+        des retours), jamais `product_uom_qty` : mesuré en base, 15 901
+        pièces commandées pour 14 983 livrées, dont 686 revenues par bon de
+        retour — comptées comme dispatchées, elles créaient de la sortie
+        fantôme et donc de l'écart de stock.
+
+        Les lignes dont la variante n'a AUCUN bon d'achat fournisseur
+        (`scope_variant_ids`) ne rentrent pas dans l'arbre ni dans les
+        totaux : elles partent dans `hors_perimetre`, affiché à part.
+        """
+        retail_partner_ids = retail_companies.mapped('partner_id').ids
+        so_domain = [
+            ('state', 'in', ['sale', 'done']),
+            ('company_id', '=', mod_for_life.id),
+            ('partner_id', 'in', retail_partner_ids),
+        ]
+        if kw.get('date_start'):
+            so_domain.append(('date_order', '>=', kw['date_start'] + ' 00:00:00'))
+        if kw.get('date_end'):
+            so_domain.append(('date_order', '<=', kw['date_end'] + ' 23:59:59'))
+        sale_orders = request.env['sale.order'].sudo().search(so_domain)
+        so_names = {so.id: so.name for so in sale_orders}
+
+        vide = {
+            'par_societe': [], 'qty_total': 0, 'ca_total': 0.0,
+            'nb_magasins': 0, 'nb_bons_vente': 0, 'qty_non_identifiee': 0,
+            'hors_perimetre': [], 'hors_perimetre_qty': 0,
+            'hors_perimetre_nb_refs': 0, 'hors_perimetre_nb_bons': 0,
+        }
+        if not sale_orders:
+            return vide
+
+        shop_by_order = self._modforlife_order_to_shop(
+            mod_for_life, retail_companies, sale_orders)
+
+        params = {'orders': sale_orders.ids}
+        filters = self._mfl_sans_test_sql('pt')
+        if product_tmpl_ids is not None:
+            filters += ' AND pt.id = ANY(%(tmpls)s)'
+            params['tmpls'] = list(product_tmpl_ids)
+        sachet_variants = self._get_sachet_variant_ids()
+        if sachet_variants:
+            filters += ' AND NOT (sol.product_id = ANY(%(sachet)s))'
+            params['sachet'] = list(sachet_variants)
+
+        # Couleur et taille viennent des valeurs d'attribut de la variante —
+        # c'est le grain exact du bon de vente, qui porte une ligne par
+        # variante (couleur x taille). Les noms d'attributs de cette base ne
+        # sont pas normalisés (« COULEURS », « COULEURSS », « Couleur »,
+        # « POINTURES », « POINTURE », « TAILLES ») : on matche donc sur un
+        # préfixe, pas sur une égalité.
+        request.env.cr.execute("""
+            WITH attr AS (
+                SELECT pvc.product_product_id AS pid,
+                       MAX(CASE WHEN UPPER(pa.name->>'en_US') LIKE 'COULEUR%%'
+                                THEN pav.name->>'en_US' END) AS couleur,
+                       MAX(CASE WHEN UPPER(pa.name->>'en_US') LIKE 'POINTURE%%'
+                                  OR UPPER(pa.name->>'en_US') LIKE 'TAILLE%%'
+                                THEN pav.name->>'en_US' END) AS taille
+                  FROM product_variant_combination pvc
+                  JOIN product_template_attribute_value ptav
+                    ON ptav.id = pvc.product_template_attribute_value_id
+                  JOIN product_attribute pa ON pa.id = ptav.attribute_id
+                  JOIN product_attribute_value pav
+                    ON pav.id = ptav.product_attribute_value_id
+                 GROUP BY 1
+            )
+            SELECT sol.order_id,
+                   so.partner_id,
+                   pt.id,
+                   COALESCE(NULLIF(pt.base_pivot_reference, ''),
+                            NULLIF(pt.default_code, ''),
+                            NULLIF(pp.default_code, ''),
+                            pt.name->>'en_US') AS ref,
+                   COALESCE(pt.name->>'fr_FR', pt.name->>'en_US') AS produit,
+                   COALESCE(attr.couleur, '') AS couleur,
+                   COALESCE(attr.taille, '') AS taille,
+                   COALESCE(SUM(sol.qty_delivered / NULLIF(su.factor, 0) * tu.factor), 0),
+                   COALESCE(SUM(sol.price_total), 0),
+                   pp.id
+              FROM sale_order_line sol
+              JOIN sale_order so ON so.id = sol.order_id
+              JOIN product_product pp ON pp.id = sol.product_id
+              JOIN product_template pt ON pt.id = pp.product_tmpl_id
+              JOIN uom_uom su ON su.id = sol.product_uom
+              JOIN uom_uom tu ON tu.id = pt.uom_id
+              LEFT JOIN attr ON attr.pid = pp.id
+             WHERE sol.order_id = ANY(%(orders)s)
+               {FILTERS}
+             GROUP BY 1, 2, 3, 4, 5, 6, 7, 10
+        """.replace('{FILTERS}', filters), params)
+        rows = request.env.cr.fetchall()
+        # Bons de vente comptés = ceux qui portent au moins un article hors
+        # test : les lignes renvoyées ci-dessus excluent déjà les articles
+        # « TEST ». Sans ça, les 5 bons de test (S00109 à S00112, S00144)
+        # restaient comptés alors que leurs articles ne l'étaient plus.
+        nb_bons_vente = len({r[0] for r in rows})
+
+        partner_to_company = {
+            c.partner_id.id: c for c in retail_companies if c.partner_id
+        }
+        scope = set(scope_variant_ids or ())
+
+        societes = {}
+        hors = {}
+        hors_orders = set()
+        qty_total = ca_total = qty_non_identifiee = hors_qty = 0.0
+        for (so_id, partner_id, tmpl_id, ref, produit, couleur, taille,
+             qty, ca, variant_id) in rows:
+            qty = float(qty or 0.0)
+            ca = float(ca or 0.0)
+            if qty <= 0:
+                continue
+            company = partner_to_company.get(partner_id)
+            wh_id, shop_label = shop_by_order.get(
+                so_id, (0, 'Magasin non identifié'))
+            couleur = (couleur or '').strip() or '—'
+            soc_nom = company.name if company else '—'
+
+            # Pas de bon d'achat fournisseur derrière cette variante : hors
+            # compte. Jamais fondu dans les totaux, jamais caché non plus.
+            if variant_id not in scope:
+                hors_qty += qty
+                hors_orders.add(so_id)
+                k = (tmpl_id, soc_nom, shop_label)
+                h = hors.setdefault(k, {
+                    'article_id': tmpl_id,
+                    'reference': ref or '—',
+                    'produit': produit or '—',
+                    'societe': soc_nom,
+                    'magasin': shop_label,
+                    'qty': 0.0,
+                })
+                h['qty'] += qty
+                continue
+
+            soc_key = company.id if company else partner_id
+            soc = societes.setdefault(soc_key, {
+                'societe': soc_nom, 'qty': 0.0, 'ca': 0.0, 'magasins': {},
+            })
+            if not wh_id:
+                qty_non_identifiee += qty
+            mag = soc['magasins'].setdefault(wh_id, {
+                'magasin': shop_label, 'warehouse_id': wh_id,
+                'qty': 0.0, 'ca': 0.0, 'refs': {}, 'bons': set(),
+            })
+            mag['bons'].add(so_names.get(so_id))
+            ligne = mag['refs'].setdefault((tmpl_id, couleur), {
+                'article_id': tmpl_id,
+                'reference': ref or '—',
+                'produit': produit or '—',
+                'couleur': couleur,
+                'qty': 0.0, 'ca': 0.0, 'tailles': {},
+            })
+            ligne['qty'] += qty
+            ligne.setdefault('pids', set()).add(variant_id)
+            ligne['ca'] += ca
+            if taille:
+                ligne['tailles'][taille] = ligne['tailles'].get(taille, 0.0) + qty
+            mag['qty'] += qty
+            mag['ca'] += ca
+            soc['qty'] += qty
+            soc['ca'] += ca
+            qty_total += qty
+            ca_total += ca
+
+        def _tailles_txt(tailles):
+            if not tailles:
+                return ''
+            try:
+                ordered = sorted(tailles.items(),
+                                 key=lambda kv: (float(kv[0]), kv[0]))
+            except (TypeError, ValueError):
+                ordered = sorted(tailles.items())
+            return ' · '.join('%s : %d' % (t, int(round(q)))
+                              for t, q in ordered)
+
+        # Qté vendue en caisse par le magasin (demande utilisatrice
+        # 2026-09-22), mêmes variantes que la ligne, sur la période choisie.
+        ventes = self._ventes_caisse_par_magasin(
+            kw, {pid for s in societes.values() for m in s['magasins'].values()
+                 for l in m['refs'].values() for pid in l.get('pids', ())})
+
+        par_societe = []
+        nb_magasins = 0
+        for soc in societes.values():
+            magasins = []
+            for mag in soc['magasins'].values():
+                refs = []
+                for ligne in mag['refs'].values():
+                    refs.append({
+                        'article_id': ligne['article_id'],
+                        'reference': ligne['reference'],
+                        'produit': ligne['produit'],
+                        'couleur': ligne['couleur'],
+                        'tailles': _tailles_txt(ligne['tailles']),
+                        'qty': int(round(ligne['qty'])),
+                        'ca': round(ligne['ca'], 2),
+                        'vendu': int(round(sum(ventes.get((mag['warehouse_id'], pid), 0.0)
+                                               for pid in ligne.get('pids', ())))),
+                    })
+                refs.sort(key=lambda r: (-r['qty'], r['reference']))
+                magasins.append({
+                    'magasin': mag['magasin'],
+                    'warehouse_id': mag['warehouse_id'],
+                    'qty': int(round(mag['qty'])),
+                    'ca': round(mag['ca'], 2),
+                    'vendu': sum(r['vendu'] for r in refs),
+                    'nb_references': len({r['reference'] for r in refs}),
+                    # Les bons de vente derrière la ligne : indispensable sur
+                    # « Magasin non identifié », où la seule façon de savoir
+                    # ce qui est parti est d'ouvrir le bon dans Odoo.
+                    'bons': sorted(b for b in mag['bons'] if b)[:20],
+                    'nb_bons': len(mag['bons']),
+                    'references': refs,
+                })
+            magasins.sort(key=lambda m: -m['qty'])
+            nb_magasins += len([m for m in magasins if m['warehouse_id']])
+            par_societe.append({
+                'societe': soc['societe'],
+                'qty': int(round(soc['qty'])),
+                'ca': round(soc['ca'], 2),
+                'nb_magasins': len(magasins),
+                'magasins': magasins,
+            })
+        par_societe.sort(key=lambda s: -s['qty'])
+
+        hors_rows = sorted(hors.values(), key=lambda r: -r['qty'])
+        for r in hors_rows:
+            r['qty'] = int(round(r['qty']))
+
+        return {
+            'par_societe': par_societe,
+            'qty_total': int(round(qty_total)),
+            'ca_total': round(ca_total, 2),
+            'nb_magasins': nb_magasins,
+            'nb_bons_vente': nb_bons_vente,
+            'qty_non_identifiee': int(round(qty_non_identifiee)),
+            'hors_perimetre': hors_rows[:200],
+            'hors_perimetre_qty': int(round(hors_qty)),
+            'hors_perimetre_nb_refs': len({r['reference'] for r in hors_rows}),
+            'hors_perimetre_nb_bons': len(hors_orders),
+        }
+
+    def _ventes_caisse_par_magasin(self, kw, product_ids):
+        """{(warehouse_id, product_id): qté vendue en caisse}, nette des
+        retours, sur la période des filtres. Le magasin est celui de la
+        caisse (type d'opération du point de vente). Sert à la colonne
+        « Qté vendue » du dispatch MOD FOR LIFE (demande 2026-09-22)."""
+        product_ids = [p for p in (product_ids or ()) if p]
+        if not product_ids:
+            return {}
+        params = {'pids': product_ids}
+        dates = ''
+        if kw.get('date_start'):
+            dates += ' AND po.date_order >= %(ds)s'
+            params['ds'] = kw['date_start'] + ' 00:00:00'
+        if kw.get('date_end'):
+            dates += ' AND po.date_order <= %(de)s'
+            params['de'] = kw['date_end'] + ' 23:59:59'
+        request.env.cr.execute("""
+            SELECT spt.warehouse_id, pol.product_id, SUM(pol.qty)
+              FROM pos_order_line pol
+              JOIN pos_order po ON po.id = pol.order_id
+              JOIN pos_session ps ON ps.id = po.session_id
+              JOIN pos_config pc ON pc.id = ps.config_id
+              JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+             WHERE po.state IN ('paid', 'done', 'invoiced')
+               AND pol.product_id = ANY(%(pids)s)
+               {DATES}
+             GROUP BY 1, 2
+        """.replace('{DATES}', dates), params)
+        return {(wh, pid): float(q or 0.0) for wh, pid, q in request.env.cr.fetchall()}
+
+    def _modforlife_achats_directs(self, kw, mod_for_life, retail_companies,
+                                   product_tmpl_ids, company_id=None, warehouse_id=None):
+        """Articles que les MAGASINS ont achetés chez MOD FOR LIFE sans bon
+        de vente MFL derrière, surtout les chaussures.
+
+        DEMANDE UTILISATEUR (2026-09-21) : « il n'y a que des sacs dans le
+        dispatch, pas de chaussures, ce n'est pas logique ». Vérifié en base :
+        MOD FOR LIFE n'a jamais vendu de chaussures dans Odoo (ses 41 bons
+        de vente = sacs, chaussettes, culottes). Les chaussures arrivent par
+        des bons d'achat saisis À LA MAIN par les magasins, fournisseur
+        « MOD FOR LIFE » (879 bons, 270 591 pièces, 02/2025 à 05/2026), sans
+        bon de vente MFL ni achat fournisseur MFL.
+
+        Solution choisie (1) : les montrer dans l'arbre du dispatch, marquées
+        « achat magasin », mais HORS des totaux et du compte acheté moins
+        dispatché = stock (MOD FOR LIFE ne les a jamais eues en stock dans
+        Odoo : les ajouter casserait un compte qui tombe juste).
+
+        Un bon d'achat magasin né d'un bon de vente MFL porte ce bon dans son
+        origine (flux inter-sociétés) : ceux-là sont déjà dans le dispatch et
+        sont écartés ici. Quantité = réceptionnée par le magasin, en unité de
+        l'article ; montant = total TTC du bon d'achat au prorata du reçu.
+        Sachets et articles « TEST » exclus, comme dans le reste de la vue.
+        """
+        params = {
+            'partner': mod_for_life.partner_id.id,
+            'mfl': mod_for_life.id,
+            'companies': retail_companies.ids or [-1],
+        }
+        filters = self._mfl_sans_test_sql('pt')
+        if product_tmpl_ids is not None:
+            filters += ' AND pt.id = ANY(%(tmpls)s)'
+            params['tmpls'] = list(product_tmpl_ids)
+        sachet_variants = self._get_sachet_variant_ids()
+        if sachet_variants:
+            filters += ' AND NOT (pol.product_id = ANY(%(sachet)s))'
+            params['sachet'] = list(sachet_variants)
+        if kw.get('date_start'):
+            filters += ' AND po.date_order >= %(ds)s'
+            params['ds'] = kw['date_start'] + ' 00:00:00'
+        if kw.get('date_end'):
+            filters += ' AND po.date_order <= %(de)s'
+            params['de'] = kw['date_end'] + ' 23:59:59'
+        # Chargement d'un seul magasin (dépliage dans l'arbre).
+        if company_id:
+            filters += ' AND po.company_id = %(cid)s'
+            params['cid'] = int(company_id)
+        if warehouse_id is not None:
+            filters += ' AND COALESCE(spt.warehouse_id, 0) = %(wid)s'
+            params['wid'] = int(warehouse_id)
+
+        request.env.cr.execute("""
+            WITH attr AS (
+                SELECT pvc.product_product_id AS pid,
+                       MAX(CASE WHEN UPPER(pa.name->>'en_US') LIKE 'COULEUR%%'
+                                THEN pav.name->>'en_US' END) AS couleur,
+                       MAX(CASE WHEN UPPER(pa.name->>'en_US') LIKE 'POINTURE%%'
+                                  OR UPPER(pa.name->>'en_US') LIKE 'TAILLE%%'
+                                THEN pav.name->>'en_US' END) AS taille
+                  FROM product_variant_combination pvc
+                  JOIN product_template_attribute_value ptav
+                    ON ptav.id = pvc.product_template_attribute_value_id
+                  JOIN product_attribute pa ON pa.id = ptav.attribute_id
+                  JOIN product_attribute_value pav
+                    ON pav.id = ptav.product_attribute_value_id
+                 GROUP BY 1
+            )
+            SELECT po.company_id,
+                   COALESCE(spt.warehouse_id, 0),
+                   po.name,
+                   pt.id,
+                   COALESCE(NULLIF(pt.base_pivot_reference, ''),
+                            NULLIF(pt.default_code, ''),
+                            NULLIF(pp.default_code, ''),
+                            pt.name->>'en_US') AS ref,
+                   COALESCE(pt.name->>'fr_FR', pt.name->>'en_US') AS produit,
+                   COALESCE(attr.couleur, '') AS couleur,
+                   COALESCE(attr.taille, '') AS taille,
+                   COALESCE(SUM(pol.qty_received / NULLIF(su.factor, 0) * tu.factor), 0),
+                   COALESCE(SUM(pol.price_total
+                                * pol.qty_received / NULLIF(pol.product_qty, 0)), 0),
+                   pp.id
+              FROM purchase_order_line pol
+              JOIN purchase_order po ON po.id = pol.order_id
+              LEFT JOIN stock_picking_type spt ON spt.id = po.picking_type_id
+              JOIN product_product pp ON pp.id = pol.product_id
+              JOIN product_template pt ON pt.id = pp.product_tmpl_id
+              JOIN uom_uom su ON su.id = pol.product_uom
+              JOIN uom_uom tu ON tu.id = pt.uom_id
+              LEFT JOIN attr ON attr.pid = pp.id
+             WHERE po.partner_id = %(partner)s
+               AND po.company_id = ANY(%(companies)s)
+               AND po.state IN ('purchase', 'done')
+               AND NOT EXISTS (
+                     SELECT 1 FROM sale_order so
+                      WHERE so.company_id = %(mfl)s
+                        AND po.origin LIKE '%%' || so.name || '%%')
+               {FILTERS}
+             GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 11
+        """.replace('{FILTERS}', filters), params)
+        return request.env.cr.fetchall()
+
+    @http.route('/mavie/api/mfl-achats-directs', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_mfl_achats_directs(self, **kw):
+        """Lignes « achat magasin » d'UN magasin, chargées au dépliage dans
+        l'arbre du dispatch MOD FOR LIFE (voir _modforlife_achats_directs).
+        Mêmes filtres que la vue : dates, collection / batch / catégorie."""
+        try:
+            mod_for_life = request.env['res.company'].sudo().search(
+                [('name', '=', 'MOD FOR LIFE')], limit=1)
+            if not mod_for_life:
+                return {'error': 'Société MOD FOR LIFE introuvable.'}
+            retail_companies = request.env['res.company'].sudo().search([
+                ('id', '!=', mod_for_life.id), ('name', 'not in', ['PAIE'])])
+            product_tmpl_ids = None
+            if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
+                product_tmpl_ids = request.env['product.template'].sudo().search(
+                    self._build_product_domain(kw)).ids or [-1]
+            rows = self._modforlife_achats_directs(
+                kw, mod_for_life, retail_companies, product_tmpl_ids,
+                company_id=kw.get('company_id'),
+                warehouse_id=int(kw.get('warehouse_id') or 0))
+            vide = {'par_societe': []}
+            self._modforlife_fusion_directs(vide, rows, retail_companies, kw=kw)
+            for soc in vide['par_societe']:
+                for mag in soc['magasins']:
+                    return {'references_directes': mag.get('references_directes', [])}
+            return {'references_directes': []}
+        except Exception as e:
+            _logger.error(f"Erreur api_mfl_achats_directs: {str(e)}", exc_info=True)
+            return {'error': str(e)}
+
+    def _modforlife_fusion_directs(self, dispatch, rows, retail_companies,
+                                   avec_lignes=True, kw=None):
+        """Range les achats directs des magasins (voir
+        _modforlife_achats_directs) dans l'arbre du dispatch, à part des
+        pièces MFL : `references_directes`, `qty_direct`, `ca_direct`,
+        `bons_directs` sur chaque magasin, `qty_direct` / `ca_direct` sur
+        chaque société. Les champs `qty` / `ca` existants ne bougent pas."""
+        shop_labels = self._modforlife_shop_by_warehouse()
+        companies = {c.id: c for c in retail_companies}
+        wh_names = {w.id: w.name for w in request.env['stock.warehouse'].sudo().browse(
+            list({r[1] for r in rows if r[1]})).exists()}
+        socs = {s['societe']: s for s in dispatch['par_societe']}
+        acc = {}
+        total_qty = total_ca = 0.0
+        bons_total = set()
+        for (company_id, wh_id, po_name, tmpl_id, ref, produit, couleur, taille,
+             qty, ca, variant_id) in rows:
+            qty = float(qty or 0.0)
+            ca = float(ca or 0.0)
+            if qty <= 0:
+                continue
+            company = companies.get(company_id)
+            soc_nom = company.name if company else '—'
+            soc = socs.get(soc_nom)
+            if soc is None:
+                soc = socs[soc_nom] = {'societe': soc_nom, 'qty': 0, 'ca': 0.0,
+                                       'nb_magasins': 0, 'magasins': []}
+                dispatch['par_societe'].append(soc)
+            key = (soc_nom, wh_id)
+            if key not in acc:
+                mag = next((m for m in soc['magasins'] if m['warehouse_id'] == wh_id), None)
+                if mag is None:
+                    mag = {'magasin': shop_labels.get(wh_id) or wh_names.get(wh_id) or 'Magasin non identifié',
+                           'warehouse_id': wh_id, 'qty': 0, 'ca': 0.0,
+                           'nb_references': 0, 'bons': [], 'nb_bons': 0, 'references': []}
+                    soc['magasins'].append(mag)
+                acc[key] = {'mag': mag, 'soc': soc, 'refs': {}, 'bons': set(),
+                            'qty': 0.0, 'ca': 0.0, 'company_id': company_id}
+            a = acc[key]
+            a['bons'].add(po_name)
+            bons_total.add(po_name)
+            couleur = (couleur or '').strip() or '—'
+            ligne = a['refs'].setdefault((tmpl_id, couleur), {
+                'article_id': tmpl_id, 'reference': ref or '—',
+                'produit': produit or '—', 'couleur': couleur,
+                'qty': 0.0, 'ca': 0.0, 'tailles': {},
+            })
+            ligne.setdefault('pids', set()).add(variant_id)
+            ligne['qty'] += qty
+            ligne['ca'] += ca
+            if taille:
+                ligne['tailles'][taille] = ligne['tailles'].get(taille, 0.0) + qty
+            a['qty'] += qty
+            a['ca'] += ca
+            total_qty += qty
+            total_ca += ca
+
+        def _tailles_txt(tailles):
+            try:
+                ordered = sorted(tailles.items(), key=lambda kv: (float(kv[0]), kv[0]))
+            except (TypeError, ValueError):
+                ordered = sorted(tailles.items())
+            return ' · '.join('%s : %d' % (t, int(round(q))) for t, q in ordered)
+
+        # Qté vendue en caisse (lignes chargées seulement : inutile pour les
+        # totaux d'en-tête).
+        ventes = self._ventes_caisse_par_magasin(
+            kw or {}, {pid for a in acc.values() for l in a['refs'].values()
+                       for pid in l.get('pids', ())}) if avec_lignes else {}
+
+        for a in acc.values():
+            refs = [{
+                'article_id': l['article_id'], 'reference': l['reference'],
+                'produit': l['produit'], 'couleur': l['couleur'],
+                'tailles': _tailles_txt(l['tailles']),
+                'qty': int(round(l['qty'])), 'ca': round(l['ca'], 2),
+                'vendu': int(round(sum(ventes.get((a['mag']['warehouse_id'], pid), 0.0)
+                                       for pid in l.get('pids', ())))),
+            } for l in a['refs'].values()]
+            refs.sort(key=lambda r: (-r['qty'], r['reference']))
+            mag = a['mag']
+            mag['company_id_direct'] = a['company_id']
+            if avec_lignes:
+                mag['references_directes'] = refs
+            else:
+                # Mesuré : 33 982 lignes, 5,8 Mo de JSON à chaque ouverture
+                # de la vue. Les lignes sont chargées au dépliage du magasin
+                # (/mavie/api/mfl-achats-directs) ; on garde ici de quoi
+                # faire marcher la recherche : références et couleurs.
+                mag['references_directes'] = []
+                mag['directes_a_charger'] = True
+                mag['recherche_directe'] = ' '.join(sorted(
+                    {r['reference'].lower() for r in refs}
+                    | {r['couleur'].lower() for r in refs}))
+            mag['qty_direct'] = int(round(a['qty']))
+            mag['ca_direct'] = round(a['ca'], 2)
+            mag['nb_references_directes'] = len({r['reference'] for r in refs})
+            mag['bons_directs'] = sorted(a['bons'])[:20]
+            mag['nb_bons_directs'] = len(a['bons'])
+            soc = a['soc']
+            soc['qty_direct'] = soc.get('qty_direct', 0) + mag['qty_direct']
+            soc['ca_direct'] = round(soc.get('ca_direct', 0.0) + mag['ca_direct'], 2)
+
+        for soc in dispatch['par_societe']:
+            soc['nb_magasins'] = len(soc['magasins'])
+            soc['magasins'].sort(key=lambda m: -(m['qty'] + m.get('qty_direct', 0)))
+        dispatch['par_societe'].sort(key=lambda s: -(s['qty'] + s.get('qty_direct', 0)))
+        dispatch['direct_qty_total'] = int(round(total_qty))
+        dispatch['direct_ca_total'] = round(total_ca, 2)
+        dispatch['direct_nb_bons'] = len(bons_total)
+        return dispatch
+
+    def _modforlife_balance(self, mod_for_life, achats_par_variante,
+                            qty_dispatchee, stock_reel, retail_partner_ids):
+        """Le compte, UNIQUEMENT sur documents : acheté − dispatché = stock.
+
+        Aucune quantité n'est ajoutée pour faire tomber le compte : les trois
+        chiffres viennent des bons (bons d'achat fournisseur réceptionnés,
+        bons de vente livrés) et du stock réel de l'entrepôt. Ce qui reste
+        est un ÉCART, affiché comme tel, avec les références derrière —
+        jamais absorbé dans un total.
+
+        L'écart est décomposé variante par variante pour qu'il soit
+        actionnable : `acheté − dispatché − stock` par variante, puis les
+        références triées par poids. Mesuré en base : une seule variante,
+        MOUCASSIN MD-A50530, 1 pièce achetée sur bon et jamais retrouvée.
+        """
+        variant_ids = list(achats_par_variante.keys())
+        if not variant_ids:
+            return {
+                'qty_achetee': 0, 'qty_dispatchee': int(round(qty_dispatchee)),
+                'stock_reel': int(round(stock_reel)), 'stock_theorique': 0,
+                'ecart': 0, 'refs_ecart': [], 'nb_refs_ecart': 0,
+            }
+
+        request.env.cr.execute("""
+            WITH disp AS (
+                -- Même règle que la carte « dispatché » : vers les sociétés
+                -- magasins uniquement, quantité livrée convertie en pièces.
+                SELECT sol.product_id AS pid,
+                       SUM(sol.qty_delivered / NULLIF(su.factor, 0) * tu.factor) AS q
+                  FROM sale_order_line sol
+                  JOIN sale_order so ON so.id = sol.order_id
+                  JOIN product_product dpp ON dpp.id = sol.product_id
+                  JOIN product_template dpt ON dpt.id = dpp.product_tmpl_id
+                  JOIN uom_uom su ON su.id = sol.product_uom
+                  JOIN uom_uom tu ON tu.id = dpt.uom_id
+                 WHERE so.state IN ('sale', 'done')
+                   AND so.company_id = %(mfl)s
+                   AND so.partner_id = ANY(%(rp)s)
+                   AND sol.product_id = ANY(%(variants)s)
+                 GROUP BY 1
+            ), stk AS (
+                SELECT sq.product_id AS pid, SUM(sq.quantity) AS q
+                  FROM stock_quant sq
+                  JOIN stock_location sl ON sl.id = sq.location_id
+                 WHERE sl.usage = 'internal'
+                   AND sl.company_id = %(mfl)s
+                   AND sq.product_id = ANY(%(variants)s)
+                 GROUP BY 1
+            )
+            SELECT pp.id, pp.product_tmpl_id,
+                   COALESCE(NULLIF(pt.base_pivot_reference, ''),
+                            NULLIF(pt.default_code, ''),
+                            NULLIF(pp.default_code, ''),
+                            pt.name->>'en_US') AS ref,
+                   COALESCE(pt.name->>'fr_FR', pt.name->>'en_US') AS produit,
+                   COALESCE(disp.q, 0), COALESCE(stk.q, 0)
+              FROM product_product pp
+              JOIN product_template pt ON pt.id = pp.product_tmpl_id
+              LEFT JOIN disp ON disp.pid = pp.id
+              LEFT JOIN stk ON stk.pid = pp.id
+             WHERE pp.id = ANY(%(variants)s)
+        """, {'mfl': mod_for_life.id, 'variants': variant_ids,
+              'rp': list(retail_partner_ids) or [-1]})
+
+        ecarts = {}
+        for pid, tmpl_id, ref, produit, d, s in request.env.cr.fetchall():
+            a = achats_par_variante.get(pid, 0.0)
+            ecart = a - float(d or 0) - float(s or 0)
+            if abs(ecart) < 0.001:
+                continue
+            e = ecarts.setdefault(tmpl_id, {
+                'article_id': tmpl_id,
+                'reference': ref or '—',
+                'produit': produit or '—',
+                'qty': 0.0,
+                'nb_variantes': 0,
+            })
+            e['qty'] += ecart
+            e['nb_variantes'] += 1
+
+        refs_ecart = sorted(ecarts.values(), key=lambda r: -abs(r['qty']))
+        qty_achetee = sum(achats_par_variante.values())
+        stock_theorique = qty_achetee - qty_dispatchee
+        return {
+            'qty_achetee': int(round(qty_achetee)),
+            'qty_dispatchee': int(round(qty_dispatchee)),
+            'stock_theorique': int(round(stock_theorique)),
+            'stock_reel': int(round(stock_reel)),
+            'ecart': int(round(stock_theorique - stock_reel)),
+            'refs_ecart': [{
+                'article_id': r['article_id'],
+                'reference': r['reference'],
+                'produit': r['produit'],
+                'qty': int(round(r['qty'])),
+                'nb_variantes': r['nb_variantes'],
+            } for r in refs_ecart[:50]],
+            'nb_refs_ecart': len(refs_ecart),
+        }
+
     def _compute_kpis_modforlife(self, kw, mod_for_life):
         """Calcul dédié pour MOD FOR LIFE : pas de vente en caisse ni
         d'alertes rupture retail (ce n'est pas un magasin), donc pas la même
-        forme que _compute_kpis. Trois axes : ce qu'elle achète chez de vrais
-        fournisseurs (purchase.order), ce qu'elle "vend" au prix coûtant à
-        chacune des 3 sociétés magasins (sale.order — PAS le POS, confirmé
-        dans mv_base_pivot/models/mv_article_batch.py:action_generate_sale_orders),
-        et son propre stock entrepôt (stock.quant)."""
+        forme que _compute_kpis.
+
+        TOUT part des BONS, et rien d'autre (règle utilisateur 2026-09-17) :
+        bons d'achat fournisseur confirmés et réceptionnés d'un côté, bons de
+        vente inter-sociétés confirmés et livrés de l'autre, stock réel de
+        l'entrepôt au milieu. Aucune quantité n'est ajoutée pour faire
+        tomber le compte ; ce qui ne rentre pas dans les bons est montré à
+        part, nommé, et exclu des totaux.
+        """
         try:
             retail_companies = request.env['res.company'].sudo().search([
                 ('id', '!=', mod_for_life.id),
@@ -2289,30 +3174,48 @@ class MaVieDashboardController(http.Controller):
                 if not product_tmpl_ids:
                     product_tmpl_ids = [-1]
 
-            # ── Achats fournisseurs : bons de commande de MOD FOR LIFE dont
-            # le fournisseur n'est PAS une des sociétés magasins (donc un
-            # vrai fournisseur externe, pas un flux inter-société).
+            # ── LE PÉRIMÈTRE : ce que de vrais fournisseurs (Tom&Eva,
+            # DIVERS, ABC…) ont vendu à MOD FOR LIFE, sur bon d'achat
+            # confirmé ET réceptionné. Rien d'autre ne compte.
+            achats_par_variante = self._modforlife_purchased_variants(
+                mod_for_life, retail_companies, product_tmpl_ids)
+            scope_variant_ids = list(achats_par_variante.keys())
+            qty_achats_total = int(round(sum(achats_par_variante.values())))
+
             po_domain = [
                 ('order_id.state', 'in', ['purchase', 'done']),
                 ('order_id.company_id', '=', mod_for_life.id),
                 ('partner_id', 'not in', retail_partner_ids),
             ]
             po_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+            po_domain += self._mfl_sans_test_domain('product_id.product_tmpl_id.name')
             if product_tmpl_ids is not None:
                 po_domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
             if kw.get('date_start'):
                 po_domain.append(('order_id.date_order', '>=', kw['date_start'] + ' 00:00:00'))
             if kw.get('date_end'):
                 po_domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
-
             po_grouped = request.env['purchase.order.line'].sudo().read_group(
-                po_domain, ['qty_received:sum', 'price_total:sum'], [], lazy=False
+                po_domain, ['price_total:sum'], [], lazy=False
             )
-            # Quantité RÉELLEMENT REÇUE (net des retours fournisseur), même
-            # règle que la Qté achetée du dashboard retail.
-            qty_achats_fournisseurs = int(po_grouped[0].get('qty_received') or 0) if po_grouped else 0
-
-            # TTC, comme tous les CA du dashboard (décision 2026-08-18).
+            # Quantité RÉELLEMENT REÇUE (nette des retours fournisseur), EN
+            # PIÈCES et sur les seuls articles STOCKABLES : exactement le même
+            # calcul que le bilan plus bas (même fonction, bornée à la
+            # période), pour que la carte et le bilan ne puissent jamais
+            # diverger. Un bon d'achat confirmé mais jamais réceptionné, ou
+            # reçu puis renvoyé, ne compte pas. C'est ce qui est entré en
+            # stock, donc un chiffre qui ne bouge plus quand la marchandise
+            # repart.
+            if kw.get('date_start') or kw.get('date_end'):
+                achats_periode = self._modforlife_purchased_variants(
+                    mod_for_life, retail_companies, product_tmpl_ids,
+                    kw.get('date_start'), kw.get('date_end'))
+            else:
+                achats_periode = achats_par_variante
+            qty_achats_fournisseurs = int(round(sum(achats_periode.values())))
+            # Le montant, lui, reste celui de TOUS les bons d'achat
+            # fournisseur : c'est de l'argent réellement engagé, y compris
+            # sur un article non stockable.
             ca_achats_fournisseurs = round(po_grouped[0].get('price_total') or 0.0, 2) if po_grouped else 0.0
 
             po_tickets_agg = request.env['purchase.order.line'].sudo().read_group(
@@ -2320,68 +3223,56 @@ class MaVieDashboardController(http.Controller):
             )
             nb_commandes_fournisseurs = (po_tickets_agg[0].get('order_id') or 0) if po_tickets_agg else 0
 
-            # ── Ventes vers les sociétés magasins : sale.order.line, pas
-            # pos.order.line — order_partner_id est le champ stocké (related
-            # sur order_id.partner_id), pas "partner_id" (qui n'existe pas
-            # sur sale.order.line).
-            so_domain = [
-                ('order_id.state', 'in', ['sale', 'done']),
-                ('order_id.company_id', '=', mod_for_life.id),
-                ('order_partner_id', 'in', retail_partner_ids),
-            ]
-            so_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
-            if product_tmpl_ids is not None:
-                so_domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
-            if kw.get('date_start'):
-                so_domain.append(('order_id.date_order', '>=', kw['date_start'] + ' 00:00:00'))
-            if kw.get('date_end'):
-                so_domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
+            nb_references_achetees = len(achats_periode)
 
-            # Quantité RÉELLEMENT LIVRÉE (qty_delivered), pas commandée :
-            # Odoo la tient nette des retours sur bon de vente. Vérifié en
-            # base : 15 901 pièces commandées par MOD FOR LIFE pour 14 983
-            # livrées, dont 686 revenues par un bon de retour — comptées
-            # comme vendues, elles créaient de la vente fantôme et donc de
-            # l'écart de stock.
-            so_grouped = request.env['sale.order.line'].sudo().read_group(
-                so_domain,
-                ['qty_delivered:sum', 'price_total:sum', 'order_partner_id'],
-                ['order_partner_id'],
-                lazy=False
-            )
-            partner_name_by_id = {p.id: p.name for p in retail_companies.mapped('partner_id')}
+            # Achats réceptionnés d'articles dont Odoo ne tient pas le stock :
+            # hors du compte « acheté = stock + dispatché », affichés à part.
+            non_stockables = self._modforlife_non_stockables(
+                mod_for_life, retail_companies, product_tmpl_ids)
 
-            ventes_par_societe = []
-            qty_ventes_total = 0.0
-            ca_ventes_total = 0.0
-            for g in so_grouped:
-                pid = g['order_partner_id'][0] if g.get('order_partner_id') else None
-                qty = g.get('qty_delivered') or 0.0
-                ca = g.get('price_total') or 0.0
-                qty_ventes_total += qty
-                ca_ventes_total += ca
-                ventes_par_societe.append({
-                    'societe': partner_name_by_id.get(pid) or (g['order_partner_id'][1] if g.get('order_partner_id') else '—'),
-                    'qty': int(qty),
-                    'ca': round(ca, 2),
-                })
-            ventes_par_societe.sort(key=lambda x: -x['ca'])
+            # ── Dispatch : société -> magasin -> référence x couleur,
+            # restreint au périmètre des références achetées sur bon.
+            dispatch = self._modforlife_dispatch(
+                kw, mod_for_life, retail_companies, product_tmpl_ids,
+                scope_variant_ids)
 
-            # ── Stock entrepôt : même principe que le stock retail
-            # (stock.quant, emplacements internes) mais SANS l'exclusion
-            # NON_RETAIL_COMPANIES — ici MOD FOR LIFE EST la société
-            # regardée, son stock est justement ce qu'on veut voir.
+            # ── Stock entrepôt, sur le même périmètre : un stock sans bon
+            # d'achat derrière n'entre pas dans le compte non plus.
+            # Vérifié en base : il n'y en a aucun aujourd'hui.
             quant_domain = [
                 ('location_id.usage', '=', 'internal'),
                 ('company_id', '=', mod_for_life.id),
+                ('product_id', 'in', scope_variant_ids or [-1]),
             ]
-            quant_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
-            if product_tmpl_ids is not None:
-                quant_domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
             quant_grouped = request.env['stock.quant'].sudo().read_group(
                 quant_domain, ['quantity:sum'], [], lazy=False
             )
             stock_entrepot = int(sum(g.get('quantity') or 0 for g in quant_grouped)) if quant_grouped else 0
+
+            # ── Le compte : acheté − dispatché = stock. Comparé au stock
+            # réel, et l'écart reste un écart (jamais absorbé).
+            if kw.get('date_start') or kw.get('date_end'):
+                kw_sans_dates = dict(kw)
+                kw_sans_dates.pop('date_start', None)
+                kw_sans_dates.pop('date_end', None)
+                dispatch_total = self._modforlife_dispatch(
+                    kw_sans_dates, mod_for_life, retail_companies,
+                    product_tmpl_ids, scope_variant_ids)['qty_total']
+            else:
+                dispatch_total = dispatch['qty_total']
+
+            balance = self._modforlife_balance(
+                mod_for_life, achats_par_variante, dispatch_total, stock_entrepot,
+                retail_partner_ids)
+
+            # Achats directs des magasins chez MOD FOR LIFE (chaussures…),
+            # ajoutés à l'arbre APRÈS le compte : ils n'y entrent pas.
+            self._modforlife_fusion_directs(
+                dispatch,
+                self._modforlife_achats_directs(
+                    kw, mod_for_life, retail_companies, product_tmpl_ids),
+                retail_companies, avec_lignes=False)
+
 
             # DÉCISION UTILISATEUR (2026-08-19) : cette vue reste en PIÈCES.
             # Une conversion en cartons avait été ajoutée, puis retirée :
@@ -2396,11 +3287,26 @@ class MaVieDashboardController(http.Controller):
                 'company_name': mod_for_life.name,
                 'ca_achats_fournisseurs': ca_achats_fournisseurs,
                 'qty_achats_fournisseurs': qty_achats_fournisseurs,
+                'qty_achats_total': qty_achats_total,
                 'nb_commandes_fournisseurs': nb_commandes_fournisseurs,
-                'ca_ventes_societes': round(ca_ventes_total, 2),
-                'qty_ventes_societes': int(qty_ventes_total),
-                'ventes_par_societe': ventes_par_societe,
+                'nb_references_achetees': nb_references_achetees,
+                'non_stockables': non_stockables,
+                'ca_ventes_societes': dispatch['ca_total'],
+                'qty_ventes_societes': dispatch['qty_total'],
+                'dispatch_par_societe': dispatch['par_societe'],
+                'dispatch_nb_magasins': dispatch['nb_magasins'],
+                'dispatch_nb_bons_vente': dispatch['nb_bons_vente'],
+                'direct_qty_total': dispatch.get('direct_qty_total', 0),
+                'direct_ca_total': dispatch.get('direct_ca_total', 0.0),
+                'direct_nb_bons': dispatch.get('direct_nb_bons', 0),
+                'dispatch_qty_non_identifiee': dispatch['qty_non_identifiee'],
+                'hors_perimetre': dispatch['hors_perimetre'],
+                'hors_perimetre_qty': dispatch['hors_perimetre_qty'],
+                'hors_perimetre_nb_refs': dispatch['hors_perimetre_nb_refs'],
+                'hors_perimetre_nb_bons': dispatch['hors_perimetre_nb_bons'],
                 'stock_entrepot': stock_entrepot,
+                'balance_mfl': balance,
+                'periode_filtree': bool(kw.get('date_start') or kw.get('date_end')),
             }
         except Exception as e:
             _logger.error(f"Erreur _compute_kpis_modforlife: {str(e)}", exc_info=True)
@@ -3432,6 +4338,7 @@ class MaVieDashboardController(http.Controller):
             _pv = self._positive_stock(product_variants.ids, variant_warehouses.ids)
             positif_par_variante, net_par_variante = _pv[0], _pv[4]
 
+            prix_ratio = self._solde_tax_ratio(product_tmpl, request.env.company)
             by_color = {}
             for v in product_variants:
                 stat = sales_by_variant.get(v.id, {'qty': 0, 'ca': 0, 'shops': {}})
@@ -3493,6 +4400,14 @@ class MaVieDashboardController(http.Controller):
                     }
                     by_color[color_label] = entry
 
+                # DEMANDE UTILISATEUR (2026-09-21) : afficher le prix de vente
+                # de chaque couleur avant la quantité vendue. Prix catalogue
+                # TTC de la variante (prix de vente + supplément de variante,
+                # taxes de l'article) ; min/max si les tailles d'une même
+                # couleur n'ont pas toutes le même prix.
+                v_prix = round(v.lst_price * prix_ratio, 2)
+                entry['prix_min'] = v_prix if entry.get('prix_min') is None else min(entry['prix_min'], v_prix)
+                entry['prix_max'] = v_prix if entry.get('prix_max') is None else max(entry['prix_max'], v_prix)
                 entry['qty'] += int(stat['qty'])
                 entry['ca'] += stat['ca']
                 entry['dispatched'] += dispatched
@@ -3834,6 +4749,7 @@ class MaVieDashboardController(http.Controller):
                 'batch_name': product_tmpl.arrivage_id.name if getattr(product_tmpl, 'arrivage_id', False) else '—',
                 'best_variants': best_variants,
                 'variants': best_variants,
+                'prix_vente_ttc': round(product_tmpl.list_price * prix_ratio, 2),
                 'has_base_pivot_data': has_base_pivot_data,
                 'stock_by_store': stock_by_store_pivot,
                 'real_stock_by_store': stock_by_store,
@@ -3842,6 +4758,7 @@ class MaVieDashboardController(http.Controller):
                     'by_magasin': verif_by_magasin,
                 },
                 'image_url': image_url,
+                'actions_detail': self._actions_detail(product_tmpl.id),
                 'has_image': has_image,
             }
         except Exception as e:
@@ -4592,6 +5509,10 @@ class MaVieDashboardController(http.Controller):
                 # critère retenu par la section Historique (voir
                 # created_from_dashboard sur inter.internal.transfer).
                 'created_from_dashboard': True,
+                # Lancé depuis la fenêtre Réassort de la page Action : marqué
+                # pour être compté comme « réassort » (pastille verte) et non
+                # comme un transfert ordinaire (voir _actions_references).
+                'origin': self.REASSORT_ORIGINE if kw.get('reassort') else False,
             })
             # action_submit aiguille le bon vers l'endroit où il sera
             # collecté : Inventaire → Transferts → Interne si les deux
@@ -5644,7 +6565,1333 @@ class MaVieDashboardController(http.Controller):
                 'remises_magasin_qty': sum(s['qty'] for s in remises_items),
                 'remises_magasin_ca': round(sum(s['ca'] for s in remises_items), 2),
                 'retours_count': len(retours_items),
+                'soldes_programmees': self._solde_history(product_tmpl, variants),
             }
         except Exception as e:
             _logger.error(f"Erreur api_product_history: {str(e)}", exc_info=True)
             return {'error': str(e), 'transfers': [], 'soldes': []}
+
+    # ─────────────────────────────────────────────────────────────
+    # RÉASSORT — proposition d'envoi du dépôt MOD FOR LIFE vers les magasins
+    #
+    # DEMANDE UTILISATEUR (2026-09-18) : savoir à quel magasin envoyer un
+    # article, d'après ce qu'il a reçu, ce qu'il a vendu, depuis combien de
+    # temps, et ce que le dépôt a réellement en stock. Règle métier de
+    # l'utilisateur : alerter quand il ne reste plus que 10 % de ce qu'un
+    # magasin a reçu. Source des envois : le dépôt MOD FOR LIFE UNIQUEMENT
+    # (les transferts magasin -> magasin ont déjà leur propre écran).
+    #
+    # Montage validé avec l'utilisateur :
+    #   • alerte principale = sa règle des 10 % (stock <= 10 % du reçu) ;
+    #   • une colonne « jours restants » (stock ÷ vitesse de vente) pour
+    #     trier ces alertes par urgence réelle ;
+    #   • une alerte secondaire « vend vite » : il reste plus de 10 %, mais
+    #     au rythme actuel ça ne tiendra pas le délai de réappro. Sans elle,
+    #     ce sont les meilleures ventes qui tombent en rupture sans prévenir ;
+    #   • une quantité proposée calculée sur la vitesse, plafonnée par ce que
+    #     le dépôt possède, et répartie au prorata de la vitesse quand le
+    #     dépôt n'en a pas assez pour tout le monde.
+    #
+    # Grain = (magasin x VARIANTE) : couleur ET taille. Une référence « en
+    # stock » peut être morte en magasin parce qu'il ne reste que du 41.
+    # ─────────────────────────────────────────────────────────────
+
+    REASSORT_MAX_ROWS = 3000
+
+    def _reassort_params(self, kw):
+        """Paramètres réglables à l'écran, bornés pour rester raisonnables."""
+        def _int(name, default, lo, hi):
+            try:
+                v = int(kw.get(name) or default)
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+        return {
+            'fenetre': _int('fenetre', 90, 7, 365),
+            'seuil_pct': _int('seuil_pct', 10, 1, 90),
+            'delai': _int('delai', 21, 1, 180),
+            'cible': _int('cible', 30, 1, 365),
+        }
+
+    def _reassort_warehouses(self, kw):
+        """Magasins physiques retenus : filtre magasin, sinon sociétés
+        cochées dans le sélecteur Odoo, sinon tout le réseau actif. MOD FOR
+        LIFE et PAIE n'en font jamais partie : ce ne sont pas des magasins."""
+        non_retail = self._get_non_retail_company_ids()
+        mappings = self._get_active_shop_mappings().filtered(
+            lambda m: m.warehouse_id and m.warehouse_id.company_id.id not in non_retail
+        )
+        if kw.get('shop_field'):
+            scope = self._get_shop_scope(kw['shop_field'])
+            if scope and scope.get('warehouse'):
+                wh = scope['warehouse']
+                return wh, {wh.id: scope.get('label') or wh.name}
+        warehouses = mappings.mapped('warehouse_id')
+        context_ids = [c for c in self._get_context_company_ids() if c not in non_retail]
+        if context_ids:
+            filtered = warehouses.filtered(lambda w: w.company_id.id in context_ids)
+            if filtered:
+                warehouses = filtered
+        labels = {}
+        for m in mappings:
+            if m.warehouse_id.id in warehouses.ids:
+                labels[m.warehouse_id.id] = m.warehouse_id.name
+        return warehouses, labels
+
+    def _reassort_reference_date(self, warehouse_ids):
+        """Date de référence de la fenêtre de vente.
+
+        Calée sur la DERNIÈRE VENTE PRÉSENTE EN BASE (bornée à aujourd'hui),
+        jamais aveuglément sur la date du jour. Mesuré sur la base de test :
+        les ventes caisse s'arrêtent au 2026-08-01 ; une fenêtre « 90
+        derniers jours » glissante n'y trouvait que 93 lignes et toutes les
+        vitesses tombaient à 0 — écran vide. En production, alimentée au
+        jour le jour, les deux dates se confondent.
+        """
+        request.env.cr.execute("""
+            SELECT MAX(po.date_order)::date
+              FROM pos_order po
+              JOIN pos_session ps ON ps.id = po.session_id
+              JOIN pos_config pc ON pc.id = ps.config_id
+              JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+             WHERE po.state IN ('paid', 'done', 'invoiced')
+               AND spt.warehouse_id = ANY(%(wh)s)
+        """, {'wh': list(warehouse_ids)})
+        last = request.env.cr.fetchone()[0]
+        today = date.today()
+        if not last or last > today:
+            return today
+        return last
+
+    # ─────────────────────────────────────────────────────────────
+    # ACTIONS FAITES SUR UNE RÉFÉRENCE (2026-09-22)
+    #
+    # Demande utilisatrice : voir à côté de la référence (page Action) ce
+    # qu'elle a déjà eu comme action, et dans la fiche produit colorer le
+    # stock de chaque magasin / couleur : bleu = transféré, rouge = soldé,
+    # vert = réassort. Choix : « réassort » = transfert lancé depuis la
+    # fenêtre Réassort (marqué à la création, origin REASSORT_ORIGINE), pas
+    # une simple proposition.
+    #   - Transfert : bon inter.internal.transfer non brouillon portant
+    #     l'article (le magasin compte comme émetteur OU récepteur).
+    #   - Solde : règle de prix ACTIVE (liste active, pas encore finie)
+    #     posée sur l'article ou une de ses variantes, dans une liste
+    #     rattachée à la caisse du magasin. Les remises globales ou par
+    #     catégorie (ex. « REMISE 20% » sur tout) ne comptent pas : ce ne
+    #     sont pas des soldes de CET article.
+    # ─────────────────────────────────────────────────────────────
+
+    REASSORT_ORIGINE = 'Réassort (dashboard)'
+
+    def _actions_references(self, tmpl_ids):
+        """{tmpl_id: {'transfert': {ids}, 'reassort': {ids}, 'solde': {wh},
+        'wh': {wh_id: {actions}}, 'couleur': {couleur: {actions}}}}"""
+        cr = request.env.cr
+        out = {}
+        tmpl_ids = [t for t in tmpl_ids if t]
+        if not tmpl_ids:
+            return out
+
+        def acc(tid):
+            return out.setdefault(tid, {'transfert': set(), 'reassort': set(), 'solde': set(),
+                                        'wh': {}, 'couleur': {}})
+
+        cr.execute("""
+            SELECT pp.product_tmpl_id, pp.id, t.id,
+                   COALESCE(t.origin, '') = %(orig)s,
+                   ls.warehouse_id, ld.warehouse_id
+              FROM inter_internal_transfer_line l
+              JOIN inter_internal_transfer t ON t.id = l.transfer_id
+              JOIN product_product pp ON pp.id = l.product_id
+              LEFT JOIN stock_location ls ON ls.id = t.location_source_id
+              LEFT JOIN stock_location ld ON ld.id = t.location_target_id
+             WHERE pp.product_tmpl_id = ANY(%(tmpls)s)
+               AND COALESCE(t.state, 'draft') != 'draft'
+        """, {'tmpls': tmpl_ids, 'orig': self.REASSORT_ORIGINE})
+        lignes = cr.fetchall()
+
+        Item = request.env['product.pricelist.item'].sudo()
+        now = fields.Datetime.now()
+        items = Item.search([
+            ('pricelist_id.active', '=', True),
+            '|', ('date_end', '=', False), ('date_end', '>=', now),
+            '|',
+            '&', ('applied_on', '=', '1_product'), ('product_tmpl_id', 'in', tmpl_ids),
+            '&', ('applied_on', '=', '0_product_variant'), ('product_id.product_tmpl_id', 'in', tmpl_ids),
+        ])
+        wh_par_liste = {}
+        if items:
+            listes = items.mapped('pricelist_id')
+            configs = request.env['pos.config'].sudo().search([
+                '|', ('available_pricelist_ids', 'in', listes.ids), ('pricelist_id', 'in', listes.ids)])
+            for cfg in configs:
+                wh = cfg.picking_type_id.warehouse_id.id
+                if not wh:
+                    continue
+                for pl in (cfg.available_pricelist_ids | cfg.pricelist_id) & listes:
+                    wh_par_liste.setdefault(pl.id, set()).add(wh)
+
+        pids = {r[1] for r in lignes} | set(items.mapped('product_id').ids)
+        couleurs = {}
+        if pids:
+            cr.execute("""
+                SELECT pvc.product_product_id, MAX(pav.name->>'en_US')
+                  FROM product_variant_combination pvc
+                  JOIN product_template_attribute_value ptav
+                    ON ptav.id = pvc.product_template_attribute_value_id
+                  JOIN product_attribute pa ON pa.id = ptav.attribute_id
+                  JOIN product_attribute_value pav ON pav.id = ptav.product_attribute_value_id
+                 WHERE pvc.product_product_id = ANY(%s)
+                   AND UPPER(pa.name->>'en_US') LIKE 'COULEUR%%'
+                 GROUP BY 1
+            """, (list(pids),))
+            couleurs = {pid: (c or '').strip() for pid, c in cr.fetchall()}
+
+        for tid, pid, trid, est_reassort, wh_src, wh_dst in lignes:
+            a = acc(tid)
+            action = 'reassort' if est_reassort else 'transfert'
+            a[action].add(trid)
+            for wh in (wh_src, wh_dst):
+                if wh:
+                    a['wh'].setdefault(wh, set()).add(action)
+            c = couleurs.get(pid)
+            if c:
+                a['couleur'].setdefault(c, set()).add(action)
+
+        for it in items:
+            tid = it.product_tmpl_id.id or it.product_id.product_tmpl_id.id
+            a = acc(tid)
+            whs = wh_par_liste.get(it.pricelist_id.id, set())
+            if not whs:
+                continue
+            a['solde'] |= whs
+            for wh in whs:
+                a['wh'].setdefault(wh, set()).add('solde')
+            if it.applied_on == '0_product_variant':
+                c = couleurs.get(it.product_id.id)
+                if c:
+                    a['couleur'].setdefault(c, set()).add('solde')
+            else:
+                a['couleur'].setdefault('*', set()).add('solde')
+        return out
+
+    def _actions_detail(self, tmpl_id):
+        """Pour la fiche produit : actions par magasin (clé shop_field, comme
+        les lignes du tableau des magasins) et par couleur. '*' = solde posée
+        sur l'article entier, donc valable pour toutes les couleurs."""
+        a = self._actions_references([tmpl_id]).get(tmpl_id)
+        if not a:
+            return {'magasins': {}, 'couleurs': {}}
+        par_wh = {m.warehouse_id.id: m.shop_field for m in self._get_active_shop_mappings() if m.warehouse_id}
+        magasins = {}
+        for wh, acts in a['wh'].items():
+            field = par_wh.get(wh)
+            if field:
+                magasins.setdefault(field, set()).update(acts)
+        return {
+            'magasins': {k: sorted(v) for k, v in magasins.items()},
+            'couleurs': {k: sorted(v) for k, v in a['couleur'].items()},
+        }
+
+    def _actions_resume(self, a):
+        """Résumé pour la page Action : nombre de bons / de magasins."""
+        if not a:
+            return {'transfert': 0, 'reassort': 0, 'solde': 0}
+        return {'transfert': len(a['transfert']), 'reassort': len(a['reassort']), 'solde': len(a['solde'])}
+
+    # ─────────────────────────────────────────────────────────────
+    # PAGE « ACTION » (menu Dashboard → Action)
+    #
+    # DEMANDE UTILISATEUR (2026-09-22) : une page à côté de « Stock &
+    # ruptures » avec un grand tableau reprenant les informations du
+    # Top/Flop Produits, trié du top au flop, une ligne par référence et
+    # ses couleurs dessous ; colonnes Catégorie et Prix après la référence,
+    # sans la colonne Produit ; Qté en dépôt puis trois boutons à la fin
+    # (Transférer, Prix, Réassort). En haut : nombre de lignes à afficher,
+    # choix des colonnes, et une barre de recherche avec Filtres /
+    # Regrouper par / Favoris.
+    #
+    # Les chiffres sont calculés avec EXACTEMENT les mêmes domaines que le
+    # Top/Flop (_build_pos_domain, _build_purchase_domain, même périmètre
+    # de stock) : une référence doit afficher les mêmes valeurs sur les deux
+    # écrans. « Dépôt » = stock interne de MOD FOR LIFE, comme le réassort.
+    # ─────────────────────────────────────────────────────────────
+
+    ACTION_FILTRES = {
+        'vendus': lambda t: t['qty_sold'] > 0,
+        'non_vendus': lambda t: t['qty_sold'] <= 0,
+        'rupture': lambda t: t['stock'] <= 0,
+        'en_stock': lambda t: t['stock'] > 0,
+        'depot': lambda t: t['depot'] > 0,
+        'depot_vide': lambda t: t['depot'] <= 0,
+        'reste_negatif': lambda t: t['qty_purchased'] - t['qty_sold'] < 0,
+    }
+
+    def _action_quant_domain(self, kw, product_tmpl_ids):
+        """Domaine stock.quant du Top/Flop (copie fidèle du bloc de
+        _compute_kpis) : magasins actifs, société / magasin choisis,
+        sachets exclus. Gardé à part pour ne pas toucher au calcul
+        principal ; toute évolution de l'un doit être reportée dans l'autre."""
+        domain = [('location_id.usage', '=', 'internal')]
+        domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+        shop_field = kw.get('shop_field')
+        shop_scope = self._get_shop_scope(shop_field)
+        if shop_field:
+            if shop_scope:
+                if shop_scope['company_id']:
+                    domain.append(('company_id', '=', shop_scope['company_id']))
+                if shop_scope['warehouse'] and shop_scope['warehouse'].lot_stock_id:
+                    domain.append(('location_id', 'child_of', shop_scope['warehouse'].lot_stock_id.id))
+        else:
+            context_company_ids = self._get_context_company_ids()
+            if context_company_ids:
+                domain.append(('company_id', 'in', context_company_ids))
+        if product_tmpl_ids is not None:
+            variants = request.env['product.product'].sudo().with_context(active_test=False).search(
+                [('product_tmpl_id', 'in', product_tmpl_ids)])
+            domain.append(('product_id', 'in', variants.ids))
+
+        Warehouse = request.env['stock.warehouse'].sudo()
+        excluded_non_retail_ids = self._get_excluded_non_retail_ids(kw)
+        scoped = Warehouse.search([
+            ('company_id', 'not in', self._get_non_retail_company_ids()),
+            ('id', 'in', self._get_active_shop_mappings().mapped('warehouse_id').ids),
+        ])
+        explicit = [cid for cid in self._get_non_retail_company_ids()
+                    if cid not in excluded_non_retail_ids]
+        if explicit:
+            scoped |= Warehouse.search([('company_id', 'in', explicit)])
+        if shop_scope and shop_scope['kind'] == 'online' and shop_scope['warehouse']:
+            scoped |= shop_scope['warehouse']
+        lot_ids = scoped.mapped('lot_stock_id').ids
+        if excluded_non_retail_ids:
+            domain.append(('company_id', 'not in', excluded_non_retail_ids))
+        if lot_ids:
+            domain.append(('location_id', 'child_of', lot_ids))
+        return domain
+
+    @http.route('/mavie/api/actions', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_actions(self, **kw):
+        try:
+            request._mavie_societe_id = self._action_societe_id(kw)
+            return self._compute_actions(kw)
+        except Exception as e:
+            _logger.error(f"Erreur api_actions: {str(e)}", exc_info=True)
+            return {'error': str(e)}
+
+    def _compute_actions(self, kw):
+        cr = request.env.cr
+        try:
+            limit = max(1, min(int(kw.get('limit') or 20), 500))
+        except (TypeError, ValueError):
+            limit = 20
+        q = (kw.get('q') or '').strip().lower()
+        filtres = [f for f in (kw.get('filtres') or []) if f in self.ACTION_FILTRES]
+
+        product_tmpl_ids = None
+        if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
+            product_tmpl_ids = request.env['product.template'].sudo().search(
+                self._build_product_domain(kw)).ids
+            if not product_tmpl_ids:
+                return {'rows': [], 'total': 0, 'limit': limit}
+
+        # ── Par variante : ventes, achats, stock magasins, stock dépôt.
+        par_variante = {}
+
+        def v(pid):
+            return par_variante.setdefault(pid, {
+                'qty_sold': 0.0, 'ca': 0.0, 'qty_purchased': 0.0,
+                'ca_achat': 0.0, 'stock': 0.0, 'depot': 0.0})
+
+        for g in self._group_sums('pos.order.line', self._build_pos_domain(kw, product_tmpl_ids),
+                                  ['price_subtotal_incl', 'qty']):
+            if g.get('product_id'):
+                x = v(g['product_id'][0])
+                x['qty_sold'] += g.get('qty') or 0.0
+                x['ca'] += g.get('price_subtotal_incl') or 0.0
+        # Ventes sur bon de vente des sociétés non retail explicitement
+        # cochées : ajoutées au vendu, comme dans le Top/Flop.
+        if self._get_explicit_non_retail_ids(kw):
+            for g in self._group_sums('sale.order.line',
+                                      self._build_non_retail_sale_domain(kw, product_tmpl_ids),
+                                      ['product_uom_qty', 'price_total']):
+                if g.get('product_id'):
+                    x = v(g['product_id'][0])
+                    x['qty_sold'] += g.get('product_uom_qty') or 0.0
+                    x['ca'] += g.get('price_total') or 0.0
+        for g in self._group_sums('purchase.order.line',
+                                  self._build_purchase_domain(kw, product_tmpl_ids),
+                                  ['qty_received', 'price_total']):
+            if g.get('product_id'):
+                x = v(g['product_id'][0])
+                x['qty_purchased'] += g.get('qty_received') or 0.0
+                x['ca_achat'] += g.get('price_total') or 0.0
+        for g in self._group_sums('stock.quant', self._action_quant_domain(kw, product_tmpl_ids),
+                                  ['quantity']):
+            if g.get('product_id'):
+                v(g['product_id'][0])['stock'] += g.get('quantity') or 0.0
+
+        mfl = request.env['res.company'].sudo().search([('name', '=', 'MOD FOR LIFE')], limit=1)
+        if mfl:
+            cr.execute("""
+                SELECT sq.product_id, SUM(sq.quantity)
+                  FROM stock_quant sq
+                  JOIN stock_location sl ON sl.id = sq.location_id
+                 WHERE sl.usage = 'internal' AND sl.company_id = %s
+                 GROUP BY 1
+            """, (mfl.id,))
+            sachet = set(self._get_sachet_variant_ids())
+            for pid, qte in cr.fetchall():
+                if pid in sachet:
+                    continue
+                # Stock dépôt seul (aucune vente, achat ni stock magasin) :
+                # on ne fait pas entrer la référence dans le tableau pour ça.
+                if pid in par_variante:
+                    par_variante[pid]['depot'] += qte or 0.0
+
+        if not par_variante:
+            return {'rows': [], 'total': 0, 'limit': limit}
+
+        # ── Infos article (une requête), puis agrégat par référence.
+        cr.execute("""
+            SELECT pp.id, pt.id,
+                   COALESCE(NULLIF(pt.base_pivot_reference, ''), NULLIF(pt.default_code, ''),
+                            pt.name->>'fr_FR', pt.name->>'en_US') AS ref,
+                   COALESCE(pt.name->>'fr_FR', pt.name->>'en_US') AS nom,
+                   COALESCE(pc.name, '') AS categorie,
+                   pt.list_price,
+                   pt.collection_id
+              FROM product_product pp
+              JOIN product_template pt ON pt.id = pp.product_tmpl_id
+              LEFT JOIN product_category pc ON pc.id = pt.categ_id
+             WHERE pp.id = ANY(%s)
+        """, (list(par_variante.keys()),))
+        refs = {}
+        for pid, tid, ref, nom, categorie, list_price, collection_id in cr.fetchall():
+            t = refs.setdefault(tid, {
+                'id': tid, 'ref': ref or '—', 'name': nom or '—', 'categorie': categorie,
+                'list_price': list_price or 0.0, 'collection_id': collection_id,
+                'qty_sold': 0.0, 'ca': 0.0, 'qty_purchased': 0.0, 'ca_achat': 0.0,
+                'stock': 0.0, 'depot': 0.0, 'variantes': [],
+            })
+            t['variantes'].append(pid)
+            for k, val in par_variante[pid].items():
+                t[k] += val
+
+        # Du top au flop : chiffre d'affaires vendu, puis quantité vendue,
+        # puis stock (une référence sans vente mais avec du stock est un
+        # flop plus urgent qu'une référence vide).
+        ordre = sorted(refs.values(), key=lambda t: (-t['ca'], -t['qty_sold'], -t['stock'], t['ref']))
+        # Niveau (flèche de couleur, demande utilisatrice 2026-09-22) :
+        # découpage ABC du chiffre d'affaires, comme l'Analyse ABC du
+        # dashboard. Top = les références qui font les 80 premiers % du CA,
+        # moyen = jusqu'à 95 %, flop = le reste (dont tout ce qui n'a rien
+        # vendu).
+        ca_total = sum(max(t['ca'], 0.0) for t in ordre) or 1.0
+        cumul = 0.0
+        for rang, t in enumerate(ordre, 1):
+            t['rang'] = rang
+            part_avant = cumul / ca_total
+            cumul += max(t['ca'], 0.0)
+            if t['ca'] <= 0:
+                t['niveau'] = 'flop'
+            elif part_avant < 0.80:
+                t['niveau'] = 'top'
+            elif part_avant < 0.95:
+                t['niveau'] = 'moyen'
+            else:
+                t['niveau'] = 'flop'
+        # Bouton « Top → Flop / Flop → Top » : même classement, lu à l'envers.
+        if kw.get('ordre') == 'flop':
+            ordre.reverse()
+
+        if q:
+            ordre = [t for t in ordre
+                     if q in t['ref'].lower() or q in t['name'].lower() or q in t['categorie'].lower()]
+        for f in filtres:
+            ordre = [t for t in ordre if self.ACTION_FILTRES[f](t)]
+        total = len(ordre)
+        page = ordre[:limit]
+
+        # ── Couleur de chaque variante affichée.
+        pids = [pid for t in page for pid in t['variantes']]
+        couleurs = {}
+        if pids:
+            cr.execute("""
+                SELECT pvc.product_product_id,
+                       MAX(CASE WHEN UPPER(pa.name->>'en_US') LIKE 'COULEUR%%'
+                                THEN pav.name->>'en_US' END)
+                  FROM product_variant_combination pvc
+                  JOIN product_template_attribute_value ptav
+                    ON ptav.id = pvc.product_template_attribute_value_id
+                  JOIN product_attribute pa ON pa.id = ptav.attribute_id
+                  JOIN product_attribute_value pav ON pav.id = ptav.product_attribute_value_id
+                 WHERE pvc.product_product_id = ANY(%s)
+                 GROUP BY 1
+            """, (pids,))
+            couleurs = {pid: (c or '').strip() for pid, c in cr.fetchall()}
+
+        collections = {}
+        coll_ids = list({t['collection_id'] for t in page if t['collection_id']})
+        if coll_ids and 'collection_id' in request.env['product.template']._fields:
+            comodel = request.env['product.template']._fields['collection_id'].comodel_name
+            collections = {c.id: c.display_name for c in request.env[comodel].sudo().browse(coll_ids).exists()}
+
+        tmpls = request.env['product.template'].sudo().browse([t['id'] for t in page])
+        tmpl_by_id = {t.id: t for t in tmpls}
+        images = self._image_availability({t['id'] for t in page})
+        actions = self._actions_references([t['id'] for t in page])
+        company = request.env.company
+
+        def arrondi(d):
+            return {
+                'qty_sold': int(round(d['qty_sold'])), 'ca': round(d['ca'], 2),
+                'qty_purchased': int(round(d['qty_purchased'])), 'ca_achat': round(d['ca_achat'], 2),
+                'stock': int(round(d['stock'])), 'depot': int(round(d['depot'])),
+            }
+
+        rows = []
+        for t in page:
+            par_couleur = {}
+            for pid in t['variantes']:
+                c = couleurs.get(pid) or '—'
+                acc = par_couleur.setdefault(c, {'couleur': c, 'qty_sold': 0.0, 'ca': 0.0,
+                                                 'qty_purchased': 0.0, 'ca_achat': 0.0,
+                                                 'stock': 0.0, 'depot': 0.0})
+                for k, val in par_variante[pid].items():
+                    acc[k] += val
+            variantes = []
+            for acc in par_couleur.values():
+                d = arrondi(acc)
+                d['couleur'] = acc['couleur']
+                ac = actions.get(t['id']) or {}
+                d['actions'] = sorted((ac.get('couleur') or {}).get(acc['couleur'], set())
+                                      | (ac.get('couleur') or {}).get('*', set()))
+                variantes.append(d)
+            variantes.sort(key=lambda d: (-d['ca'], -d['qty_sold'], -d['stock'], d['couleur']))
+            tmpl = tmpl_by_id.get(t['id'])
+            ratio = self._solde_tax_ratio(tmpl, company) if tmpl else 1.0
+            src = images.get(t['id'])
+            row = arrondi(t)
+            row.update({
+                'id': t['id'], 'rang': t['rang'], 'ref': t['ref'], 'name': t['name'],
+                'categorie': t['categorie'] or '—',
+                'collection': collections.get(t['collection_id']) or '—',
+                'prix': round(t['list_price'] * ratio, 2),
+                'image_url': self._image_url(t['id'], src), 'has_image': bool(src),
+                'variantes': variantes,
+                'niveau': t['niveau'],
+                'actions': self._actions_resume(actions.get(t['id'])),
+            })
+            rows.append(row)
+        return {'rows': rows, 'total': total, 'nb_references': len(refs), 'limit': limit,
+                'perimetre': self._action_perimetre(kw),
+                'societes': self._action_societes_cochees(),
+                'societe_id': getattr(request, '_mavie_societe_id', None)}
+
+    def _action_societe_id(self, kw):
+        try:
+            return int(kw.get('societe_id') or 0) or None
+        except (TypeError, ValueError):
+            return None
+
+    def _action_societes_cochees(self):
+        """Sociétés proposées dans le menu « Société » de la page : celles
+        cochées dans Odoo (sans le drapeau de la page), hors PAIE."""
+        forcee = getattr(request, '_mavie_societe_id', None)
+        request._mavie_societe_id = None
+        ids = self._get_context_company_ids()
+        request._mavie_societe_id = forcee
+        Company = request.env['res.company'].sudo()
+        societes = Company.browse(ids).exists() if ids else Company.search([])
+        return [{'id': c.id, 'name': c.name} for c in societes if c.name != 'PAIE']
+
+    def _action_perimetre(self, kw):
+        """Sur quoi porte le classement, affiché au-dessus du tableau.
+
+        Vérifié le 2026-09-22 (« toutes les sociétés ont le même classement ») :
+        le calcul suit bien le sélecteur de sociétés d'Odoo (SALMEDO : TC1
+        premier, BLACK AND GOLD : TC28, DELTA-GOLD : Valise LK-02). Mais
+        quand plusieurs sociétés sont cochées, cliquer le nom d'une société
+        ne décoche pas les autres (Odoo la passe seulement en tête) : le
+        classement reste celui de toutes les sociétés cochées. On l'écrit
+        donc en clair."""
+        if kw.get('shop_field'):
+            scope = self._get_shop_scope(kw['shop_field'])
+            if scope and scope.get('warehouse'):
+                return 'magasin ' + scope['warehouse'].name
+        ids = self._get_context_company_ids()
+        noms = [n for n in request.env['res.company'].sudo().browse(ids).exists().mapped('name') if n != 'PAIE']
+        if not noms:
+            return 'toutes les sociétés'
+        if len(noms) == 1:
+            return 'société ' + noms[0]
+        return 'toutes les sociétés cochées (%d)' % len(noms)
+
+    @http.route('/mavie/api/reassort', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_reassort(self, **kw):
+        try:
+            # Ouvert depuis la page Action : même périmètre société qu'elle.
+            if kw.get('societe_id'):
+                request._mavie_societe_id = self._action_societe_id(kw)
+            return self._compute_reassort(kw)
+        except Exception as e:
+            _logger.error(f"Erreur api_reassort: {str(e)}", exc_info=True)
+            return {'error': str(e)}
+
+    def _compute_reassort(self, kw):
+        p = self._reassort_params(kw)
+        warehouses, wh_labels = self._reassort_warehouses(kw)
+        # Magasin cible du bouton « Transférer » de la fenêtre Réassort.
+        shop_par_wh = {m.warehouse_id.id: m.shop_field
+                       for m in self._get_active_shop_mappings() if m.warehouse_id}
+        mod_for_life = request.env['res.company'].sudo().search(
+            [('name', '=', 'MOD FOR LIFE')], limit=1)
+        if not warehouses or not mod_for_life:
+            return {'rows': [], 'kpis': {}, 'params': p, 'magasins': []}
+
+        wh_ids = warehouses.ids
+        wh_societes = {w.id: w.company_id.name or '' for w in warehouses}
+        ref_date = self._reassort_reference_date(wh_ids)
+        date_debut = ref_date - timedelta(days=p['fenetre'] - 1)
+
+        product_tmpl_ids = None
+        if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
+            product_tmpl_ids = request.env['product.template'].sudo().search(
+                self._build_product_domain(kw)).ids or [-1]
+        # Bouton « Réassort » de la page Action : une seule référence.
+        if kw.get('article_id'):
+            product_tmpl_ids = [int(kw['article_id'])]
+
+        params = {
+            'wh': wh_ids,
+            'debut': datetime.combine(date_debut, datetime.min.time()),
+            'fin': datetime.combine(ref_date, datetime.max.time()),
+            'mfl': mod_for_life.id,
+        }
+        prod_filter = self._mfl_sans_test_sql('pt')
+        if product_tmpl_ids is not None:
+            prod_filter += ' AND pp.product_tmpl_id = ANY(%(tmpls)s)'
+            params['tmpls'] = list(product_tmpl_ids)
+        sachet = self._get_sachet_variant_ids()
+        if sachet:
+            prod_filter += ' AND NOT (pp.id = ANY(%(sachet)s))'
+            params['sachet'] = list(sachet)
+
+        # Une seule requête : pour chaque (magasin x variante) ACTIF sur la
+        # fenêtre — il a reçu quelque chose ou vendu quelque chose —, le
+        # reçu, le vendu, le stock magasin et le stock dépôt. Un couple sans
+        # réception ni vente ne peut déclencher aucune des deux alertes : on
+        # ne le charge pas.
+        #
+        #  • REÇU : mouvements validés ENTRANT dans le magasin depuis un
+        #    fournisseur (réception du bon d'achat miroir de MOD FOR LIFE) ou
+        #    depuis un autre entrepôt (transfert). Les ajustements
+        #    d'inventaire et les retours clients caisse ne sont PAS de la
+        #    marchandise reçue : exclus.
+        #  • VENDU : lignes de caisse de TOUS les points de vente de
+        #    l'entrepôt (physique + online partagent le même stock : pour le
+        #    réassort c'est la sortie de stock qui compte), nettes des
+        #    retours, planchers à 0 plus bas.
+        #  • STOCK : stock.quant de l'entrepôt, sous-emplacements compris.
+        #  • DÉPÔT : stock positif de MOD FOR LIFE pour la variante exacte.
+        #  • Seuls les articles STOCKABLES comptent, et les lignes de
+        #    récompense de caisse (remises fidélité, produit fictif « All 50%
+        #    SUR LE… ») sont exclues des ventes : sans ça, une remise remontait
+        #    en tête de liste comme un article en rupture à réassortir.
+        request.env.cr.execute("""
+            WITH wh AS (
+                SELECT w.id, wl.parent_path
+                  FROM stock_warehouse w
+                  JOIN stock_location wl ON wl.id = w.lot_stock_id
+                 WHERE w.id = ANY(%(wh)s)
+            ), loc AS (
+                SELECT l.id AS loc_id, wh.id AS wh_id
+                  FROM stock_location l
+                  JOIN wh ON l.parent_path LIKE wh.parent_path || '%%'
+            ), recu AS (
+                SELECT dst.wh_id, sml.product_id, SUM(sml.quantity) AS q
+                  FROM stock_move_line sml
+                  JOIN loc dst ON dst.loc_id = sml.location_dest_id
+                  JOIN stock_location src ON src.id = sml.location_id
+                  LEFT JOIN loc srcw ON srcw.loc_id = sml.location_id
+                 WHERE sml.state = 'done'
+                   AND sml.date BETWEEN %(debut)s AND %(fin)s
+                   AND src.usage IN ('supplier', 'internal', 'transit')
+                   AND (srcw.wh_id IS NULL OR srcw.wh_id <> dst.wh_id)
+                 GROUP BY 1, 2
+            ), vendu AS (
+                SELECT spt.warehouse_id AS wh_id, pol.product_id, SUM(pol.qty) AS q
+                  FROM pos_order_line pol
+                  JOIN pos_order po ON po.id = pol.order_id
+                  JOIN pos_session ps ON ps.id = po.session_id
+                  JOIN pos_config pc ON pc.id = ps.config_id
+                  JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                 WHERE po.state IN ('paid', 'done', 'invoiced')
+                   AND po.date_order BETWEEN %(debut)s AND %(fin)s
+                   AND spt.warehouse_id = ANY(%(wh)s)
+                   AND NOT COALESCE(pol.is_reward_line, FALSE)
+                 GROUP BY 1, 2
+            ), actifs AS (
+                SELECT wh_id, product_id FROM recu WHERE q > 0
+                UNION
+                SELECT wh_id, product_id FROM vendu WHERE q > 0
+            ), deja AS (
+                -- Au moins une réception de la variante dans ce magasin, sur
+                -- TOUT l'historique (même règle que « reçu », sans fenêtre).
+                SELECT DISTINCT dst.wh_id, sml.product_id
+                  FROM stock_move_line sml
+                  JOIN loc dst ON dst.loc_id = sml.location_dest_id
+                  JOIN actifs a ON a.wh_id = dst.wh_id AND a.product_id = sml.product_id
+                  JOIN stock_location src ON src.id = sml.location_id
+                  LEFT JOIN loc srcw ON srcw.loc_id = sml.location_id
+                 WHERE sml.state = 'done'
+                   AND src.usage IN ('supplier', 'internal', 'transit')
+                   AND (srcw.wh_id IS NULL OR srcw.wh_id <> dst.wh_id)
+            ), stk AS (
+                SELECT loc.wh_id, sq.product_id, SUM(sq.quantity) AS q
+                  FROM stock_quant sq
+                  JOIN loc ON loc.loc_id = sq.location_id
+                  JOIN actifs a ON a.wh_id = loc.wh_id AND a.product_id = sq.product_id
+                 GROUP BY 1, 2
+            ), depot AS (
+                SELECT sq.product_id, SUM(sq.quantity) AS q
+                  FROM stock_quant sq
+                  JOIN stock_location sl ON sl.id = sq.location_id
+                 WHERE sl.usage = 'internal' AND sl.company_id = %(mfl)s
+                 GROUP BY 1
+            ), attr AS (
+                SELECT pvc.product_product_id AS pid,
+                       MAX(CASE WHEN UPPER(pa.name->>'en_US') LIKE 'COULEUR%%'
+                                THEN pav.name->>'en_US' END) AS couleur,
+                       MAX(CASE WHEN UPPER(pa.name->>'en_US') LIKE 'POINTURE%%'
+                                  OR UPPER(pa.name->>'en_US') LIKE 'TAILLE%%'
+                                THEN pav.name->>'en_US' END) AS taille
+                  FROM product_variant_combination pvc
+                  JOIN product_template_attribute_value ptav
+                    ON ptav.id = pvc.product_template_attribute_value_id
+                  JOIN product_attribute pa ON pa.id = ptav.attribute_id
+                  JOIN product_attribute_value pav
+                    ON pav.id = ptav.product_attribute_value_id
+                 GROUP BY 1
+            )
+            SELECT a.wh_id, pp.id, pt.id,
+                   COALESCE(NULLIF(pt.base_pivot_reference, ''),
+                            NULLIF(pt.default_code, ''),
+                            NULLIF(pp.default_code, ''),
+                            pt.name->>'en_US') AS ref,
+                   COALESCE(pt.name->>'fr_FR', pt.name->>'en_US') AS produit,
+                   COALESCE(attr.couleur, '') AS couleur,
+                   COALESCE(attr.taille, '') AS taille,
+                   COALESCE(recu.q, 0), COALESCE(vendu.q, 0),
+                   COALESCE(stk.q, 0), COALESCE(depot.q, 0),
+                   (deja.product_id IS NOT NULL) AS deja_recu
+              FROM actifs a
+              JOIN product_product pp ON pp.id = a.product_id
+              JOIN product_template pt ON pt.id = pp.product_tmpl_id
+              LEFT JOIN recu  ON recu.wh_id  = a.wh_id AND recu.product_id  = a.product_id
+              LEFT JOIN vendu ON vendu.wh_id = a.wh_id AND vendu.product_id = a.product_id
+              LEFT JOIN stk   ON stk.wh_id   = a.wh_id AND stk.product_id   = a.product_id
+              LEFT JOIN depot ON depot.product_id = a.product_id
+              LEFT JOIN attr  ON attr.pid = pp.id
+              LEFT JOIN deja  ON deja.wh_id  = a.wh_id AND deja.product_id  = a.product_id
+             WHERE pt.type = 'product' {PROD_FILTER}
+        """.replace('{PROD_FILTER}', prod_filter), params)
+        raw = request.env.cr.fetchall()
+
+        fenetre = float(p['fenetre'])
+        seuil = p['seuil_pct'] / 100.0
+        inclure_negatifs = bool(kw.get('inclure_negatifs'))
+        rows = []
+        nb_negatifs = 0
+        nb_jamais_recu = 0
+        for (wh_id, pid, tmpl_id, ref, produit, couleur, taille,
+             recu, vendu, stock, depot, deja_recu) in raw:
+            recu = float(recu or 0)
+            vendu = max(0.0, float(vendu or 0))   # net des retours, plancher 0
+            stock_brut = float(stock or 0)
+            stock_mag = max(0.0, stock_brut)
+            depot = max(0.0, float(depot or 0))
+
+            vitesse = vendu / fenetre
+            jours = (stock_mag / vitesse) if vitesse > 0 else None
+            reste_pct = (stock_mag / recu * 100.0) if recu > 0 else None
+
+            alerte = None
+            if recu > 0 and stock_mag <= seuil * recu:
+                alerte = 'pct'          # la règle des 10 % de l'utilisateur
+            elif jours is not None and jours < p['delai']:
+                alerte = 'vitesse'      # reste > 10 %, mais part trop vite
+            if not alerte:
+                continue
+
+            # Un stock négatif n'est pas une rupture à réassortir : c'est un
+            # stock Odoo faux. Cas vérifié en base : SAC 24P-6065 NOIR à
+            # Californie a reçu 14 pièces le 2026-05-05, n'a rien vendu
+            # depuis, et stock.quant affiche -1. Le ramener à 0 fabriquerait
+            # une fausse rupture — et la base en compte des dizaines de
+            # milliers. Ces lignes sont donc MISES DE CÔTÉ par défaut
+            # (comptées dans un KPI ; la case « Inclure les stocks négatifs »
+            # a été retirée de l'écran le 2026-09-21) et
+            # ne consomment pas le stock du dépôt dans la répartition.
+            negatif = stock_brut < 0
+            if negatif and not inclure_negatifs:
+                nb_negatifs += 1
+                continue
+
+            # DEMANDE UTILISATEUR (2026-09-21) : pas d'alerte pour un article
+            # que le magasin n'a JAMAIS reçu (sur tout l'historique). Ce ne
+            # sont pas des besoins : ce sont des ventes passées sur la
+            # mauvaise caisse ou prises dans le stock d'un autre magasin.
+            # Cas vérifié : MAGASIN MARINA VETEMENTS AGADIR (vêtements
+            # uniquement) a encaissé 49 chaussures du 28 au 31/07/2026 sans
+            # en avoir jamais reçu une — le réassort proposait d'acheter des
+            # babouches pour un magasin de vêtements. 92 alertes sur 852
+            # étaient dans ce cas, toutes « Manquant au dépôt ».
+            if not deja_recu:
+                nb_jamais_recu += 1
+                continue
+
+            besoin = 0
+            if vitesse > 0:
+                # Arrondi au-dessus : on n'envoie pas 2,3 pièces, et arrondir
+                # au-dessous laisserait le magasin juste sous sa cible.
+                besoin = max(0, math.ceil(p['cible'] * vitesse - stock_mag - 1e-9))
+            rows.append({
+                'wh_id': wh_id,
+                'magasin': wh_labels.get(wh_id) or '—',
+                'shop_field': shop_par_wh.get(wh_id),
+                'societe': wh_societes.get(wh_id) or '',
+                'product_id': pid,
+                'article_id': tmpl_id,
+                'reference': ref or '—',
+                'produit': produit or '—',
+                'couleur': (couleur or '').strip() or '—',
+                'taille': (taille or '').strip(),
+                'recu': int(round(recu)),
+                'vendu': int(round(vendu)),
+                'stock': int(round(stock_mag)),
+                'stock_negatif': int(round(stock_brut)) if negatif else 0,
+                'reste_pct': round(reste_pct, 1) if reste_pct is not None else None,
+                'vitesse_jour': round(vitesse, 3),
+                'vitesse_semaine': round(vitesse * 7, 1),
+                'jours_restants': round(jours, 1) if jours is not None else None,
+                'depot': int(round(depot)),
+                'besoin': besoin,
+                'propose': 0,
+                'alerte': alerte,
+            })
+
+        self._reassort_allocate(rows)
+
+        for r in rows:
+            if r['depot'] <= 0:
+                r['statut'] = 'depot_vide'
+            elif r['propose'] > 0:
+                r['statut'] = 'partiel' if r['propose'] < r['besoin'] else 'servi'
+            elif r['besoin'] == 0 and r['vitesse_jour'] == 0:
+                r['statut'] = 'sans_vente'
+            else:
+                r['statut'] = 'couvert'
+
+        # Ordre d'urgence : d'abord ce qui SE VEND (une alerte sur un article
+        # sans vente sur la période n'appelle pas d'envoi, elle est à juger),
+        # puis le moins de jours restants, puis la règle des 10 % avant
+        # l'alerte vitesse, puis le plus rapide.
+        def _urgence(r):
+            j = r['jours_restants']
+            return (0 if r['vitesse_jour'] > 0 else 1,
+                    j if j is not None else 10 ** 6,
+                    0 if r['alerte'] == 'pct' else 1,
+                    -(r['vitesse_jour']))
+        rows.sort(key=_urgence)
+
+        servables = [r for r in rows if r['depot'] > 0]
+        kpis = {
+            'nb_alertes': len(rows),
+            'nb_alertes_pct': len([r for r in rows if r['alerte'] == 'pct']),
+            'nb_alertes_vitesse': len([r for r in rows if r['alerte'] == 'vitesse']),
+            'nb_servables': len(servables),
+            'nb_depot_vide': len(rows) - len(servables),
+            'pieces_proposees': sum(r['propose'] for r in rows),
+            'pieces_besoin': sum(r['besoin'] for r in rows),
+            'nb_magasins': len({r['wh_id'] for r in rows}),
+            'nb_references': len({r['article_id'] for r in rows}),
+            'nb_negatifs': nb_negatifs,
+            'nb_jamais_recu': nb_jamais_recu,
+            'inclure_negatifs': inclure_negatifs,
+            'nb_ruptures': len([r for r in rows if r['stock'] == 0]),
+        }
+        magasins = sorted({(r['wh_id'], r['magasin'], r['societe']) for r in rows}, key=lambda x: x[1])
+        return {
+            'params': p,
+            'date_reference': ref_date.isoformat(),
+            'date_debut': date_debut.isoformat(),
+            'aujourdhui': date.today().isoformat(),
+            'kpis': kpis,
+            'rows': rows[:self.REASSORT_MAX_ROWS],
+            'tronque': len(rows) > self.REASSORT_MAX_ROWS,
+            'magasins': [{'id': w, 'name': n, 'societe': s} for w, n, s in magasins],
+        }
+
+    def _reassort_allocate(self, rows):
+        """Répartit le stock du dépôt entre les magasins qui en ont besoin.
+
+        Pour une même variante, si le dépôt couvre tous les besoins, chacun
+        reçoit son besoin. Sinon, on distribue PIÈCE PAR PIÈCE : chaque
+        pièce va au magasin dont le rapport vitesse ÷ (déjà attribué + 1)
+        est le plus élevé, sans jamais dépasser son besoin (méthode de
+        D'Hondt). Résultat : un partage proportionnel à la vitesse, en
+        pièces entières, où le magasin qui vend le plus vite passe devant.
+
+        CORRIGÉ avant livraison : une première version calculait une part
+        au prorata puis la plafonnait au besoin, sans redistribuer le
+        surplus. Dépôt = 10, A (besoin 2, vend vite), B (besoin 20) : A
+        recevait 2, B recevait 2, et 6 pièces restaient au dépôt alors que B
+        en manquait. Ici une pièce n'est jamais laissée au dépôt tant qu'un
+        magasin en a besoin.
+
+        Travaille en place sur `rows` (clés `besoin`, `depot`,
+        `vitesse_jour`, `product_id`) et renseigne `propose` / `partage`.
+        """
+        par_variante = {}
+        for r in rows:
+            if r['besoin'] > 0:
+                par_variante.setdefault(r['product_id'], []).append(r)
+        for lignes in par_variante.values():
+            dispo = int(lignes[0]['depot'])
+            if dispo <= 0:
+                continue
+            if sum(r['besoin'] for r in lignes) <= dispo:
+                for r in lignes:
+                    r['propose'] = r['besoin']
+                continue
+            attrib = [0] * len(lignes)
+            # (-priorité, index) : heapq est un tas min. L'index départage
+            # les égalités de façon stable (ordre d'urgence de la liste).
+            tas = [(-(r['vitesse_jour'] or 0.0), i) for i, r in enumerate(lignes)]
+            heapq.heapify(tas)
+            while dispo > 0 and tas:
+                _prio, i = heapq.heappop(tas)
+                attrib[i] += 1
+                dispo -= 1
+                if attrib[i] < lignes[i]['besoin']:
+                    heapq.heappush(
+                        tas, (-(lignes[i]['vitesse_jour'] or 0.0) / (attrib[i] + 1), i))
+            for r, q in zip(lignes, attrib):
+                r['propose'] = q
+                r['partage'] = True
+
+    # ─────────────────────────────────────────────────────────────
+    # SOLDES DEPUIS LE DASHBOARD
+    #
+    # DEMANDE UTILISATEUR (2026-09-21) : un bouton « Solder » à côté de
+    # « Transférer » dans la fiche référence, pour lancer une solde sans
+    # quitter le dashboard. Règle : vérifier si le magasin a déjà sa liste
+    # de soldes ; sinon en créer une nouvelle, avec un nom.
+    #
+    # Ce qu'est « la liste des soldes d'un magasin » dans cette base
+    # (vérifié le 2026-09-21) : une LISTE DE PRIX Odoo (product.pricelist)
+    # nommée « Solde … » et rattachée aux listes disponibles de la caisse
+    # du magasin — ex. « Solde Sela Park » (735 règles, caisse MAGASIN
+    # CARREFOUR AGADIR), « Solde Salam 2 » (556 règles, MAGASIN SALAM2
+    # AGADIR). Chaque article soldé y est une règle « prix fixe » posée sur
+    # l'ARTICLE (applied_on = 1_product : toutes couleurs et tailles), avec
+    # une date de début. On reproduit exactement ce modèle, pour que les
+    # soldes créées ici soient indiscernables de celles créées à la main.
+    #
+    # PIÈGE : ces prix sont enregistrés HORS TAXE, comme le prix de vente
+    # de l'article (ex. 165,83 HT = 199 TTC). L'utilisateur saisit un prix
+    # TTC (celui de l'étiquette) ; on le convertit avec les taxes de
+    # l'article, sinon la solde partirait 20 % trop haut.
+    # ─────────────────────────────────────────────────────────────
+
+    def _solde_tax_ratio(self, product_tmpl, company):
+        """Coefficient TTC/HT du prix de vente de l'article pour cette
+        société (1.0 sans taxe, ou si la taxe est déjà incluse dans le prix
+        catalogue — dans ce cas le prix catalogue et la règle sont tous deux
+        TTC et il n'y a rien à convertir)."""
+        taxes = product_tmpl.sudo().taxes_id.filtered(
+            lambda t: not t.company_id or t.company_id == company)
+        if not taxes:
+            return 1.0
+        res = taxes.compute_all(100.0, currency=company.currency_id)
+        ratio = (res.get('total_included') or 100.0) / 100.0
+        return ratio if 0.5 <= ratio <= 2.0 else 1.0
+
+    def _solde_store_configs(self, mapping):
+        """Caisses PHYSIQUES du magasin (les caisses « Online » du même
+        entrepôt ont leurs propres promotions, on n'y touche pas)."""
+        scope = self._get_shop_scope(mapping.shop_field)
+        ids = (scope or {}).get('pos_config_ids') or []
+        return request.env['pos.config'].sudo().browse(ids).exists()
+
+    def _solde_is_default_list(self, pricelist):
+        """Liste de prix NORMALE (« Liste de prix MAD par défaut ») : jamais
+        une liste de soldes, on n'y pose aucune règle."""
+        nom = (pricelist.name or '').lower()
+        return 'par défaut' in nom or 'par defaut' in nom or 'default' in nom
+
+    def _solde_find_list(self, configs):
+        """La liste de soldes déjà rattachée à ces caisses, s'il y en a une.
+
+        DEMANDE UTILISATEUR (2026-09-21) : « si la caisse a déjà une liste,
+        il ne faut pas en créer une nouvelle ». Avant, seules les listes dont
+        le nom contient « solde » étaient reconnues : « REMISE 20% »,
+        rattachée à MAGASIN MORROCO MALL, était ignorée et le bouton créait
+        « Solde Morocco Mall » à côté. Choix de l'utilisatrice : TOUJOURS
+        réutiliser la liste existante, même si elle est partagée avec
+        d'autres caisses (REMISE 20% sert les 14 caisses de la société : le
+        prix soldé s'y appliquera partout ; le panneau l'annonce).
+
+        Toute liste active disponible sur la caisse, sauf la liste normale
+        par défaut. S'il y en a plusieurs : d'abord celles nommées « solde »,
+        puis celle qui porte le plus d'articles.
+        """
+        lists = (configs.mapped('available_pricelist_ids') | configs.mapped('pricelist_id'))
+        lists = lists.filtered(lambda p: p.active and not self._solde_is_default_list(p))
+        if not lists:
+            return request.env['product.pricelist'].sudo().browse()
+        return lists.sorted(
+            key=lambda p: ('solde' in (p.name or '').lower(), len(p.item_ids), p.id), reverse=True)[:1]
+
+    def _solde_other_configs(self, pricelist, configs):
+        """Caisses HORS de ce magasin qui utilisent aussi cette liste."""
+        autres = request.env['pos.config'].sudo().search([
+            '|', ('available_pricelist_ids', 'in', pricelist.ids), ('pricelist_id', 'in', pricelist.ids)])
+        return autres - configs
+
+    def _solde_variantes_couleur(self, product_tmpl, couleur):
+        """Variantes (toutes tailles) d'UNE couleur de la référence.
+
+        DEMANDE UTILISATRICE (2026-09-22) : depuis la page Action, pouvoir
+        solder une seule couleur (bouton sur la ligne variante). Une règle de
+        liste de prix ne vise qu'une variante : une couleur = une règle par
+        taille (applied_on = 0_product_variant). Odoo fait passer ces règles
+        avant la règle posée sur l'article entier."""
+        request.env.cr.execute("""
+            SELECT pp.id
+              FROM product_product pp
+              JOIN product_variant_combination pvc ON pvc.product_product_id = pp.id
+              JOIN product_template_attribute_value ptav
+                ON ptav.id = pvc.product_template_attribute_value_id
+              JOIN product_attribute pa ON pa.id = ptav.attribute_id
+              JOIN product_attribute_value pav ON pav.id = ptav.product_attribute_value_id
+             WHERE pp.product_tmpl_id = %s
+               AND UPPER(pa.name->>'en_US') LIKE 'COULEUR%%'
+               AND TRIM(pav.name->>'en_US') = %s
+        """, (product_tmpl.id, (couleur or '').strip()))
+        return request.env['product.product'].sudo().browse([r[0] for r in request.env.cr.fetchall()])
+
+    def _solde_rule_variante(self, pricelist, variant):
+        return pricelist.item_ids.filtered(
+            lambda i: i.applied_on == '0_product_variant' and i.product_id.id == variant.id
+        )[:1]
+
+    def _solde_rule(self, pricelist, product_tmpl):
+        return pricelist.item_ids.filtered(
+            lambda i: i.applied_on == '1_product' and i.product_tmpl_id.id == product_tmpl.id
+        )[:1]
+
+    def _solde_mappings(self):
+        non_retail = self._get_non_retail_company_ids()
+        return self._get_active_shop_mappings().filtered(
+            lambda m: m.warehouse_id and m.company_id and m.company_id.id not in non_retail
+        )
+
+    @http.route('/mavie/api/solde-context', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_solde_context(self, **kw):
+        """Tout ce que le panneau « Solder » affiche avant de valider :
+        prix catalogue, et pour chaque magasin son stock de l'article, sa
+        liste de soldes (existante ou à créer) et la solde déjà en place."""
+        try:
+            tmpl = request.env['product.template'].sudo().browse(int(kw.get('product_tmpl_id') or 0))
+            if not tmpl.exists():
+                return {'error': 'Référence introuvable.'}
+            # Solde d'une seule couleur (bouton sur la ligne variante de la
+            # page Action) : stock, solde en place et prix de CETTE couleur.
+            couleur = (kw.get('couleur') or '').strip()
+            variantes = None
+            if couleur:
+                variantes = self._solde_variantes_couleur(tmpl, couleur)
+                if not variantes:
+                    return {'error': 'Aucune variante « %s » pour cette référence.' % couleur}
+            catalogue_ht = min(variantes.mapped('lst_price')) if variantes else tmpl.list_price
+            mappings = self._solde_mappings()
+
+            # Stock de l'article par magasin (négatifs ramenés à 0 : un
+            # stock négatif n'est pas de la marchandise à solder).
+            request.env.cr.execute("""
+                SELECT w.id, COALESCE(SUM(sq.quantity), 0)
+                  FROM stock_quant sq
+                  JOIN product_product pp ON pp.id = sq.product_id
+                  JOIN stock_location l ON l.id = sq.location_id
+                  JOIN stock_warehouse w ON w.id = ANY(%(wh)s)
+                  JOIN stock_location wl ON wl.id = w.lot_stock_id
+                 WHERE pp.product_tmpl_id = %(tmpl)s{V}
+                   AND l.parent_path LIKE wl.parent_path || '%%'
+                 GROUP BY 1
+            """.replace('{V}', ' AND pp.id = ANY(%(vids)s)' if variantes else ''),
+                {'wh': mappings.mapped('warehouse_id').ids or [-1], 'tmpl': tmpl.id,
+                 'vids': variantes.ids if variantes else []})
+            stock_by_wh = {r[0]: max(0, int(round(r[1] or 0))) for r in request.env.cr.fetchall()}
+
+            magasins = []
+            ratio_ref = None
+            for m in mappings:
+                ratio = self._solde_tax_ratio(tmpl, m.company_id)
+                ratio_ref = ratio_ref or ratio
+                configs = self._solde_store_configs(m)
+                lst = self._solde_find_list(configs)
+                rule = None
+                if lst and variantes:
+                    # Solde déjà posée sur cette couleur, sinon celle de
+                    # l'article entier (qui s'applique aussi à la couleur).
+                    for vr in variantes:
+                        rule = self._solde_rule_variante(lst, vr)
+                        if rule:
+                            break
+                if lst and not rule:
+                    rule = self._solde_rule(lst, tmpl)
+                regle = None
+                if rule:
+                    prix = rule.fixed_price if rule.compute_price == 'fixed' else (
+                        catalogue_ht * (1 - (rule.percent_price or 0) / 100.0))
+                    regle = {
+                        'prix_ttc': round(prix * ratio, 2),
+                        'date_start': fields.Datetime.to_string(rule.date_start)[:10] if rule.date_start else '',
+                        'date_end': fields.Datetime.to_string(rule.date_end)[:10] if rule.date_end else '',
+                    }
+                magasins.append({
+                    'shop_field': m.shop_field,
+                    'magasin': m.warehouse_id.name,
+                    'libelle': m.shop_label or m.warehouse_id.name,
+                    'societe': m.company_id.name,
+                    'stock': stock_by_wh.get(m.warehouse_id.id, 0),
+                    'caisses': configs.mapped('name'),
+                    'liste': {'id': lst.id, 'name': lst.name, 'nb_articles': len(lst.item_ids),
+                              'autres_caisses': self._solde_other_configs(lst, configs).mapped('name')} if lst else None,
+                    'nom_propose': 'Solde %s' % (m.shop_label or m.warehouse_id.name),
+                    'regle': regle,
+                })
+            magasins.sort(key=lambda x: (x['societe'], x['magasin']))
+            ratio_ref = ratio_ref or 1.0
+            return {
+                'product_tmpl_id': tmpl.id,
+                'nom': tmpl.name,
+                'reference': tmpl.base_pivot_reference or tmpl.default_code or tmpl.name,
+                'prix_catalogue_ttc': round(catalogue_ht * ratio_ref, 2),
+                'couleur': couleur,
+                'nb_variantes': len(variantes) if variantes else 0,
+                'magasins': magasins,
+            }
+        except Exception as e:
+            _logger.error(f"Erreur api_solde_context: {str(e)}", exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/solde-apply', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_solde_apply(self, **kw):
+        """Applique la solde : pour chaque magasin choisi, ajoute (ou met à
+        jour) la règle de l'article dans la liste de soldes du magasin, en
+        créant cette liste si le magasin n'en a pas encore.
+
+        Tout est validé AVANT la première écriture, et l'ensemble tient dans
+        la transaction de la requête : si un seul magasin échoue, aucun
+        magasin n'est modifié — jamais de solde appliquée à moitié.
+        """
+        try:
+            tmpl = request.env['product.template'].sudo().browse(int(kw.get('product_tmpl_id') or 0))
+            if not tmpl.exists():
+                return {'error': 'Référence introuvable.'}
+            try:
+                prix_ttc = float(kw.get('prix_ttc') or 0)
+            except (TypeError, ValueError):
+                return {'error': 'Prix soldé invalide.'}
+            date_start = (kw.get('date_start') or '').strip()
+            date_end = (kw.get('date_end') or '').strip()
+            demandes = kw.get('magasins') or []
+            if not demandes:
+                return {'error': 'Choisissez au moins un magasin.'}
+            if prix_ttc <= 0:
+                return {'error': 'Le prix soldé doit être supérieur à 0.'}
+            if date_end and date_start and date_end < date_start:
+                return {'error': 'La date de fin est avant la date de début.'}
+
+            # Solde d'une seule couleur (page Action) : une règle par taille.
+            couleur = (kw.get('couleur') or '').strip()
+            variantes = None
+            if couleur:
+                variantes = self._solde_variantes_couleur(tmpl, couleur)
+                if not variantes:
+                    return {'error': 'Aucune variante « %s » pour cette référence.' % couleur}
+            catalogue_ht = min(variantes.mapped('lst_price')) if variantes else tmpl.list_price
+
+            by_field = {m.shop_field: m for m in self._solde_mappings()}
+            plan = []
+            for d in demandes:
+                m = by_field.get(d.get('shop_field'))
+                if not m:
+                    return {'error': 'Magasin inconnu ou inactif : %s' % d.get('shop_field')}
+                configs = self._solde_store_configs(m)
+                if not configs:
+                    return {'error': '%s n\'a aucune caisse : impossible d\'y appliquer une solde.' % m.warehouse_id.name}
+                ratio = self._solde_tax_ratio(tmpl, m.company_id)
+                catalogue_ttc = catalogue_ht * ratio
+                if prix_ttc >= catalogue_ttc - 0.005:
+                    return {'error': 'Le prix soldé (%.2f) doit être inférieur au prix de vente (%.2f TTC).' % (prix_ttc, catalogue_ttc)}
+                lst = self._solde_find_list(configs)
+                nom = (d.get('nom_liste') or '').strip() or 'Solde %s' % (m.shop_label or m.warehouse_id.name)
+                plan.append((m, configs, lst, nom, ratio))
+
+            Pricelist = request.env['product.pricelist'].sudo()
+            Item = request.env['product.pricelist.item'].sudo()
+            resultats = []
+            for m, configs, lst, nom, ratio in plan:
+                creee = False
+                if not lst:
+                    lst = Pricelist.create({
+                        'name': nom,
+                        'company_id': m.company_id.id,
+                        'currency_id': m.company_id.currency_id.id,
+                    })
+                    creee = True
+                # Disponible sur la caisse, comme « Solde Sela Park » : la
+                # liste par défaut de la caisse reste la liste normale.
+                # pos.config.write exige la liste COMPLÈTE (commande 6) : il
+                # compare l'ancienne et la nouvelle pour interdire tout
+                # RETRAIT pendant une session ouverte. Un ajout reste permis,
+                # session ouverte ou non — la caisse le verra au prochain
+                # rechargement.
+                for cfg in configs.filtered(lambda c: lst not in c.available_pricelist_ids):
+                    vals_cfg = {'available_pricelist_ids': [(6, 0, (cfg.available_pricelist_ids | lst).ids)]}
+                    if not cfg.use_pricelist:
+                        vals_cfg['use_pricelist'] = True
+                    cfg.write(vals_cfg)
+
+                prix_ht = lst.currency_id.round(prix_ttc / ratio)
+                base = {
+                    'compute_price': 'fixed',
+                    'fixed_price': prix_ht,
+                    'min_quantity': 0,
+                    'date_start': (date_start + ' 00:00:00') if date_start else False,
+                    'date_end': (date_end + ' 23:59:59') if date_end else False,
+                }
+                ancien = None
+                if variantes:
+                    for vr in variantes:
+                        vals = dict(base, applied_on='0_product_variant',
+                                    product_id=vr.id, product_tmpl_id=tmpl.id)
+                        rule = self._solde_rule_variante(lst, vr)
+                        if rule:
+                            if rule.compute_price == 'fixed' and ancien is None:
+                                ancien = round(rule.fixed_price * ratio, 2)
+                            rule.write(vals)
+                        else:
+                            vals['pricelist_id'] = lst.id
+                            Item.create(vals)
+                else:
+                    vals = dict(base, applied_on='1_product', product_tmpl_id=tmpl.id)
+                    rule = self._solde_rule(lst, tmpl)
+                    if rule:
+                        if rule.compute_price == 'fixed':
+                            ancien = round(rule.fixed_price * ratio, 2)
+                        rule.write(vals)
+                    else:
+                        vals['pricelist_id'] = lst.id
+                        rule = Item.create(vals)
+                resultats.append({
+                    'magasin': m.warehouse_id.name,
+                    'liste': lst.name,
+                    'liste_creee': creee,
+                    'ancien_prix_ttc': ancien,
+                    'prix_ttc': round(prix_ht * ratio, 2),
+                    'prix_ht': prix_ht,
+                })
+            _logger.info("Solde dashboard par %s : %s -> %s TTC dans %s",
+                         request.env.user.login, tmpl.display_name + (' / ' + couleur if couleur else ''), prix_ttc,
+                         ', '.join(r['magasin'] for r in resultats))
+            return {'ok': True, 'resultats': resultats}
+        except Exception as e:
+            _logger.error(f"Erreur api_solde_apply: {str(e)}", exc_info=True)
+            # La transaction de la requête est annulée par Odoo : aucune
+            # écriture partielle ne reste en base.
+            request.env.cr.rollback()
+            return {'error': str(e)}
+
+    def _solde_history(self, product_tmpl, variants):
+        """Soldes PROGRAMMÉES de la référence, pour l'onglet « Soldes » de
+        l'historique.
+
+        DEMANDE UTILISATEUR (2026-09-21) : une solde lancée depuis le bouton
+        « Solder » doit apparaître dans l'historique de la référence. Cet
+        onglet ne listait que les VENTES en caisse à prix réduit : une solde
+        qui vient d'être lancée, sans vente encore, n'y figurait pas.
+
+        On lit donc les règles des listes de soldes (listes de prix dont le
+        nom contient « solde », actives ou non) portant sur cet article ou
+        sur une de ses variantes — celles créées depuis le dashboard comme
+        celles saisies à la main dans Odoo. Prix affichés TTC, comme le reste
+        du dashboard (les règles sont stockées HT).
+        """
+        # Depuis que le bouton réutilise la liste déjà rattachée à la caisse
+        # (ex. « REMISE 20% »), une solde peut vivre dans une liste qui ne
+        # s'appelle pas « solde » : on prend aussi toute liste rattachée à
+        # une caisse, hors liste normale par défaut. Seules les règles posées
+        # sur CET article comptent (la remise globale de 20 % n'en est pas).
+        Item = request.env['product.pricelist.item'].sudo().with_context(active_test=False)
+        cfg_lists = request.env['pos.config'].sudo().with_context(active_test=False).search([])
+        cfg_lists = (cfg_lists.mapped('available_pricelist_ids') | cfg_lists.mapped('pricelist_id'))
+        cfg_lists = cfg_lists.filtered(lambda p: not self._solde_is_default_list(p))
+        items = Item.search([
+            '|', ('pricelist_id.name', 'ilike', 'solde'), ('pricelist_id', 'in', cfg_lists.ids),
+            '|',
+            '&', ('applied_on', '=', '1_product'), ('product_tmpl_id', '=', product_tmpl.id),
+            '&', ('applied_on', '=', '0_product_variant'), ('product_id', 'in', variants.ids),
+        ], order='create_date desc, id desc')
+        if not items:
+            return []
+        configs = request.env['pos.config'].sudo().with_context(active_test=False).search([
+            '|', ('available_pricelist_ids', 'in', items.mapped('pricelist_id').ids),
+            ('pricelist_id', 'in', items.mapped('pricelist_id').ids),
+        ])
+        now = fields.Datetime.now()
+        out = []
+        for it in items:
+            pl = it.pricelist_id
+            ratio = self._solde_tax_ratio(product_tmpl, pl.company_id or request.env.company)
+            catalogue_ht = it.product_id.lst_price if it.applied_on == '0_product_variant' else product_tmpl.list_price
+            if it.compute_price == 'fixed':
+                prix_ht = it.fixed_price
+            elif it.compute_price == 'percentage':
+                prix_ht = catalogue_ht * (1 - (it.percent_price or 0.0) / 100.0)
+            else:
+                prix_ht = None
+            if not pl.active:
+                statut = 'inactive'
+            elif it.date_end and it.date_end < now:
+                statut = 'terminee'
+            elif it.date_start and it.date_start > now:
+                statut = 'a_venir'
+            else:
+                statut = 'en_cours'
+            caisses = configs.filtered(lambda c: pl in c.available_pricelist_ids or c.pricelist_id == pl)
+            catalogue_ttc = round(catalogue_ht * ratio, 2)
+            prix_ttc = round(prix_ht * ratio, 2) if prix_ht is not None else None
+            out.append({
+                'date': fields.Datetime.to_string(it.create_date)[:16] if it.create_date else '—',
+                'modifiee': (fields.Datetime.to_string(it.write_date)[:16]
+                             if it.write_date and it.create_date and (it.write_date - it.create_date).total_seconds() > 60 else ''),
+                'par': it.create_uid.name or '—',
+                'liste': pl.name,
+                'societe': pl.company_id.name or '',
+                'magasins': caisses.mapped('name'),
+                'variante': it.product_id.display_name if it.applied_on == '0_product_variant' else '',
+                'prix_catalogue': catalogue_ttc,
+                'prix_solde': prix_ttc,
+                'remise_pct': (round((1 - prix_ttc / catalogue_ttc) * 100, 1)
+                               if prix_ttc is not None and catalogue_ttc else None),
+                'debut': fields.Datetime.to_string(it.date_start)[:10] if it.date_start else '',
+                'fin': fields.Datetime.to_string(it.date_end)[:10] if it.date_end else '',
+                'statut': statut,
+            })
+        return out

@@ -2,6 +2,30 @@
 import re
 
 from odoo import api, fields, models
+# ── Compatibilité Base Pivot ────────────────────────────────────────────
+# Deux versions de mv_base_pivot coexistent :
+#   • l'historique, où mv.batch.shop.mapping porte un champ Selection
+#     shop_field (marina_1, salam_2, …) — c'est la base « recette test » ;
+#   • celle du serveur Elite, où les magasins sont des enregistrements
+#     (mv.batch.shop) et où shop_field n'existe plus.
+# Le dashboard utilise shop_field comme clé de magasin partout. Plutôt que
+# de le réécrire, on détecte la version et on recalcule la clé quand elle
+# n'existe pas (voir MvBatchShopMappingExt).
+try:
+    from odoo.addons.mv_base_pivot.models.mv_batch_shop_mapping import SHOP_FIELDS as _BP_SHOP_FIELDS
+except ImportError:  # version « magasins dynamiques »
+    _BP_SHOP_FIELDS = None
+
+BASE_PIVOT_MAGASINS_DYNAMIQUES = _BP_SHOP_FIELDS is None
+
+
+def _cle_magasin(nom):
+    """« MAGASIN SALAM2 AGADIR » -> « magasin_salam2_agadir »."""
+    nom = (nom or '').strip().lower()
+    nom = (nom.replace('é', 'e').replace('è', 'e').replace('ê', 'e')
+              .replace('à', 'a').replace('â', 'a').replace('î', 'i')
+              .replace('ô', 'o').replace('û', 'u').replace('ç', 'c'))
+    return re.sub(r'_+', '_', re.sub(r'[^a-z0-9]+', '_', nom)).strip('_')
 
 # Déduction automatique de la ville à partir du champ magasin (base pivot).
 # CORRIGÉ le 2026-08-03 : la première version se basait sur le code interne
@@ -67,13 +91,36 @@ CITY_PROXIMITY = {
 class MvBatchShopMappingExt(models.Model):
     _inherit = 'mv.batch.shop.mapping'
 
-    shop_field = fields.Selection(
-        selection_add=[
-            ('marina_vetements_agadir', 'Marina Vêtements Agadir'),
-            ('oranger', 'Oranger'),
-        ],
-        ondelete={'marina_vetements_agadir': 'cascade', 'oranger': 'cascade'},
-    )
+    if not BASE_PIVOT_MAGASINS_DYNAMIQUES:
+        # Base Pivot « historique » : shop_field est une sélection figée, on
+        # y ajoute les deux magasins manquants.
+        shop_field = fields.Selection(
+            selection_add=[
+                ('marina_vetements_agadir', 'Marina Vêtements Agadir'),
+                ('oranger', 'Oranger'),
+            ],
+            ondelete={'marina_vetements_agadir': 'cascade', 'oranger': 'cascade'},
+        )
+    else:
+        # Base Pivot « magasins dynamiques » (serveur Elite, 2026-09-24) :
+        # le champ shop_field n'existe plus, les magasins sont des
+        # enregistrements mv.batch.shop. Tout le dashboard utilise
+        # shop_field comme clé de magasin : on la recalcule à partir du
+        # libellé pour ne rien changer au reste du module.
+        shop_field = fields.Char(
+            string="Clé magasin (dashboard)",
+            compute='_compute_shop_field_compat',
+            store=False,
+            help="Clé technique reconstituée à partir du nom du magasin, "
+                 "pour les écrans du dashboard.",
+        )
+
+        @api.depends('shop_label', 'shop_id', 'warehouse_id')
+        def _compute_shop_field_compat(self):
+            for rec in self:
+                nom = (rec.shop_label or rec.shop_id.name
+                       or rec.warehouse_id.name or '') or ''
+                rec.shop_field = _cle_magasin(nom) or ('magasin_%s' % rec.id)
 
     city = fields.Char(
         string="Ville",
@@ -150,7 +197,7 @@ class MvBatchShopMappingExt(models.Model):
                 if vals.get('warehouse_id'):
                     wh = self.env['stock.warehouse'].sudo().browse(vals['warehouse_id'])
                     city = _guess_city_from_warehouse_name(wh.name)
-                if not city and vals.get('shop_field'):
+                if not city and not BASE_PIVOT_MAGASINS_DYNAMIQUES and vals.get('shop_field'):
                     city = SHOP_CITY_GUESS.get(vals['shop_field'])
                 vals['city'] = city or ''
         return super().create(vals_list)

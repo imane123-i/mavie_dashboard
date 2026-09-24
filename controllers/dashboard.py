@@ -247,7 +247,7 @@ class MaVieDashboardController(http.Controller):
         )
         return request.env.cr.fetchall()
 
-    def _group_sums(self, model_name, domain, sum_fields, group_fields=('product_id',), agg='SUM'):
+    def _group_sums(self, model_name, domain, sum_fields, group_fields=('product_id',), agg='SUM', ctx=None):
         """read_group par product_id (et éventuellement company_id) SANS le
         surcoût de libellé d'Odoo.
 
@@ -264,6 +264,8 @@ class MaVieDashboardController(http.Controller):
         read_group.
         """
         Model = request.env[model_name].sudo()
+        if ctx:
+            Model = Model.with_context(**ctx)
         query = Model._where_calc(domain)
         Model._apply_ir_rules(query, 'read')
         from_clause, where_clause, params = query.get_sql()
@@ -767,9 +769,10 @@ class MaVieDashboardController(http.Controller):
                 'mapping': request.env['mv.batch.shop.mapping'].sudo().browse(),
             }
 
-        mapping = request.env['mv.batch.shop.mapping'].sudo().search(
-            [('shop_field', '=', shop_field)], limit=1
-        )
+        # shop_field peut être un champ calculé (Base Pivot « magasins
+        # dynamiques ») : on filtre au lieu de chercher en base.
+        mapping = self._get_active_shop_mappings().filtered(
+            lambda m: m.shop_field == shop_field)[:1]
         if not mapping:
             return None
 
@@ -2088,21 +2091,35 @@ class MaVieDashboardController(http.Controller):
             val_cost_total = 0.0
             stock_val_by_store = []
 
-            quant_domain_valorisation = quant_domain_base
+            # DEMANDE UTILISATRICE (2026-09-23) : « je dois avoir les mêmes
+            # quantités que dans Odoo ». L'écran Inventaire → Opérations →
+            # Ajustements → Inventaire physique additionne TOUT : sachets,
+            # articles archivés et stocks négatifs (Carrefour Agadir 8 475 =
+            # 5 147 hors sachets + 3 328 sachets). Cette table suit donc les
+            # quants bruts, sans les exclusions du reste du dashboard.
+            # On retire l'exclusion des sachets (posée sur product_id par
+            # _sachet_exclude_domain) : Odoo les compte.
+            quant_domain_valorisation = [
+                d for d in quant_domain_base
+                if not (isinstance(d, (list, tuple)) and len(d) == 3
+                        and d[0] == 'product_id' and d[1] == 'not in')
+            ]
             if excluded_non_retail_ids:
-                quant_domain_valorisation = quant_domain_base + [
+                quant_domain_valorisation = quant_domain_valorisation + [
                     ('company_id', 'not in', excluded_non_retail_ids)
                 ]
 
+            # active_test=False : les articles archivés ont encore du stock et
+            # Odoo les compte dans son écran.
             quant_val_grouped = self._group_sums(
                 'stock.quant', quant_domain_valorisation, ['quantity'],
-                group_fields=('product_id', 'company_id'),
+                group_fields=('product_id', 'company_id'), ctx={'active_test': False},
             )
 
             val_pids = [g['product_id'][0] for g in quant_val_grouped if g.get('product_id')]
             val_cost_estime = False
             if val_pids:
-                val_prods = request.env['product.product'].sudo().search_read(
+                val_prods = request.env['product.product'].sudo().with_context(active_test=False).search_read(
                     [('id', 'in', val_pids)],
                     ['id', 'list_price', 'standard_price', 'product_tmpl_id']
                 )
@@ -2134,7 +2151,9 @@ class MaVieDashboardController(http.Controller):
                     # il n'y en a qu'une poignée.
                     cid = g['company_id'][0] if g.get('company_id') else None
                     qty = g.get('quantity') or 0.0
-                    if qty <= 0 or not pid or pid not in val_prod_map:
+                    # Stocks négatifs gardés : Odoo les additionne aussi dans
+                    # son écran d'inventaire (demande du 2026-09-23).
+                    if not qty or not pid or pid not in val_prod_map:
                         continue
                     p_data = val_prod_map[pid]
                     price_ht = p_data.get('list_price') or 0.0
@@ -5029,7 +5048,48 @@ class MaVieDashboardController(http.Controller):
         fname = re.sub(r'[^\w.-]+', '_', f"Bon_transfert_{transfer.name}") + '.pdf'
         return (fname, pdf)
 
-    def _notify_transfer_responsible(self, transfer, source_mapping, dest_mapping):
+    # Bandeau des notifications de TEST : impossible de le confondre avec un
+    # vrai bon à préparer.
+    BANDEAU_TEST = (
+        '<div style="background:#DC2626;color:#FFFFFF;font-size:16px;font-weight:800;'
+        'padding:14px 16px;border-radius:8px;margin-bottom:14px;text-align:center;">'
+        '⚠️ CECI EST UN TEST — NE FAITES RIEN<br/>'
+        '<span style="font-weight:600;font-size:13px;">Les magasins n\'ont rien reçu.</span></div>'
+    )
+
+    @http.route('/mavie/api/transfer-notif-test', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_transfer_notif_test(self, **kw):
+        """DEMANDE UTILISATRICE (2026-09-23) : voir à quoi ressemble la
+        notification d'un transfert sans déranger les responsables de
+        magasin. On renvoie EXACTEMENT le même message (bon PDF compris),
+        mais au seul utilisateur connecté et coiffé d'un bandeau rouge
+        « ceci est un test ». Rien n'est créé ni modifié dans Odoo."""
+        try:
+            transfer = request.env['inter.internal.transfer'].sudo().browse(
+                int(kw.get('transfer_id') or 0)).exists()
+            if not transfer:
+                return {'error': 'Transfert introuvable.'}
+            mappings = self._get_active_shop_mappings()
+
+            def mapping_de(location):
+                wh = location.warehouse_id
+                return mappings.filtered(lambda m: m.warehouse_id == wh)[:1] if wh else mappings.browse()
+
+            source = mapping_de(transfer.location_source_id)
+            dest = mapping_de(transfer.location_target_id)
+            if not source or not dest:
+                return {'error': "Ce bon ne pointe pas sur deux magasins connus du dashboard."}
+            notified, warning = self._notify_transfer_responsible(
+                transfer, source, dest, test_partner=request.env.user.partner_id)
+            return {'ok': True, 'transfert': transfer.name, 'destinataire': request.env.user.name,
+                    'messages': len(notified.get('source') or []) + len(notified.get('dest') or []),
+                    'warning': warning}
+        except Exception as e:
+            _logger.error(f"Erreur api_transfer_notif_test: {str(e)}", exc_info=True)
+            return {'error': str(e)}
+
+    def _notify_transfer_responsible(self, transfer, source_mapping, dest_mapping,
+                                     test_partner=None):
         """Notifie les responsables des deux magasins dans Odoo UNIQUEMENT
         (boîte de réception, jamais d'email — voir mail_thread_ext.py), bon de
         transfert PDF en pièce jointe.
@@ -5048,9 +5108,13 @@ class MaVieDashboardController(http.Controller):
 
         source_managers = source_mapping._get_store_managers()
         dest_all = dest_mapping._get_store_managers()
+        if test_partner:
+            # Mode test : personne d'autre ne reçoit rien, et les deux
+            # messages (préparer / réceptionner) partent à l'utilisateur.
+            source_managers = dest_all = request.env.user
         # Un même utilisateur responsable des deux magasins ne reçoit que la
         # notification « à préparer », qui contient déjà tout.
-        dest_managers = dest_all - source_managers
+        dest_managers = dest_all if test_partner else dest_all - source_managers
 
         notified = {'source': [], 'dest': []}
         warnings = [
@@ -5116,10 +5180,26 @@ class MaVieDashboardController(http.Controller):
             f"<p><strong>Transfert {escape(transfer.name)}</strong> : "
             f"<strong>{source_label}</strong> → <strong>{dest_label}</strong></p>"
         )
+        if test_partner:
+            route_txt = self.BANDEAU_TEST + route_txt
         items_txt = f"<ul>{''.join(lines_txt)}</ul>"
         # Boîte de réception Odoo uniquement, même pour les utilisateurs réglés
         # sur « Notification par email » (demande utilisateur).
-        mail_thread = request.env['mail.thread'].sudo().with_context(mavie_notify_inbox_only=True)
+        mail_thread = request.env['mail.thread'].sudo().with_context(
+            mavie_notify_inbox_only=True,
+            # Mode test : l'utilisatrice est à la fois à l'origine du message et
+            # sa destinataire. Odoo n'envoie jamais à l'utilisateur courant
+            # (`real_author_id` dans mail_thread._notify_get_recipients), d'où
+            # « je n'ai rien reçu » le 2026-09-23 : on lève ce garde-fou, mais
+            # seulement pour le test.
+            mail_notify_author=bool(test_partner),
+        )
+        # Mode test : l'utilisatrice est destinataire. Odoo ne notifie jamais
+        # l'auteur de son propre message — sans changer d'auteur, le message
+        # était créé mais n'apparaissait pas dans la cloche (constaté le
+        # 2026-09-23 : « je n'ai rien reçu »). On le fait donc signer par
+        # OdooBot.
+        extra = {'author_id': request.env.ref('base.partner_root').id} if test_partner else {}
 
         # Markup() : sans ça, Odoo traite le corps comme du texte brut et
         # échappe les balises — le responsable reçoit « &lt;p&gt;… » au lieu
@@ -5127,7 +5207,7 @@ class MaVieDashboardController(http.Controller):
         if source_managers:
             mail_thread.message_notify(
                 partner_ids=source_managers.mapped('partner_id').ids,
-                subject=f"Transfert {transfer.name} à préparer — {_label(source_mapping)}",
+                subject=('[TEST] ' if test_partner else '') + f"Transfert {transfer.name} à préparer — {_label(source_mapping)}",
                 body=Markup(
                     f"{route_txt}"
                     f"<p>Marchandise {where_txt}. Le bon de transfert est joint en PDF.</p>"
@@ -5136,12 +5216,13 @@ class MaVieDashboardController(http.Controller):
                 model=model,
                 res_id=res_id,
                 attachments=attachments,
+                **extra,
             )
             notified['source'] = source_managers.mapped('name')
         if dest_managers:
             mail_thread.message_notify(
                 partner_ids=dest_managers.mapped('partner_id').ids,
-                subject=f"Transfert {transfer.name} à réceptionner — {_label(dest_mapping)}",
+                subject=('[TEST] ' if test_partner else '') + f"Transfert {transfer.name} à réceptionner — {_label(dest_mapping)}",
                 body=Markup(
                     f"{route_txt}"
                     f"<p>Marchandise en route vers votre magasin : à contrôler à la "
@@ -5151,8 +5232,32 @@ class MaVieDashboardController(http.Controller):
                 model=model,
                 res_id=res_id,
                 attachments=attachments,
+                **extra,
             )
             notified['dest'] = dest_managers.mapped('name')
+
+        # CONSTAT UTILISATRICE (2026-09-23) : en ouvrant le bon depuis la
+        # cloche, sa conversation était VIDE. C'est Odoo : message_notify
+        # crée des messages de type « user_notification », que le chatter
+        # d'un document n'affiche jamais (domaine de message_ids). On écrit
+        # donc aussi une note sur le bon lui-même, bon PDF joint : le
+        # responsable retrouve la consigne là où il travaille. Sans
+        # destinataire : aucune notification en double.
+        try:
+            document = request.env[model].sudo().browse(res_id).exists()
+            if document and hasattr(document, 'message_post'):
+                document.with_context(mail_notify_author=False).message_post(
+                    body=Markup(
+                        f"{route_txt}"
+                        f"<p>Marchandise {where_txt}. Bon de transfert en PDF ci-joint.</p>"
+                        f"{items_txt}"
+                    ),
+                    subject=('[TEST] ' if test_partner else '') + f"Transfert {transfer.name}",
+                    subtype_xmlid='mail.mt_note',
+                    attachments=attachments,
+                )
+        except Exception as e:  # une note manquante ne doit jamais bloquer
+            _logger.warning("Note sur le bon de transfert impossible : %s", e)
         return notified, ' '.join(warnings) or None
 
     @http.route('/mavie/api/transfer-suggestions', type='json', auth='user', methods=['POST'], csrf=False)
@@ -5317,6 +5422,127 @@ class MaVieDashboardController(http.Controller):
             _logger.error(f"Erreur api_transfer_variant_stock: {str(e)}", exc_info=True)
             return {'error': str(e), 'variants': []}
 
+    def _mouvements_couleur(self, variant_ids):
+        """Ce qui s'est passé sur ces variantes, magasin par magasin.
+
+        DEMANDE UTILISATRICE (2026-09-23) : dans « Stock par magasin — cette
+        couleur », voir d'où vient le stock au lieu d'un nombre gris —
+        transfert reçu ou envoyé, réassort, vente en solde.
+
+        {wh_id: {'entree': n, 'sortie': n, 'reassort': n, 'attente': n,
+                 'solde': n, 'details': [texte, …]}}
+          - entree / sortie : pièces d'un bon de transfert DÉJÀ FAIT
+            (stock déplacé). 'attente' compte les pièces d'un bon encore à
+            valider : le stock n'a pas encore bougé, c'est dit en clair.
+          - reassort : transfert lancé depuis la fenêtre Réassort.
+          - solde : pièces vendues en caisse sous le prix catalogue.
+        """
+        variant_ids = list(variant_ids or [])
+        out = {}
+        if not variant_ids:
+            return out
+
+        def acc(wh):
+            return out.setdefault(wh, {'entree': 0, 'sortie': 0, 'reassort': 0,
+                                       'attente': 0, 'solde': 0, 'details': [], 'lignes': []})
+
+        request.env.cr.execute("""
+            SELECT t.name, t.state, COALESCE(t.origin, '') = %(orig)s,
+                   ls.warehouse_id, ld.warehouse_id,
+                   SUM(l.quantity), MAX(t.create_date),
+                   MAX(ws.name), MAX(wd.name),
+                   MAX(po.name), MAX(pk.name)
+              FROM inter_internal_transfer_line l
+              JOIN inter_internal_transfer t ON t.id = l.transfer_id
+              LEFT JOIN stock_location ls ON ls.id = t.location_source_id
+              LEFT JOIN stock_location ld ON ld.id = t.location_target_id
+              LEFT JOIN stock_warehouse ws ON ws.id = ls.warehouse_id
+              LEFT JOIN stock_warehouse wd ON wd.id = ld.warehouse_id
+              LEFT JOIN purchase_order po ON po.id = t.purchase_id
+              LEFT JOIN stock_picking pk ON pk.id = t.picking_id
+             WHERE l.product_id = ANY(%(pids)s)
+               AND COALESCE(t.state, 'draft') != 'draft'
+             GROUP BY 1, 2, 3, 4, 5
+             ORDER BY 7 DESC
+        """, {'pids': variant_ids, 'orig': self.REASSORT_ORIGINE})
+        for (nom, etat, est_reassort, wh_src, wh_dst, qte, date,
+             nom_src, nom_dst, nom_po, nom_picking) in request.env.cr.fetchall():
+            qte = int(round(qte or 0))
+            fait = etat == 'done'
+            quoi = 'Réassort' if est_reassort else 'Transfert'
+            quand = str(date)[:10] if date else ''
+            for wh, signe in ((wh_dst, 1), (wh_src, -1)):
+                if not wh:
+                    continue
+                a = acc(wh)
+                if not fait:
+                    a['attente'] += qte
+                elif signe > 0:
+                    a['reassort' if est_reassort else 'entree'] += qte
+                else:
+                    a['sortie'] += qte
+                # Les anciens bons inter-sociétés n'ont pas de numéro
+                # (name = « New ») : ne pas l'afficher tel quel.
+                # Les anciens bons inter-sociétés n'ont pas de numéro propre
+                # (name = « New ») : on montre alors le document Odoo qui
+                # porte le mouvement — bon d'achat miroir ou opération.
+                libelle_bon = (nom if nom and nom != 'New' else None) or nom_po or nom_picking or 'sans numéro'
+                a['details'].append('%s %s%s pcs · %s · %s%s' % (
+                    quoi, '+' if signe > 0 else '−', qte, libelle_bon, quand,
+                    '' if fait else ' · EN ATTENTE de validation, stock pas encore déplacé'))
+                # Lignes détaillées pour le tableau dépliable du pop-up
+                # couleur (demande utilisatrice 2026-09-23 : « je dois avoir
+                # le détail : date, reçu ou envoyé, magasin »).
+                a['lignes'].append({
+                    'date': quand,
+                    'sens': 'recu' if signe > 0 else 'envoye',
+                    'quoi': quoi,
+                    'qty': qte,
+                    'bon': libelle_bon,
+                    'avec': (nom_src if signe > 0 else nom_dst) or '—',
+                    'etat': 'Fait' if fait else 'En attente de validation',
+                    'fait': fait,
+                })
+
+        # Vendu en solde : prix réellement payé sous le prix catalogue.
+        request.env.cr.execute("""
+            SELECT spt.warehouse_id, SUM(pol.qty), MAX(po.date_order)
+              FROM pos_order_line pol
+              JOIN pos_order po ON po.id = pol.order_id
+              JOIN pos_session ps ON ps.id = po.session_id
+              JOIN pos_config pc ON pc.id = ps.config_id
+              JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+              JOIN product_product pp ON pp.id = pol.product_id
+              JOIN product_template pt ON pt.id = pp.product_tmpl_id
+             WHERE pol.product_id = ANY(%(pids)s)
+               AND po.state IN ('paid', 'done', 'invoiced')
+               AND pt.list_price > 0
+               AND pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0) < pt.list_price * 0.999
+             GROUP BY 1
+        """, {'pids': variant_ids})
+        for wh, qte, derniere in request.env.cr.fetchall():
+            if not wh:
+                continue
+            a = acc(wh)
+            a['solde'] = int(round(qte or 0))
+            if not a['solde']:
+                # Ventes en solde annulées par des retours : rien à montrer.
+                continue
+            a['details'].append('Vendu en solde %s pcs · dernière vente %s' % (
+                a['solde'], str(derniere)[:10] if derniere else '—'))
+            a['lignes'].append({'date': str(derniere)[:10] if derniere else '',
+                                'sens': 'solde', 'quoi': 'Vendu en solde', 'qty': a['solde'],
+                                'bon': '—', 'avec': 'caisse', 'etat': 'Fait', 'fait': True})
+        # Infobulle lisible : les 8 mouvements les plus récents suffisent.
+        for a in out.values():
+            a['lignes'].sort(key=lambda x: x['date'], reverse=True)
+            a['lignes'] = a['lignes'][:40]
+            if len(a['details']) > 8:
+                reste = len(a['details']) - 8
+                a['details'] = a['details'][:8] + ['… et %d autre%s mouvement%s' % (
+                    reste, 's' if reste > 1 else '', 's' if reste > 1 else '')]
+        return out
+
     @http.route('/mavie/api/color-stock-by-store', type='json', auth='user', methods=['POST'], csrf=False)
     def api_color_stock_by_store(self, **kw):
         """Stock disponible d'UNE couleur d'un produit, détaillé par magasin
@@ -5360,7 +5586,20 @@ class MaVieDashboardController(http.Controller):
             )
             inside_set = set(inside_ids)
 
+            # Ce qui s'est passé dans chaque magasin pour cette couleur.
+            mouvements = self._mouvements_couleur(color_variants.ids)
             mappings = self._get_active_shop_mappings()
+            # CORRIGÉ (2026-09-23, « il n'affiche plus le stock ») : avec
+            # MOD FOR LIFE seule cochée, aucun magasin n'entre dans le
+            # périmètre et le tableau restait vide, alors que la carte
+            # « Stock total » affichait les pièces du dépôt. Aucun magasin
+            # en périmètre : on montre tout le réseau et on le dit.
+            note = ''
+            if not any(m.warehouse_id and m.warehouse_id.lot_stock_id
+                       and m.warehouse_id.lot_stock_id.id in inside_set for m in mappings):
+                inside_set |= {m.warehouse_id.lot_stock_id.id for m in mappings
+                               if m.warehouse_id and m.warehouse_id.lot_stock_id}
+                note = 'Aucun magasin dans cette société : tout le réseau est affiché.'
             stores = []
             total_reseau = 0.0
             # DEMANDE UTILISATEUR (2026-09-07) : un stock negatif n'est pas
@@ -5406,15 +5645,43 @@ class MaVieDashboardController(http.Controller):
                     'city': m.city or '—',
                     'stock_total': int(round(total)),
                     'by_size': {k: int(round(v)) for k, v in by_size.items() if abs(v) >= 0.01},
+                    'mouvements': mouvements.get(m.warehouse_id.id) or {},
                 })
 
             # Plus gros stock en premier — facilite le choix d'un magasin
             # source pour un futur transfert de cette couleur.
             stores.sort(key=lambda s: -s['stock_total'])
 
+            # Le dépôt MOD FOR LIFE n'est pas un magasin (aucun mapping) mais
+            # c'est lui qui alimente le réassort : sa ligne manquait.
+            mfl = request.env['res.company'].sudo().search(
+                [('name', '=', 'MOD FOR LIFE')], limit=1)
+            if mfl:
+                depot_quants = request.env['stock.quant'].sudo().search([
+                    ('product_id', 'in', color_variants.ids),
+                    ('location_id.usage', '=', 'internal'),
+                    ('company_id', '=', mfl.id),
+                ])
+                depot_total = sum(depot_quants.mapped('quantity'))
+                if depot_total:
+                    depot_sizes = {}
+                    for q in depot_quants:
+                        t = size_by_variant.get(q.product_id.id, '—')
+                        depot_sizes[t] = depot_sizes.get(t, 0.0) + q.quantity
+                    stores.insert(0, {
+                        'shop_field': None,
+                        'shop_label': 'DÉPÔT MOD FOR LIFE',
+                        'city': '—',
+                        'stock_total': int(round(depot_total)),
+                        'by_size': {k: int(round(v)) for k, v in depot_sizes.items() if abs(v) >= 0.01},
+                        'mouvements': {},
+                        'depot': True,
+                    })
+
             return {
                 'color': color,
                 'stores': stores,
+                'note': note,
                 # Ce qu'il y a vraiment en rayon : somme des stocks positifs.
                 'stock_present': int(round(total_present)),
                 # Les stocks negatifs, isoles : ce sont des anomalies
@@ -5686,7 +5953,8 @@ class MaVieDashboardController(http.Controller):
                 ('location_id.usage', '=', 'internal'),
                 ('company_id', '=', company.id),
             ]
-            quant_domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+            # Même règle que la table principale : on compte comme Odoo
+            # (sachets, articles archivés et stocks négatifs compris).
             if product_tmpl_ids is not None:
                 variant_ids = request.env['product.product'].sudo().search(
                     [('product_tmpl_id', 'in', product_tmpl_ids)]
@@ -5695,8 +5963,9 @@ class MaVieDashboardController(http.Controller):
 
             grouped = self._group_sums(
                 'stock.quant', quant_domain, ['quantity'],
-                group_fields=('product_id', 'location_id'),
+                group_fields=('product_id', 'location_id'), ctx={'active_test': False},
             )
+            autres = {'qty': 0, 'valeur_ht': 0.0, 'valeur_cost': 0.0}
 
             # Emplacement -> entrepôt : résolu une fois pour toutes, pas une
             # requête par emplacement.
@@ -5715,7 +5984,8 @@ class MaVieDashboardController(http.Controller):
             prod_map = {}
             if pids:
                 prod_map = {
-                    p['id']: p for p in request.env['product.product'].sudo().search_read(
+                    p['id']: p for p in request.env['product.product'].sudo().with_context(
+                        active_test=False).search_read(
                         [('id', 'in', pids)], ['id', 'list_price', 'standard_price', 'product_tmpl_id'])
                 }
 
@@ -5759,10 +6029,17 @@ class MaVieDashboardController(http.Controller):
                 pid = g['product_id'][0] if g.get('product_id') else None
                 loc_id = g['location_id'][0] if g.get('location_id') else None
                 qty = g.get('quantity') or 0.0
-                if qty <= 0 or pid not in prod_map:
+                if not qty or pid not in prod_map:
                     continue
                 wh = wh_by_location.get(loc_id)
                 if not wh:
+                    # Emplacement hors entrepôt suivi (ex. « MMV/MAGASIN
+                    # MARINA AGAD - VETEMENTS », −1 628) : gardé à part, sinon
+                    # le détail ne retombe pas sur le total de la société.
+                    autres['qty'] += int(qty)
+                    p_data = prod_map[pid]
+                    autres['valeur_ht'] += qty * (p_data.get('list_price') or 0.0)
+                    autres['valeur_cost'] += qty * (p_data.get('standard_price') or 0.0)
                     continue
                 p_data = prod_map[pid]
                 cost_price = p_data.get('standard_price') or 0.0
@@ -5788,6 +6065,11 @@ class MaVieDashboardController(http.Controller):
                 }
                 for v in by_warehouse.values()
             ]
+            if autres['qty'] or autres['valeur_ht']:
+                magasins.append({'name': 'Autres emplacements',
+                                 'qty': autres['qty'],
+                                 'valeur_ht': round(autres['valeur_ht'], 2),
+                                 'valeur_cost': round(autres['valeur_cost'], 2)})
             magasins.sort(key=lambda m: -m['valeur_ht'])
 
             return {
@@ -6870,6 +7152,180 @@ class MaVieDashboardController(http.Controller):
             domain.append(('location_id', 'child_of', lot_ids))
         return domain
 
+    # Régions : regroupement de villes, propre au dashboard (aucun champ
+    # « région » n'existe sur les magasins — vérifié en base le 2026-09-23).
+    ACTION_REGIONS = {
+        'Grand Casablanca': ['Casablanca', 'Mohammadia'],
+        'Rabat-Salé': ['Rabat', 'Témara'],
+        'Souss (Agadir)': ['Agadir'],
+        'Nord (Tanger)': ['Tanger'],
+    }
+
+    def _action_magasins_filtres(self, kw):
+        """Magasins retenus par les filtres ville / région / magasin."""
+        mappings = self._get_active_shop_mappings()
+        villes = [v for v in (kw.get('villes') or []) if v]
+        regions = [r for r in (kw.get('regions') or []) if r]
+        champs = [m for m in (kw.get('magasins') or []) if m]
+        for region in regions:
+            villes += self.ACTION_REGIONS.get(region, [])
+        if not villes and not champs:
+            return {'actif': False, 'config_ids': [], 'wh_ids': [], 'lot_ids': [], 'libelle': ''}
+        choisis = mappings.filtered(
+            lambda m: (m.shop_field in champs) or ((m.city or '').strip() in villes))
+        configs = request.env['pos.config'].sudo().browse()
+        for m in choisis:
+            configs |= self._solde_store_configs(m)
+        libelle = ', '.join(regions + [v for v in villes if v not in sum(
+            [self.ACTION_REGIONS.get(r, []) for r in regions], [])]
+            + [m.shop_label or m.warehouse_id.name for m in choisis if m.shop_field in champs])
+        return {
+            'actif': True,
+            'config_ids': configs.ids,
+            'wh_ids': choisis.mapped('warehouse_id').ids,
+            'lot_ids': choisis.mapped('warehouse_id.lot_stock_id').ids,
+            'libelle': libelle,
+        }
+
+    def _action_lieux(self):
+        """Villes, régions et magasins proposés dans la barre de recherche."""
+        mappings = self._get_active_shop_mappings()
+        villes = sorted({(m.city or '').strip() for m in mappings if (m.city or '').strip()})
+        return {
+            'regions': [r for r, v in self.ACTION_REGIONS.items()
+                        if any(ville in villes for ville in v)],
+            'villes': villes,
+            'magasins': [{'shop_field': m.shop_field,
+                          'nom': m.warehouse_id.name or m.shop_label or m.shop_field,
+                          'ville': (m.city or '').strip()}
+                         for m in mappings.sorted(lambda m: m.warehouse_id.name or '')],
+        }
+
+    def _transferts_references(self, tmpl_ids, wh_ids=None):
+        """Pièces reçues et envoyées par transfert, par référence.
+
+        DEMANDE UTILISATRICE (2026-09-23) : une colonne « Transferts » dans
+        le tableau Action, avec le reçu et l'envoyé, et l'historique complet
+        au clic. Quand un magasin (ou une ville / région) est filtré, on ne
+        compte que ses entrées et sorties ; sans filtre, on compte tout le
+        réseau — reçu et envoyé sont alors égaux, puisque chaque bon a un
+        expéditeur et un destinataire.
+        """
+        tmpl_ids = [t for t in tmpl_ids if t]
+        if not tmpl_ids:
+            return {}
+        params = {'tmpls': tmpl_ids}
+        filtre_wh = ''
+        if wh_ids:
+            filtre_wh = ' AND (ls.warehouse_id = ANY(%(wh)s) OR ld.warehouse_id = ANY(%(wh)s))'
+            params['wh'] = list(wh_ids)
+        request.env.cr.execute("""
+            SELECT pp.product_tmpl_id, ls.warehouse_id, ld.warehouse_id, SUM(l.quantity)
+              FROM inter_internal_transfer_line l
+              JOIN inter_internal_transfer t ON t.id = l.transfer_id
+              JOIN product_product pp ON pp.id = l.product_id
+              LEFT JOIN stock_location ls ON ls.id = t.location_source_id
+              LEFT JOIN stock_location ld ON ld.id = t.location_target_id
+             WHERE pp.product_tmpl_id = ANY(%(tmpls)s)
+               AND COALESCE(t.state, 'draft') != 'draft'
+               {WH}
+             GROUP BY 1, 2, 3
+        """.replace('{WH}', filtre_wh), params)
+        scope = set(wh_ids or ())
+        out = {}
+        for tid, wh_src, wh_dst, qte in request.env.cr.fetchall():
+            d = out.setdefault(tid, {'recu': 0, 'envoye': 0, 'pieces': 0,
+                                     'magasins_recu': set(), 'magasins_envoye': set(),
+                                     'scope': bool(scope)})
+            qte = int(round(qte or 0))
+            d['pieces'] += qte
+            if wh_dst:
+                d['magasins_recu'].add(wh_dst)
+            if wh_src:
+                d['magasins_envoye'].add(wh_src)
+            # CORRIGÉ (2026-09-24) : sans magasin filtré, reçu et envoyé
+            # étaient forcément égaux — tout bon a un départ ET une arrivée
+            # dans le réseau (vérifié : 3 580 lignes, aucune hors réseau).
+            # On ne les calcule donc que dans un périmètre choisi.
+            if scope:
+                if wh_dst and wh_dst in scope:
+                    d['recu'] += qte
+                if wh_src and wh_src in scope:
+                    d['envoye'] += qte
+        for d in out.values():
+            d['nb_magasins_recu'] = len(d.pop('magasins_recu'))
+            d['nb_magasins_envoye'] = len(d.pop('magasins_envoye'))
+        return out
+
+    @http.route('/mavie/api/transferts-reference', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_transferts_reference(self, **kw):
+        """Historique complet des transferts d'une référence : un bon par
+        ligne, avec date, magasins, quantité, état et document Odoo."""
+        try:
+            tmpl = request.env['product.template'].sudo().browse(int(kw.get('article_id') or 0))
+            if not tmpl.exists():
+                return {'error': 'Référence introuvable.'}
+            etats = {'draft': 'Brouillon', 'submitted': 'En attente de validation',
+                     'transmitted': "Transmis à l'inventaire", 'done': 'Fait'}
+            request.env.cr.execute("""
+                SELECT t.id, t.name, t.state, t.create_date, COALESCE(t.origin, '') = %(orig)s,
+                       ws.name, wd.name, SUM(l.quantity), po.name, pk.name,
+                       cs.name, ct.name
+                  FROM inter_internal_transfer_line l
+                  JOIN inter_internal_transfer t ON t.id = l.transfer_id
+                  JOIN product_product pp ON pp.id = l.product_id
+                  LEFT JOIN stock_location ls ON ls.id = t.location_source_id
+                  LEFT JOIN stock_location ld ON ld.id = t.location_target_id
+                  LEFT JOIN stock_warehouse ws ON ws.id = ls.warehouse_id
+                  LEFT JOIN stock_warehouse wd ON wd.id = ld.warehouse_id
+                  LEFT JOIN purchase_order po ON po.id = t.purchase_id
+                  LEFT JOIN stock_picking pk ON pk.id = t.picking_id
+                  LEFT JOIN res_company cs ON cs.id = t.company_source_id
+                  LEFT JOIN res_company ct ON ct.id = t.company_target_id
+                 WHERE pp.product_tmpl_id = %(tmpl)s
+                 GROUP BY t.id, t.name, t.state, t.create_date, t.origin,
+                          ws.name, wd.name, po.name, pk.name, cs.name, ct.name
+                 ORDER BY t.create_date DESC
+                 LIMIT 300
+            """, {'tmpl': tmpl.id, 'orig': self.REASSORT_ORIGINE})
+            lignes = []
+            for (tid, nom, etat, date, est_reassort, src, dst, qte, po, pk,
+                 soc_src, soc_dst) in request.env.cr.fetchall():
+                lignes.append({
+                    'id': tid,
+                    'bon': (nom if nom and nom != 'New' else None) or po or pk or 'sans numéro',
+                    'date': str(date)[:10] if date else '',
+                    'source': src or '—',
+                    'dest': dst or '—',
+                    'societes': ('%s → %s' % (soc_src or '—', soc_dst or '—')),
+                    'qty': int(round(qte or 0)),
+                    'etat': etats.get(etat, etat or ''),
+                    'fait': etat == 'done',
+                    'reassort': bool(est_reassort),
+                })
+            # Ce qui s'est vraiment passé, magasin par magasin : un magasin
+            # peut recevoir sans jamais envoyer, et l'inverse (demande
+            # utilisatrice 2026-09-24).
+            par_magasin = {}
+            for l in lignes:
+                if l['dest'] and l['dest'] != '—':
+                    par_magasin.setdefault(l['dest'], {'magasin': l['dest'], 'recu': 0, 'envoye': 0})['recu'] += l['qty']
+                if l['source'] and l['source'] != '—':
+                    par_magasin.setdefault(l['source'], {'magasin': l['source'], 'recu': 0, 'envoye': 0})['envoye'] += l['qty']
+            magasins = sorted(par_magasin.values(), key=lambda m: -(m['recu'] + m['envoye']))
+            for m in magasins:
+                m['net'] = m['recu'] - m['envoye']
+            return {
+                'reference': tmpl.base_pivot_reference or tmpl.default_code or tmpl.name,
+                'nom': tmpl.name,
+                'lignes': lignes,
+                'magasins': magasins,
+                'total_pieces': sum(l['qty'] for l in lignes),
+            }
+        except Exception as e:
+            _logger.error(f"Erreur api_transferts_reference: {str(e)}", exc_info=True)
+            return {'error': str(e)}
+
     @http.route('/mavie/api/actions', type='json', auth='user', methods=['POST'], csrf=False)
     def api_actions(self, **kw):
         try:
@@ -6895,6 +7351,18 @@ class MaVieDashboardController(http.Controller):
             if not product_tmpl_ids:
                 return {'rows': [], 'total': 0, 'limit': limit}
 
+        # Filtres ville / région / magasin de la barre de recherche
+        # (demande utilisatrice 2026-09-23) : ils restreignent les ventes,
+        # les achats et le stock aux magasins retenus.
+        mags = self._action_magasins_filtres(kw)
+        pos_dom = self._build_pos_domain(kw, product_tmpl_ids)
+        achat_dom = self._build_purchase_domain(kw, product_tmpl_ids)
+        quant_dom = self._action_quant_domain(kw, product_tmpl_ids)
+        if mags['actif']:
+            pos_dom = pos_dom + [('order_id.session_id.config_id', 'in', mags['config_ids'] or [-1])]
+            achat_dom = achat_dom + [('order_id.picking_type_id.warehouse_id', 'in', mags['wh_ids'] or [-1])]
+            quant_dom = quant_dom + [('location_id', 'child_of', mags['lot_ids'] or [-1])]
+
         # ── Par variante : ventes, achats, stock magasins, stock dépôt.
         par_variante = {}
 
@@ -6903,7 +7371,7 @@ class MaVieDashboardController(http.Controller):
                 'qty_sold': 0.0, 'ca': 0.0, 'qty_purchased': 0.0,
                 'ca_achat': 0.0, 'stock': 0.0, 'depot': 0.0})
 
-        for g in self._group_sums('pos.order.line', self._build_pos_domain(kw, product_tmpl_ids),
+        for g in self._group_sums('pos.order.line', pos_dom,
                                   ['price_subtotal_incl', 'qty']):
             if g.get('product_id'):
                 x = v(g['product_id'][0])
@@ -6919,15 +7387,13 @@ class MaVieDashboardController(http.Controller):
                     x = v(g['product_id'][0])
                     x['qty_sold'] += g.get('product_uom_qty') or 0.0
                     x['ca'] += g.get('price_total') or 0.0
-        for g in self._group_sums('purchase.order.line',
-                                  self._build_purchase_domain(kw, product_tmpl_ids),
+        for g in self._group_sums('purchase.order.line', achat_dom,
                                   ['qty_received', 'price_total']):
             if g.get('product_id'):
                 x = v(g['product_id'][0])
                 x['qty_purchased'] += g.get('qty_received') or 0.0
                 x['ca_achat'] += g.get('price_total') or 0.0
-        for g in self._group_sums('stock.quant', self._action_quant_domain(kw, product_tmpl_ids),
-                                  ['quantity']):
+        for g in self._group_sums('stock.quant', quant_dom, ['quantity']):
             if g.get('product_id'):
                 v(g['product_id'][0])['stock'] += g.get('quantity') or 0.0
 
@@ -7041,6 +7507,8 @@ class MaVieDashboardController(http.Controller):
         tmpl_by_id = {t.id: t for t in tmpls}
         images = self._image_availability({t['id'] for t in page})
         actions = self._actions_references([t['id'] for t in page])
+        transferts = self._transferts_references(
+            [t['id'] for t in page], mags['wh_ids'] if mags['actif'] else None)
         company = request.env.company
 
         def arrondi(d):
@@ -7082,10 +7550,14 @@ class MaVieDashboardController(http.Controller):
                 'variantes': variantes,
                 'niveau': t['niveau'],
                 'actions': self._actions_resume(actions.get(t['id'])),
+                'transferts': transferts.get(t['id']) or {
+                    'recu': 0, 'envoye': 0, 'pieces': 0, 'scope': mags['actif'],
+                    'nb_magasins_recu': 0, 'nb_magasins_envoye': 0},
             })
             rows.append(row)
         return {'rows': rows, 'total': total, 'nb_references': len(refs), 'limit': limit,
-                'perimetre': self._action_perimetre(kw),
+                'perimetre': self._action_perimetre(kw) + (' · ' + mags['libelle'] if mags['actif'] else ''),
+                'lieux': self._action_lieux(),
                 'societes': self._action_societes_cochees(),
                 'societe_id': getattr(request, '_mavie_societe_id', None)}
 
@@ -7127,6 +7599,470 @@ class MaVieDashboardController(http.Controller):
         if len(noms) == 1:
             return 'société ' + noms[0]
         return 'toutes les sociétés cochées (%d)' % len(noms)
+
+    # ─────────────────────────────────────────────────────────────
+    # RÉASSORT D'UNE RÉFÉRENCE (bouton de la page Action)
+    #
+    # DEMANDE UTILISATRICE (2026-09-24) : « je dois faire le réassort depuis
+    # Action ». La fenêtre ne montrait que les magasins EN ALERTE — souvent
+    # aucun, d'où un écran vide. Elle montre désormais TOUS les magasins,
+    # avec leur stock, leurs ventes et ce que le dépôt peut envoyer, et deux
+    # boutons qui préparent les documents Odoo :
+    #   • dépôt vide      → BON D'ACHAT fournisseur dans MOD FOR LIFE ;
+    #   • dépôt servi     → BON DE VENTE inter-sociétés MOD FOR LIFE → société.
+    # Les deux sont créés EN BROUILLON (devis) : rien n'est confirmé ni
+    # livré sans validation dans Odoo.
+    # ─────────────────────────────────────────────────────────────
+
+    def _reassort_variantes(self, tmpl, couleur):
+        if couleur:
+            return self._solde_variantes_couleur(tmpl, couleur)
+        return tmpl.product_variant_ids
+
+    @http.route('/mavie/api/reassort-article', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_reassort_article(self, **kw):
+        """Tous les magasins pour cette référence (ou cette couleur) :
+        stock, vendu sur la fenêtre, et proposition d'envoi depuis le dépôt."""
+        try:
+            tmpl = request.env['product.template'].sudo().browse(int(kw.get('article_id') or 0))
+            if not tmpl.exists():
+                return {'error': 'Référence introuvable.'}
+            couleur = (kw.get('couleur') or '').strip()
+            variantes = self._reassort_variantes(tmpl, couleur)
+            if not variantes:
+                return {'error': 'Aucune variante pour cette référence.'}
+            p = self._reassort_params(kw)
+            warehouses, wh_labels = self._reassort_warehouses(kw)
+            mfl = request.env['res.company'].sudo().search([('name', '=', 'MOD FOR LIFE')], limit=1)
+            ref_date = self._reassort_reference_date(warehouses.ids)
+            debut = ref_date - timedelta(days=p['fenetre'] - 1)
+            params = {
+                'vids': variantes.ids,
+                'wh': warehouses.ids or [-1],
+                'debut': datetime.combine(debut, datetime.min.time()),
+                'fin': datetime.combine(ref_date, datetime.max.time()),
+                'mfl': mfl.id if mfl else -1,
+            }
+            request.env.cr.execute("""
+                WITH stock AS (
+                    SELECT w.id AS wh_id, SUM(sq.quantity) AS q
+                      FROM stock_quant sq
+                      JOIN stock_location sl ON sl.id = sq.location_id
+                      JOIN stock_warehouse w ON w.id = ANY(%(wh)s)
+                      JOIN stock_location wl ON wl.id = w.lot_stock_id
+                     WHERE sq.product_id = ANY(%(vids)s)
+                       AND sl.parent_path LIKE wl.parent_path || '%%'
+                     GROUP BY 1
+                ), vendu AS (
+                    SELECT spt.warehouse_id AS wh_id, SUM(pol.qty) AS q
+                      FROM pos_order_line pol
+                      JOIN pos_order po ON po.id = pol.order_id
+                      JOIN pos_session ps ON ps.id = po.session_id
+                      JOIN pos_config pc ON pc.id = ps.config_id
+                      JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                     WHERE pol.product_id = ANY(%(vids)s)
+                       AND po.state IN ('paid', 'done', 'invoiced')
+                       AND po.date_order BETWEEN %(debut)s AND %(fin)s
+                     GROUP BY 1
+                ), recu AS (
+                    SELECT spt.warehouse_id AS wh_id, SUM(pol.qty_received) AS q
+                      FROM purchase_order_line pol
+                      JOIN purchase_order po ON po.id = pol.order_id
+                      JOIN stock_picking_type spt ON spt.id = po.picking_type_id
+                     WHERE pol.product_id = ANY(%(vids)s)
+                       AND po.state IN ('purchase', 'done')
+                     GROUP BY 1
+                )
+                SELECT w.id, COALESCE(s.q, 0), COALESCE(v.q, 0), COALESCE(r.q, 0)
+                  FROM stock_warehouse w
+                  LEFT JOIN stock s ON s.wh_id = w.id
+                  LEFT JOIN vendu v ON v.wh_id = w.id
+                  LEFT JOIN recu r ON r.wh_id = w.id
+                 WHERE w.id = ANY(%(wh)s)
+            """, params)
+            lignes_sql = request.env.cr.fetchall()
+
+            depot = 0
+            if mfl:
+                request.env.cr.execute("""
+                    SELECT COALESCE(SUM(sq.quantity), 0)
+                      FROM stock_quant sq
+                      JOIN stock_location sl ON sl.id = sq.location_id
+                     WHERE sq.product_id = ANY(%(vids)s)
+                       AND sl.usage = 'internal' AND sl.company_id = %(mfl)s
+                """, params)
+                depot = int(round(request.env.cr.fetchone()[0] or 0))
+
+            shop_par_wh = {m.warehouse_id.id: m for m in self._get_active_shop_mappings() if m.warehouse_id}
+            magasins = []
+            for wh_id, stock, vendu, recu in lignes_sql:
+                m = shop_par_wh.get(wh_id)
+                stock = int(round(stock or 0))
+                vendu = int(round(vendu or 0))
+                recu = int(round(recu or 0))
+                vitesse = vendu / float(p['fenetre']) if vendu else 0.0
+                # Besoin = de quoi tenir le délai de réappro au rythme actuel.
+                besoin = max(0, int(round(vitesse * p['delai'])) - max(stock, 0))
+                magasins.append({
+                    'wh_id': wh_id,
+                    'magasin': wh_labels.get(wh_id) or (m.warehouse_id.name if m else '—'),
+                    'shop_field': m.shop_field if m else None,
+                    'societe': m.company_id.name if m else '',
+                    'societe_id': m.company_id.id if m else None,
+                    'stock': stock,
+                    'vendu': vendu,
+                    'recu': recu,
+                    'besoin': besoin,
+                })
+            magasins.sort(key=lambda x: (-x['besoin'], -x['vendu'], x['magasin']))
+
+            # Répartition de ce que le dépôt peut réellement envoyer : les
+            # magasins qui vendent le plus vite d'abord.
+            reste = depot
+            for m in magasins:
+                envoi = min(m['besoin'], reste) if reste > 0 else 0
+                m['propose'] = envoi
+                reste -= envoi
+
+            fournisseur = self._reassort_fournisseur(tmpl)
+            return {
+                'article_id': tmpl.id,
+                'reference': tmpl.base_pivot_reference or tmpl.default_code or tmpl.name,
+                'nom': tmpl.name,
+                'couleur': couleur,
+                'depot': depot,
+                'fenetre': p['fenetre'],
+                'delai': p['delai'],
+                'magasins': magasins,
+                'besoin_total': sum(m['besoin'] for m in magasins),
+                'propose_total': sum(m['propose'] for m in magasins),
+                'manque_depot': max(0, sum(m['besoin'] for m in magasins) - depot),
+                'fournisseur': fournisseur['nom'],
+                'fournisseur_id': fournisseur['id'],
+            }
+        except Exception as e:
+            _logger.error(f"Erreur api_reassort_article: {str(e)}", exc_info=True)
+            return {'error': str(e)}
+
+    def _reassort_repartition_couleurs(self, tmpl, couleur, quantites_par_shop):
+        """{couleur: {shop_field: qté}} pour les lignes couleur du batch.
+
+        Une couleur choisie : tout va dessus. Sinon on répartit ce qui est
+        demandé sur les couleurs que le dépôt possède réellement (c'est lui
+        qui expédie), la mieux fournie d'abord."""
+        quantites = {k: v for k, v in quantites_par_shop.items() if v > 0}
+        if couleur:
+            return {couleur: quantites}
+        mfl = request.env['res.company'].sudo().search([('name', '=', 'MOD FOR LIFE')], limit=1)
+        stock_couleur = []
+        if mfl:
+            request.env.cr.execute("""
+                SELECT MAX(pav.name->>'en_US') AS couleur, SUM(sq.quantity) AS q
+                  FROM stock_quant sq
+                  JOIN stock_location sl ON sl.id = sq.location_id
+                  JOIN product_product pp ON pp.id = sq.product_id
+                  JOIN product_variant_combination pvc ON pvc.product_product_id = pp.id
+                  JOIN product_template_attribute_value ptav
+                    ON ptav.id = pvc.product_template_attribute_value_id
+                  JOIN product_attribute pa ON pa.id = ptav.attribute_id
+                  JOIN product_attribute_value pav ON pav.id = ptav.product_attribute_value_id
+                 WHERE pp.product_tmpl_id = %(tmpl)s
+                   AND sl.usage = 'internal' AND sl.company_id = %(mfl)s
+                   AND UPPER(pa.name->>'en_US') LIKE 'COULEUR%%'
+                 GROUP BY ptav.id
+                HAVING SUM(sq.quantity) > 0
+                ORDER BY 2 DESC
+            """, {'tmpl': tmpl.id, 'mfl': mfl.id})
+            stock_couleur = [(c.strip(), q) for c, q in request.env.cr.fetchall() if c]
+        if not stock_couleur:
+            # Le dépôt n'a rien (cas d'un achat fournisseur) : on prend les
+            # couleurs de la référence, la première suffit.
+            noms = []
+            for v in tmpl.product_variant_ids:
+                nom = (resolve_variant_color_size(v)[0] or '').strip()
+                if nom and nom not in noms:
+                    noms.append(nom)
+            return {noms[0] if noms else '—': quantites}
+        out = {}
+        for shop_field, qte in quantites.items():
+            reste = qte
+            for nom, dispo in stock_couleur:
+                if reste <= 0:
+                    break
+                part = min(int(dispo), reste)
+                if part <= 0:
+                    continue
+                out.setdefault(nom, {})[shop_field] = out.setdefault(nom, {}).get(shop_field, 0) + part
+                reste -= part
+            if reste > 0:  # plus de stock dépôt : le solde va sur la 1re couleur
+                nom = stock_couleur[0][0]
+                out.setdefault(nom, {})[shop_field] = out.setdefault(nom, {}).get(shop_field, 0) + reste
+        return out
+
+    def _reassort_code_pointures(self, tmpl, nom_couleur, qte):
+        """Code « 0 6 12 » d'une cellule magasin, Base Pivot « magasins
+        dynamiques ».
+
+        Pour un article à pointures, Base Pivot ne lit PAS la quantité de la
+        cellule : il décode `qty_raw_code`, un nombre par pointure, dans
+        l'ordre des pointures croissantes (_decode_shop_cell_pointures).
+        Sans ce code, la vente inter-sociétés ignore la cellule. Le réassort
+        raisonne en pièces par magasin : on les répartit sur les pointures
+        de la couleur avec la répartition de Base Pivot elle-même, pour que
+        l'ordre soit exactement le sien.
+        """
+        if 'mv.color.line.dispatch' not in request.env:
+            return ''
+        attr = request.env['product.attribute'].sudo().search(
+            [('name', '=', 'POINTURES')], limit=1)
+        if not attr:
+            return ''
+        coul = (nom_couleur or '').strip().upper()
+        variantes = []
+        for v in tmpl.sudo().product_variant_ids:
+            vals = v.product_template_attribute_value_ids
+            if not vals.filtered(lambda av, a=attr: av.attribute_id.id == a.id):
+                continue
+            noms = [(av.name or '').strip().upper() for av in vals
+                    if (av.attribute_id.name or '').upper().startswith('COULEUR')]
+            if coul and noms and coul not in noms:
+                continue
+            variantes.append(v)
+        if len(variantes) <= 1:
+            return ''
+        Batch = request.env['mv.article.batch'].sudo()
+        try:
+            triees = Batch._sorted_variants_by_pointure(variantes, attr)
+            parts = Batch._distribute_pieces_round_robin(qte, len(triees))
+        except Exception:
+            return ''
+        return ' '.join(str(int(p)) for p in parts)
+
+    def _reassort_batch_base_pivot(self, tmpl, couleur, quantites_par_shop, suffixe):
+        """Crée un batch Base Pivot pour ce réassort.
+
+        DEMANDE UTILISATRICE (2026-09-24) : « le réassort doit se faire dans
+        Base Pivot — générer achat fournisseur, ou générer ventes
+        inter-sociétés ». On ne recrée donc pas les documents à la main : on
+        prépare un batch (mv.article.batch) avec la référence en état
+        « Réassort » et les quantités par magasin sur les lignes couleur,
+        puis on appelle les boutons de Base Pivot.
+
+        Les champs magasin des lignes couleur portent le même nom que le
+        `shop_field` des mappings (salam_2, citymall, shop…), voir
+        SHOP_FIELDS dans mv_batch_shop_mapping.
+        """
+        # Deux versions de Base Pivot coexistent : l'historique, où la ligne
+        # couleur porte une colonne Float par magasin (salam_2, citymall…),
+        # et celle des « magasins dynamiques », où le dispatch est une ligne
+        # de mv.color.line.dispatch (color_line_id, shop_id, qty). On écrit
+        # dans l'une ou l'autre, le reste du réassort ne change pas.
+        ColorLine = request.env['mv.article.base.color.line'].sudo()
+        dispatch_dynamique = 'dispatch_ids' in ColorLine._fields
+        shops_par_cle = {}
+        if dispatch_dynamique:
+            for m in self._get_active_shop_mappings():
+                if m.shop_field and m.shop_id:
+                    shops_par_cle.setdefault(m.shop_field, m.shop_id.id)
+        Batch = request.env['mv.article.batch'].sudo()
+        fournisseur = self._reassort_fournisseur(tmpl)
+        ref_txt = tmpl.base_pivot_reference or tmpl.default_code or tmpl.name
+
+        # Prix d'achat déjà connu dans Base Pivot pour cette référence.
+        cout = 0.0
+        art = request.env['mv.article.base'].sudo().search(
+            [('product_tmpl_id', '=', tmpl.id)], order='id desc', limit=1)
+        if art:
+            cout = art.purchase_cost_dh_ht or 0.0
+        if not cout:
+            cout = tmpl.standard_price or 0.0
+
+        # Une ligne couleur par couleur, avec la quantité de chaque magasin
+        # dans sa colonne. PIÈGE : `line_total_pieces` de Base Pivot vaut
+        # `colis_qty` — sans lui, total_reference reste à 0 et la génération
+        # des bons d'achat ne trouve « aucune ligne éligible ».
+        # Le nom de la couleur doit correspondre à la valeur de l'attribut
+        # COULEURS, sinon les ventes inter-sociétés ne trouvent aucune
+        # variante.
+        couleurs = self._reassort_repartition_couleurs(tmpl, couleur, quantites_par_shop)
+        lignes_couleur = []
+        for nom_couleur, par_shop in couleurs.items():
+            vals = {'color': nom_couleur, 'colis_qty': sum(par_shop.values())}
+            if dispatch_dynamique:
+                # Magasins dynamiques : line_total_pieces se calcule à partir
+                # des lignes de dispatch, pas de colis_qty.
+                dispatchs = []
+                for cle, qte in par_shop.items():
+                    if qte <= 0 or cle not in shops_par_cle:
+                        continue
+                    vals_d = {'shop_id': shops_par_cle[cle], 'qty': qte}
+                    code = self._reassort_code_pointures(tmpl, nom_couleur, qte)
+                    if code:
+                        vals_d['qty_raw_code'] = code
+                    dispatchs.append((0, 0, vals_d))
+                if not dispatchs:
+                    raise UserError(
+                        "Aucun des magasins choisis n'est relié à un magasin "
+                        "de Base Pivot (Base Pivot → Configuration → Mapping "
+                        "Magasins).")
+                vals['dispatch_ids'] = dispatchs
+            else:
+                vals.update({champ: qte for champ, qte in par_shop.items()})
+            lignes_couleur.append((0, 0, vals))
+
+        vals_batch = {
+            # Le type en TÊTE : la colonne « Nom du batch » est étroite dans
+            # Base Pivot et coupait la fin du nom, on ne distinguait plus
+            # l'achat fournisseur de la vente inter-sociétés (2026-09-24).
+            'name': '%s — Réassort %s%s' % (
+                'ACHAT fournisseur' if suffixe == 'achat' else 'VENTE inter-sociétés',
+                ref_txt, (' ' + couleur) if couleur else ''),
+            'date': fields.Date.context_today(request.env.user),
+            'reference_ids': [(0, 0, {
+                'reference': ref_txt,
+                'designation_odoo': tmpl.name,
+                'supplier_id': fournisseur['id'] or False,
+                'product_tmpl_id': tmpl.id,
+                'article_state': 'reassort',
+                'article_created': True,
+                'purchase_cost_dh_ht': cout,
+                'pv_ttc': tmpl.list_price or 0.0,
+                'collection_id': tmpl.collection_id.id if getattr(tmpl, 'collection_id', False) else False,
+                'color_line_ids': lignes_couleur,
+            })],
+        }
+        # Le fournisseur n'est porté par le batch que dans la version
+        # historique de Base Pivot ; ailleurs il reste sur la référence.
+        if 'fournisseur_id' in Batch._fields:
+            vals_batch['fournisseur_id'] = fournisseur['id'] or False
+        batch = Batch.create(vals_batch)
+        return batch
+
+    @http.route('/mavie/api/reassort-generer', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_reassort_generer(self, **kw):
+        """Fait le réassort DANS BASE PIVOT (demande utilisatrice
+        2026-09-24) : on prépare un batch avec la référence en « Réassort »
+        et les quantités par magasin, puis on appelle le bouton de Base
+        Pivot correspondant :
+
+          • mode « achat » → action_generate_purchase_orders()
+            (bons d'achat fournisseur dans MOD FOR LIFE) ;
+          • mode « vente » → action_generate_sale_orders()
+            (bons de vente inter-sociétés MOD FOR LIFE → sociétés, confirmés
+            et livrés par Base Pivot).
+
+        Le dashboard ne recrée plus de documents à la main : c'est le même
+        chemin que le bouton de l'écran Base Pivot.
+        """
+        try:
+            tmpl = request.env['product.template'].sudo().browse(int(kw.get('article_id') or 0))
+            if not tmpl.exists():
+                return {'error': 'Référence introuvable.'}
+            mode = kw.get('mode')
+            couleur = (kw.get('couleur') or '').strip()
+            if mode not in ('achat', 'vente'):
+                return {'error': 'Mode inconnu.'}
+
+            mappings = {m.warehouse_id.id: m for m in self._get_active_shop_mappings() if m.warehouse_id}
+            quantites = {}
+            for l in (kw.get('lignes') or []):
+                try:
+                    q = int(l.get('qty') or 0)
+                    wh_id = int(l.get('wh_id') or 0)
+                except (TypeError, ValueError):
+                    continue
+                m = mappings.get(wh_id)
+                if q > 0 and m and m.shop_field:
+                    quantites[m.shop_field] = quantites.get(m.shop_field, 0) + q
+
+            if mode == 'achat' and not quantites:
+                # Achat fournisseur sans répartition : on commande pour le
+                # dépôt, la quantité saisie est portée par un magasin fictif
+                # « shop » seulement si l'utilisatrice n'a rien réparti.
+                try:
+                    q = int(kw.get('quantite') or 0)
+                except (TypeError, ValueError):
+                    q = 0
+                if q <= 0:
+                    return {'error': 'Indiquez les quantités à commander.'}
+                quantites = {'shop': q}
+            if not quantites:
+                return {'error': 'Choisissez au moins une quantité.'}
+
+            fournisseur = self._reassort_fournisseur(tmpl)
+            if mode == 'achat' and not fournisseur['id']:
+                return {'error': "Cette référence n'a aucun fournisseur dans Odoo ni dans Base Pivot."}
+
+            batch = self._reassort_batch_base_pivot(
+                tmpl, couleur, quantites, 'achat' if mode == 'achat' else 'vente')
+
+            if mode == 'achat':
+                retour_bp = batch.action_generate_purchase_orders()
+                docs = [{'document': po.name, 'id': po.id, 'modele': 'purchase.order',
+                         'societe': po.company_id.name, 'partenaire': po.partner_id.name,
+                         'etat': po.state,
+                         'quantite': int(round(sum(po.order_line.mapped('product_qty'))))}
+                        for po in batch.purchase_order_ids]
+            else:
+                # LIMITE DE BASE PIVOT (constatée le 2026-09-24) :
+                # action_generate_sale_orders cherche l'attribut nommé
+                # exactement « COULEURS ». Les 881 articles en « COULEURSS »
+                # et les 123 en « Couleur » n'y trouvent aucune variante, et
+                # la génération sort « Aucun dispatch vers des magasins
+                # mappés ». On le dit clairement plutôt que de laisser un
+                # écran vide.
+                noms_attr = tmpl.attribute_line_ids.mapped('attribute_id.name')
+                couleurs_attr = [n for n in noms_attr if (n or '').upper().startswith('COULEUR')]
+                if couleurs_attr and 'COULEURS' not in couleurs_attr:
+                    return {'error': "Base Pivot ne sait générer les ventes inter-sociétés que pour "
+                                     "l'attribut « COULEURS ». Cette référence utilise « %s » : "
+                                     "renommez l'attribut dans Odoo, ou lancez la vente depuis "
+                                     "l'écran Base Pivot." % couleurs_attr[0]}
+                retour_bp = batch.action_generate_sale_orders()
+                docs = [{'document': so.name, 'id': so.id, 'modele': 'sale.order',
+                         'societe': so.company_id.name, 'partenaire': so.partner_id.name,
+                         'etat': so.state,
+                         'quantite': int(round(sum(so.order_line.mapped('product_uom_qty'))))}
+                        for so in batch.sale_order_ids]
+
+            if not docs:
+                # Rien généré : on retire le batch vide pour ne pas encombrer
+                # la liste de Base Pivot (constat 2026-09-24).
+                batch.sudo().unlink()
+                # Base Pivot explique lui-même pourquoi (garde-fou
+                # achat/vente, mapping manquant…) : on relaie son message
+                # plutôt qu'un texte générique.
+                msg = ''
+                try:
+                    msg = (retour_bp or {}).get('params', {}).get('message') or ''
+                except Exception:
+                    msg = ''
+                return {'error': msg or ("Base Pivot n'a créé aucun document : vérifiez le fournisseur, "
+                                         "les variantes de la référence et le mapping des magasins.")}
+            _logger.info("Réassort Base Pivot (%s) par %s : batch %s → %s",
+                         mode, request.env.user.login, batch.name,
+                         ', '.join(d['document'] for d in docs))
+            return {'ok': True, 'mode': mode, 'batch': batch.name, 'batch_id': batch.id,
+                    'documents': docs}
+        except Exception as e:
+            _logger.error(f"Erreur api_reassort_generer: {str(e)}", exc_info=True)
+            request.env.cr.rollback()
+            return {'error': str(e)}
+
+    def _reassort_fournisseur(self, tmpl):
+        """Fournisseur de la référence : celui de Base Pivot s'il existe,
+        sinon le premier fournisseur renseigné sur l'article."""
+        try:
+            art = request.env['mv.article.base'].sudo().search(
+                [('product_tmpl_id', '=', tmpl.id), ('supplier_id', '!=', False)], limit=1)
+            if art and art.supplier_id:
+                return {'id': art.supplier_id.id, 'nom': art.supplier_id.name}
+        except Exception:
+            pass
+        seller = tmpl.sudo().seller_ids[:1]
+        if seller and seller.partner_id:
+            return {'id': seller.partner_id.id, 'nom': seller.partner_id.name}
+        return {'id': None, 'nom': ''}
 
     @http.route('/mavie/api/reassort', type='json', auth='user', methods=['POST'], csrf=False)
     def api_reassort(self, **kw):
@@ -7689,6 +8625,284 @@ class MaVieDashboardController(http.Controller):
             _logger.error(f"Erreur api_solde_context: {str(e)}", exc_info=True)
             return {'error': str(e)}
 
+    # ─────────────────────────────────────────────────────────────
+    # SOLDER PAR UNE PROMOTION (Remise & Fidélité)
+    #
+    # ANALYSE EN BASE (2026-09-23) : les magasins soldent surtout par
+    # loyalty.program, pas par les listes de prix — 636 promotions actives
+    # contre 15 listes. Modèle copié sur « Solde été 2025 - 55A16 » :
+    #   programme : program_type=promotion, applies_on=current, trigger=auto,
+    #               pos_ok, société, dates, caisses (pos_config_ids) ;
+    #   règle     : mode auto, minimum_qty 0, minimum_amount 1 TTC,
+    #               product_ids = les variantes concernées ;
+    #   récompense: discount / percent / applicability specific, mêmes
+    #               variantes.
+    # Les remises y sont TOUJOURS en pourcentage : le prix soldé saisi dans
+    # le dashboard est converti (249 → 199 = 20,08 %), d'où les pourcentages
+    # à décimales des promotions existantes.
+    # ─────────────────────────────────────────────────────────────
+
+    def _promo_pourcentage(self, catalogue_ttc, prix_ttc):
+        if catalogue_ttc <= 0:
+            return None
+        return round(max(0.0, (1 - prix_ttc / catalogue_ttc)) * 100, 2)
+
+    def _solde_creer_promotion(self, tmpl, variantes, prix_ttc, plan, date_start, date_end, couleur):
+        """Une promotion par société concernée, limitée aux caisses des
+        magasins cochés. Retourne la liste des résultats par magasin."""
+        Program = request.env['loyalty.program'].sudo()
+        resultats = []
+        par_societe = {}
+        for m, configs, _lst, _nom, ratio in plan:
+            par_societe.setdefault(m.company_id, {'mappings': [], 'configs': request.env['pos.config'].sudo().browse(),
+                                                  'ratio': ratio})
+            par_societe[m.company_id]['mappings'].append(m)
+            par_societe[m.company_id]['configs'] |= configs
+
+        libelle = (tmpl.base_pivot_reference or tmpl.default_code or tmpl.name or '').strip()
+        if couleur:
+            libelle += ' ' + couleur
+
+        for company, data in par_societe.items():
+            ratio = data['ratio']
+            catalogue_ht = min(variantes.mapped('lst_price')) if variantes else tmpl.list_price
+            pct = self._promo_pourcentage(catalogue_ht * ratio, prix_ttc)
+            if not pct:
+                return None, ('Prix soldé trop proche du prix de vente : la remise calculée serait de 0 %.')
+            programme = Program.create({
+                'name': 'Solde %s — %s' % (libelle, (date_start or fields.Date.today().isoformat())),
+                'program_type': 'promotion',
+                'applies_on': 'current',
+                'trigger': 'auto',
+                'company_id': company.id,
+                'currency_id': company.currency_id.id,
+                # Caisses uniquement : le dashboard solde le magasin, pas les
+                # bons de vente inter-sociétés.
+                'pos_ok': True,
+                'sale_ok': False,
+                'date_from': date_start or False,
+                'date_to': date_end or False,
+                'pos_config_ids': [(6, 0, data['configs'].ids)],
+                'rule_ids': [(0, 0, {
+                    'mode': 'auto',
+                    'minimum_qty': 0,
+                    'minimum_amount': 1,
+                    'minimum_amount_tax_mode': 'incl',
+                    'reward_point_mode': 'order',
+                    'reward_point_amount': 1,
+                    'product_ids': [(6, 0, variantes.ids)],
+                })],
+                'reward_ids': [(0, 0, {
+                    'reward_type': 'discount',
+                    'discount_mode': 'percent',
+                    'discount': pct,
+                    'discount_applicability': 'specific',
+                    'discount_product_ids': [(6, 0, variantes.ids)],
+                    'required_points': 1,
+                })],
+            })
+            for m in data['mappings']:
+                resultats.append({
+                    'magasin': m.warehouse_id.name,
+                    'liste': programme.name,
+                    'liste_creee': True,
+                    'promotion': True,
+                    'remise_pct': pct,
+                    'ancien_prix_ttc': None,
+                    'prix_ttc': round(prix_ttc, 2),
+                    'prix_ht': round(prix_ttc / ratio, 2),
+                })
+        return resultats, None
+
+    # ─────────────────────────────────────────────────────────────
+    # CODE PROMO / CARTE CADEAU / FIDÉLITÉ, depuis le même pop-up
+    #
+    # DEMANDE UTILISATRICE (2026-09-23) : « je veux tout dans le pop-up de
+    # solde, pas séparé ». Structures copiées sur les programmes existants
+    # de la base :
+    #   code promo   : « Quiz MA VIE Avril 40% » — trigger/mode with_code,
+    #                  code saisi en caisse, remise en %.
+    #   carte cadeau : « Cartes-cadeaux » — applies_on future, points en
+    #                  monnaie (reward_point_mode money), récompense
+    #                  per_point sur la commande ; les cartes elles-mêmes
+    #                  sont des loyalty.card avec leur code et leur montant.
+    #   fidélité     : « fidélité » — points gagnés par MAD dépensé,
+    #                  échangés contre un % de remise.
+    # ─────────────────────────────────────────────────────────────
+
+    def _programme_societes(self, plan):
+        """{société: caisses} des magasins cochés."""
+        par_societe = {}
+        for m, configs, _lst, _nom, _ratio in plan:
+            entree = par_societe.setdefault(m.company_id, {
+                'mappings': [], 'configs': request.env['pos.config'].sudo().browse()})
+            entree['mappings'].append(m)
+            entree['configs'] |= configs
+        return par_societe
+
+    def _creer_code_promo(self, tmpl, variantes, kw, plan, date_start, date_end, libelle):
+        code = (kw.get('code') or '').strip()
+        if not code:
+            return None, 'Saisissez le code à taper en caisse.'
+        if request.env['loyalty.rule'].sudo().search_count([('code', '=', code)]):
+            return None, 'Ce code existe déjà : choisissez-en un autre.'
+        pct = self._promo_pourcentage_demandee(tmpl, variantes, kw, plan)
+        if not pct:
+            return None, 'Indiquez un prix soldé ou une remise.'
+        Program = request.env['loyalty.program'].sudo()
+        resultats = []
+        for company, data in self._programme_societes(plan).items():
+            programme = Program.create({
+                'name': 'Code promo %s — %s' % (code, libelle),
+                'program_type': 'promo_code',
+                'applies_on': 'current',
+                'trigger': 'with_code',
+                'company_id': company.id,
+                'currency_id': company.currency_id.id,
+                'pos_ok': True,
+                'sale_ok': False,
+                'date_from': date_start or False,
+                'date_to': date_end or False,
+                'pos_config_ids': [(6, 0, data['configs'].ids)],
+                'rule_ids': [(0, 0, {
+                    'mode': 'with_code',
+                    'code': code,
+                    'minimum_qty': 0,
+                    'minimum_amount': 0,
+                    'minimum_amount_tax_mode': 'incl',
+                    'reward_point_mode': 'order',
+                    'reward_point_amount': 1,
+                })],
+                'reward_ids': [(0, 0, {
+                    'reward_type': 'discount',
+                    'discount_mode': 'percent',
+                    'discount': pct,
+                    'discount_applicability': 'specific',
+                    'discount_product_ids': [(6, 0, variantes.ids)],
+                    'required_points': 1,
+                })],
+            })
+            for m in data['mappings']:
+                resultats.append({'magasin': m.warehouse_id.name, 'liste': programme.name,
+                                  'promotion': True, 'remise_pct': pct, 'code': code,
+                                  'liste_creee': True, 'ancien_prix_ttc': None,
+                                  'prix_ttc': 0, 'prix_ht': 0})
+        return resultats, None
+
+    def _creer_carte_cadeau(self, kw, plan, date_end, libelle):
+        try:
+            montant = float(kw.get('montant') or 0)
+            nb = int(kw.get('nb_cartes') or 1)
+        except (TypeError, ValueError):
+            return None, 'Montant ou nombre de cartes invalide.'
+        if montant <= 0:
+            return None, 'Indiquez le montant de la carte.'
+        if nb < 1 or nb > 200:
+            return None, 'Le nombre de cartes doit être entre 1 et 200.'
+        Program = request.env['loyalty.program'].sudo()
+        Card = request.env['loyalty.card'].sudo()
+        resultats = []
+        for company, data in self._programme_societes(plan).items():
+            # Une seule « caisse » de cartes cadeaux par société : on
+            # réutilise le programme existant s'il y en a un.
+            programme = Program.search([('program_type', '=', 'gift_card'), ('active', '=', True),
+                                        ('company_id', 'in', [company.id, False])], limit=1)
+            creee = False
+            if not programme:
+                programme = Program.create({
+                    'name': 'Cartes cadeaux %s' % company.name,
+                    'program_type': 'gift_card',
+                    'applies_on': 'future',
+                    'trigger': 'auto',
+                    'company_id': company.id,
+                    'currency_id': company.currency_id.id,
+                    'pos_ok': True,
+                    'sale_ok': True,
+                    'rule_ids': [(0, 0, {
+                        'mode': 'auto', 'minimum_qty': 0, 'minimum_amount': 0,
+                        'minimum_amount_tax_mode': 'incl',
+                        'reward_point_mode': 'money', 'reward_point_amount': 1,
+                        'reward_point_split': True,
+                    })],
+                    'reward_ids': [(0, 0, {
+                        'reward_type': 'discount', 'discount_mode': 'per_point',
+                        'discount': 1, 'discount_applicability': 'order',
+                        'required_points': 0.001,
+                    })],
+                })
+                creee = True
+            cartes = Card.create([{
+                'program_id': programme.id,
+                'points': montant,
+                'expiration_date': date_end or False,
+            } for _ in range(nb)])
+            for m in data['mappings']:
+                resultats.append({'magasin': m.warehouse_id.name, 'liste': programme.name,
+                                  'liste_creee': creee, 'cartes': cartes.mapped('code'),
+                                  'montant': montant, 'ancien_prix_ttc': None,
+                                  'prix_ttc': montant, 'prix_ht': montant})
+        return resultats, None
+
+    def _creer_fidelite(self, kw, plan, date_start, date_end):
+        try:
+            points = float(kw.get('points_par_mad') or 0)
+            requis = float(kw.get('points_requis') or 0)
+            remise = float(kw.get('remise_fidelite') or 0)
+        except (TypeError, ValueError):
+            return None, 'Valeurs de fidélité invalides.'
+        if points <= 0 or requis <= 0 or not (0 < remise < 100):
+            return None, 'Vérifiez les points gagnés, les points requis et la remise.'
+        Program = request.env['loyalty.program'].sudo()
+        resultats = []
+        for company, data in self._programme_societes(plan).items():
+            programme = Program.create({
+                'name': 'Fidélité %s' % company.name,
+                'program_type': 'loyalty',
+                'applies_on': 'both',
+                'trigger': 'auto',
+                'company_id': company.id,
+                'currency_id': company.currency_id.id,
+                'pos_ok': True,
+                'sale_ok': False,
+                'date_from': date_start or False,
+                'date_to': date_end or False,
+                'pos_config_ids': [(6, 0, data['configs'].ids)],
+                'rule_ids': [(0, 0, {
+                    'mode': 'auto', 'minimum_qty': 0, 'minimum_amount': 0,
+                    'minimum_amount_tax_mode': 'incl',
+                    'reward_point_mode': 'money', 'reward_point_amount': points,
+                })],
+                'reward_ids': [(0, 0, {
+                    'reward_type': 'discount', 'discount_mode': 'percent',
+                    'discount': remise, 'discount_applicability': 'order',
+                    'required_points': requis,
+                })],
+            })
+            for m in data['mappings']:
+                resultats.append({'magasin': m.warehouse_id.name, 'liste': programme.name,
+                                  'liste_creee': True, 'fidelite': True,
+                                  'points': points, 'points_requis': requis, 'remise_pct': remise,
+                                  'ancien_prix_ttc': None, 'prix_ttc': 0, 'prix_ht': 0})
+        return resultats, None
+
+    def _promo_pourcentage_demandee(self, tmpl, variantes, kw, plan):
+        """% de remise, à partir du prix soldé saisi (ou de la remise)."""
+        try:
+            remise = float(kw.get('remise_pct') or 0)
+        except (TypeError, ValueError):
+            remise = 0
+        if remise > 0:
+            return round(remise, 2)
+        try:
+            prix_ttc = float(kw.get('prix_ttc') or 0)
+        except (TypeError, ValueError):
+            return None
+        if prix_ttc <= 0 or not plan:
+            return None
+        ratio = plan[0][4]
+        catalogue_ht = min(variantes.mapped('lst_price')) if variantes else tmpl.list_price
+        return self._promo_pourcentage(catalogue_ht * ratio, prix_ttc)
+
     @http.route('/mavie/api/solde-apply', type='json', auth='user', methods=['POST'], csrf=False)
     def api_solde_apply(self, **kw):
         """Applique la solde : pour chaque magasin choisi, ajoute (ou met à
@@ -7710,9 +8924,13 @@ class MaVieDashboardController(http.Controller):
             date_start = (kw.get('date_start') or '').strip()
             date_end = (kw.get('date_end') or '').strip()
             demandes = kw.get('magasins') or []
+            mode = kw.get('mode') or 'pricelist'
+            # Carte cadeau et fidélité ne portent pas sur un prix d'article :
+            # leurs propres champs sont vérifiés plus bas.
+            besoin_prix = mode in ('pricelist', 'promotion')
             if not demandes:
                 return {'error': 'Choisissez au moins un magasin.'}
-            if prix_ttc <= 0:
+            if besoin_prix and prix_ttc <= 0:
                 return {'error': 'Le prix soldé doit être supérieur à 0.'}
             if date_end and date_start and date_end < date_start:
                 return {'error': 'La date de fin est avant la date de début.'}
@@ -7737,11 +8955,44 @@ class MaVieDashboardController(http.Controller):
                     return {'error': '%s n\'a aucune caisse : impossible d\'y appliquer une solde.' % m.warehouse_id.name}
                 ratio = self._solde_tax_ratio(tmpl, m.company_id)
                 catalogue_ttc = catalogue_ht * ratio
-                if prix_ttc >= catalogue_ttc - 0.005:
+                if besoin_prix and prix_ttc >= catalogue_ttc - 0.005:
                     return {'error': 'Le prix soldé (%.2f) doit être inférieur au prix de vente (%.2f TTC).' % (prix_ttc, catalogue_ttc)}
                 lst = self._solde_find_list(configs)
                 nom = (d.get('nom_liste') or '').strip() or 'Solde %s' % (m.shop_label or m.warehouse_id.name)
                 plan.append((m, configs, lst, nom, ratio))
+
+            # Mode « promotion » (Remise & Fidélité) : c'est l'outil que les
+            # magasins utilisent vraiment pour solder. Choix fait dans le
+            # panneau Solder (demande utilisatrice 2026-09-23).
+            libelle = (tmpl.base_pivot_reference or tmpl.default_code or tmpl.name or '').strip()
+            if couleur:
+                libelle += ' ' + couleur
+            cibles_prog = variantes if variantes else tmpl.product_variant_ids
+
+            if mode in ('promo_code', 'gift_card', 'loyalty'):
+                if mode == 'promo_code':
+                    resultats, erreur = self._creer_code_promo(
+                        tmpl, cibles_prog, kw, plan, date_start, date_end, libelle)
+                elif mode == 'gift_card':
+                    resultats, erreur = self._creer_carte_cadeau(kw, plan, date_end, libelle)
+                else:
+                    resultats, erreur = self._creer_fidelite(kw, plan, date_start, date_end)
+                if erreur:
+                    return {'error': erreur}
+                _logger.info("Programme %s créé par %s pour %s",
+                             mode, request.env.user.login, tmpl.display_name)
+                return {'ok': True, 'resultats': resultats, 'mode': mode}
+
+            if mode == 'promotion':
+                cibles = cibles_prog
+                resultats, erreur = self._solde_creer_promotion(
+                    tmpl, cibles, prix_ttc, plan, date_start, date_end, couleur)
+                if erreur:
+                    return {'error': erreur}
+                _logger.info("Promotion solde par %s : %s -> %s TTC (%s)",
+                             request.env.user.login, tmpl.display_name, prix_ttc,
+                             ', '.join(r['magasin'] for r in resultats))
+                return {'ok': True, 'resultats': resultats, 'promotion': True}
 
             Pricelist = request.env['product.pricelist'].sudo()
             Item = request.env['product.pricelist.item'].sudo()

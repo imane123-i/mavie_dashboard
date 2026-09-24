@@ -1,5 +1,5 @@
 /**
- * MaVie Dashboard – logique client principale
+ * Dashboard – logique client principale
  * Module Odoo 17 : mavie_dashboard
  * Données natives Odoo (Achats, Ventes/POS, Stock) — plus de dépendance à
  * mv.article.base (Base Pivot) pour les calculs affichés.
@@ -21,7 +21,7 @@ function detectCurrentPage() {
 }
 
 var currentPage = detectCurrentPage();
-console.log('[MaVie Dashboard] Page détectée:', currentPage, '| URL:', window.location.href);
+console.log('[Dashboard] Page détectée:', currentPage, '| URL:', window.location.href);
 
 var state = {
     period: 'all',
@@ -769,8 +769,8 @@ function _renderModForLifeDashboard(data) {
         }
         if (data.direct_qty_total) {
             bits.push('en orange : ' + formatNumber(data.direct_qty_total)
-                + ' pièces (chaussures…) achetées directement par les magasins chez MOD FOR LIFE sur '
-                + formatNumber(data.direct_nb_bons) + ' bons d\'achat, sans bon de vente MFL — hors totaux');
+                + ' pièces achetées par les magasins (' + formatNumber(data.direct_nb_bons)
+                + ' bons), hors totaux');
         }
         // « Magasin non identifié » : phrase retirée de cette note le
         // 2026-09-21 à la demande de l'utilisatrice (ce n'est pas un écart,
@@ -1084,7 +1084,7 @@ function _mflRenderTree() {
                  + '<span class="mfl-grow">' + _escapeHtml(mag.magasin) + '</span>'
                  + '<span class="' + chipCls + '">' + formatNumber((mag.nb_references || 0) + (mag.nb_references_directes || 0)) + ' réf.</span>'
                  + _mflDirectChip(mag.qty_direct)
-                 + (mag.vendu ? '<span class="mfl-chip" title="Pièces vendues en caisse par ce magasin">' + formatNumber(mag.vendu) + ' vendues</span>' : '')
+                 + (mag.vendu ? '<span class="mfl-chip" title="Vendu en caisse">' + formatNumber(mag.vendu) + ' vendues</span>' : '')
                  + '<span class="mfl-qty">' + formatNumber(mag.qty) + ' pcs</span>'
                  + '<span class="mfl-ca">' + formatMAD(mag.ca) + '</span>'
                  + '</div>'
@@ -1110,7 +1110,7 @@ function _mflRenderTree() {
 function _mflDirectChip(qty) {
     if (!qty) return '';
     return '<span class="mfl-chip" style="background:#FEF3C7;color:#92400E;" '
-         + 'title="Pièces reçues par bons d\'achat du magasin chez MOD FOR LIFE, sans bon de vente MFL : hors des totaux">'
+         + 'title="Acheté par le magasin, hors totaux">'
          + '+ ' + formatNumber(qty) + ' pcs achat magasin</span>';
 }
 
@@ -1127,7 +1127,7 @@ function _mflFindMag(key) {
 function _mflRefsTable(refs, direct) {
     var h = '<table><thead><tr' + (direct ? ' style="background:#FEF3C7;"' : '') + '>'
           + '<th>Référence</th><th>Produit</th><th>Couleur</th>'
-          + '<th>Tailles</th><th class="num">Qté</th><th class="num" title="Pièces vendues en caisse par ce magasin, sur la période filtrée">Qté vendue</th><th class="num">Montant</th>'
+          + '<th>Tailles</th><th class="num">Qté</th><th class="num" title="Vendu en caisse">Qté vendue</th><th class="num">Montant</th>'
           + '</tr></thead><tbody>';
     refs.forEach(function(r) {
         h += '<tr>'
@@ -1179,9 +1179,8 @@ function _mflMagBody(mag, key) {
         ? '… (' + formatNumber(mag.nb_bons_directs) + ' bons)' : '');
     h += '<div class="mfl-note" style="margin:' + (refs.length ? '16px' : '2px') + ' 0 8px;padding:8px 10px;'
        + 'background:#FFFBEB;border-left:3px solid #F59E0B;border-radius:6px;">'
-       + '<strong style="color:#92400E;">Achat magasin chez MOD FOR LIFE, sans bon de vente MFL</strong> · '
-       + formatNumber(mag.qty_direct) + ' pcs reçues — hors des totaux du dispatch ; '
-       + 'bons saisis à 0 MAD, donc pas de montant'
+       + '<strong style="color:#92400E;">Acheté par le magasin</strong> · '
+       + formatNumber(mag.qty_direct) + ' pcs reçues, hors totaux. Bons à 0 MAD, donc pas de montant.'
        + (bonsTxt ? '<br>Bons d\'achat : ' + _escapeHtml(bonsTxt) : '')
        + '</div>';
     var src = mag._source || mag;
@@ -1961,7 +1960,7 @@ async function _fetchAndRenderDetail() {
 // puis réassort, puis transfert) et une pastille par action le suit.
 var ACT_COULEURS = {
     solde:     ['#DC2626', 'en solde'],
-    reassort:  ['#16A34A', 'réassort (transfert lancé depuis Réassort)'],
+    reassort:  ['#16A34A', 'réassort'],
     transfert: ['#2563EB', 'transféré'],
 };
 function _actColorer(td, actions) {
@@ -2308,13 +2307,11 @@ function openTransferPanel(articleId, productName, presetColor, targetShopField,
 
     var destSel = el('transfer-dest-shop');
     if (destSel) {
-        if (targetShopField) {
-            destSel.value = targetShopField;
-        } else if (state.shop_field) {
-            destSel.value = state.shop_field;
-        } else if (destSel.options.length > 1 && !destSel.value) {
-            destSel.value = destSel.options[1].value;
-        }
+        // DEMANDE UTILISATRICE (2026-09-23) : le magasin cible n'est plus
+        // choisi d'office — la liste s'ouvre vide et on sélectionne soi-même.
+        // Exception : quand l'appelant impose déjà la cible (bouton
+        // « Transférer » d'une ligne de réassort, par exemple).
+        destSel.value = targetShopField || '';
     }
 
     var colorSel = el('transfer-color-filter');
@@ -2448,6 +2445,12 @@ function _renderTransferSuggestions(suggestions, destShopField) {
 
         var tdName = document.createElement('td');
         tdName.textContent = s.shop_label;
+        if (s.depot) {
+            // Le dépôt MOD FOR LIFE : c'est lui qui alimente le réassort.
+            tdName.style.fontWeight = '700';
+            tr.style.background = 'rgba(124,58,237,0.06)';
+            tdName.title = 'Entrepôt MOD FOR LIFE — ce n\'est pas un magasin de vente';
+        }
         tr.appendChild(tdName);
 
         var tdCity = document.createElement('td');
@@ -2884,8 +2887,59 @@ async function _loadColorDetailStores(articleId, color) {
         return;
     }
 
-    if (msgEl) msgEl.textContent = '';
+    if (msgEl) msgEl.textContent = data.note || '';
     _renderColorDetailStores(data.stores || [], data);
+}
+
+// Colonne « Ce qui s'est passé » du pop-up couleur : une étiquette par
+// mouvement, avec le détail (bons, dates) en infobulle.
+function _mouvementsCell(mv, stock) {
+    var td = document.createElement('td');
+    var puces = [];
+    function puce(txt, fond, couleur, titre) {
+        puces.push('<span style="display:inline-block;margin:0 4px 4px 0;padding:2px 8px;border-radius:10px;'
+            + 'font-size:0.78rem;font-weight:700;background:' + fond + ';color:' + couleur + ';"'
+            + (titre ? ' title="' + _escapeHtml(titre) + '"' : '') + '>' + txt + '</span>');
+    }
+    // Uniquement les ACTIONS faites : transfert, réassort, solde (choix de
+    // l'utilisatrice le 2026-09-23 — achats, ventes et écart retirés).
+    if (mv.entree) puce('+' + formatNumber(mv.entree) + ' reçu', '#DBEAFE', '#1D4ED8');
+    if (mv.sortie) puce('−' + formatNumber(mv.sortie) + ' envoyé', '#E0E7FF', '#3730A3');
+    if (mv.reassort) puce('+' + formatNumber(mv.reassort) + ' réassort', '#DCFCE7', '#166534');
+    if (mv.solde) puce(formatNumber(mv.solde) + ' vendus en solde', '#FEE2E2', '#B91C1C');
+    if (mv.attente) puce('⏳ ' + formatNumber(mv.attente) + ' en attente', '#FEF3C7', '#92400E');
+    if (!puces.length) {
+        td.textContent = '—';
+        td.style.color = '#94A3B8';
+    } else {
+        // Clic = détail complet (date, reçu/envoyé, magasin, bon, état),
+        // demandé le 2026-09-23.
+        td.innerHTML = puces.join('')
+            + ((mv.lignes && mv.lignes.length)
+                ? '<button type="button" class="ac-btn" style="padding:2px 8px;font-size:0.72rem;">Détail ▾</button>' : '');
+        if (mv.details && mv.details.length) td.title = mv.details.join('\n');
+        td._lignes = mv.lignes || [];
+    }
+    return td;
+}
+
+// Tableau détaillé des mouvements d'un magasin pour cette couleur.
+function _mouvementsDetailHtml(lignes) {
+    var h = '<table class="ac-table" style="margin:6px 0;"><thead><tr>'
+          + '<th>Date</th><th>Sens</th><th>Magasin</th><th class="num">Qté</th><th>Bon</th><th>État</th>'
+          + '</tr></thead><tbody>';
+    lignes.forEach(function(l) {
+        var sens = l.sens === 'recu' ? '<span style="color:#1D4ED8;font-weight:700;">Reçu</span>'
+            : (l.sens === 'envoye' ? '<span style="color:#3730A3;font-weight:700;">Envoyé</span>'
+            : '<span style="color:#B91C1C;font-weight:700;">Vendu en solde</span>');
+        h += '<tr class="ac-var"><td>' + _escapeHtml(l.date || '—') + '</td>'
+           + '<td>' + sens + (l.quoi === 'Réassort' ? ' <span style="color:#166534;">(réassort)</span>' : '') + '</td>'
+           + '<td>' + _escapeHtml(l.avec || '—') + '</td>'
+           + '<td class="num">' + formatNumber(l.qty) + '</td>'
+           + '<td>' + _escapeHtml(l.bon || '—') + '</td>'
+           + '<td' + (l.fait ? '' : ' style="color:#B45309;"') + '>' + _escapeHtml(l.etat || '') + '</td></tr>';
+    });
+    return h + '</tbody></table>';
 }
 
 function _renderColorDetailStores(stores, totals) {
@@ -2896,7 +2950,7 @@ function _renderColorDetailStores(stores, totals) {
     if (!stores || stores.length === 0) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 4;
+        td.colSpan = 5;
         td.textContent = 'Aucun stock trouvé pour cette couleur dans les magasins actifs.';
         td.style.textAlign = 'center';
         td.style.color = '#999';
@@ -2919,7 +2973,35 @@ function _renderColorDetailStores(stores, totals) {
         var tdStock = document.createElement('td');
         tdStock.textContent = formatNumber(s.stock_total);
         if (s.stock_total <= 0) tdStock.style.color = '#94A3B8';
+        // Le nombre prend la couleur de ce qui s'est passé dans ce magasin
+        // (demande utilisatrice 2026-09-23) : bleu transfert, vert réassort,
+        // rouge vendu en solde — au lieu d'un gris qui ne dit rien.
+        var mv = s.mouvements || {};
+        var faits = [];
+        if (mv.solde) faits.push('solde');
+        if (mv.reassort) faits.push('reassort');
+        if (mv.entree || mv.sortie) faits.push('transfert');
+        _actColorer(tdStock, faits);
+        if (mv.details && mv.details.length) tdStock.title = mv.details.join('\n');
+        tdStock.style.fontWeight = faits.length ? '700' : '';
         tr.appendChild(tdStock);
+
+        var tdMouv = _mouvementsCell(mv, s.stock_total);
+        tr.appendChild(tdMouv);
+        if (tdMouv._lignes && tdMouv._lignes.length) {
+            tdMouv.style.cursor = 'pointer';
+            tdMouv.addEventListener('click', function() {
+                var ouvert = tr.nextSibling && tr.nextSibling._detailMouvements;
+                if (ouvert) { tr.parentNode.removeChild(tr.nextSibling); return; }
+                var trD = document.createElement('tr');
+                trD._detailMouvements = true;
+                var tdD = document.createElement('td');
+                tdD.colSpan = 5;
+                tdD.innerHTML = _mouvementsDetailHtml(tdMouv._lignes);
+                trD.appendChild(tdD);
+                tr.parentNode.insertBefore(trD, tr.nextSibling);
+            });
+        }
 
         var tdSizes = document.createElement('td');
         var sizeKeys = Object.keys(s.by_size || {}).sort();
@@ -4284,7 +4366,7 @@ function _renderHistory() {
         ? ['Date', 'Ticket', 'Magasin', 'Réf', 'Produit', 'Qté',
            'Prix catalogue (TTC)', 'Remise', 'Prix payé (TTC)']
         : ['Bon', 'Date', 'État', 'Opération', 'Société source', 'Magasin source',
-           'Société cible', 'Magasin cible', 'Type', 'Réf.', 'Qté'];
+           'Société cible', 'Magasin cible', 'Type', 'Réf.', 'Qté', 'Notification'];
     columns.forEach(function(label) {
         var th = document.createElement('th');
         th.textContent = label;
@@ -4385,10 +4467,42 @@ function _renderHistory() {
                                 r.intra_societe ? '#7C3AED' : '#64748B'));
             tr.appendChild(cell(formatNumber(r.nb_references), null, null, 'center'));
             tr.appendChild(cell(formatNumber(r.qty), null, '700', 'center'));
+            tr.appendChild(_notifTestCell(r));
         }
 
         tbody.appendChild(tr);
     });
+}
+
+// Bouton « Test » de l'historique (demande utilisatrice 2026-09-23) :
+// renvoie la notification de CE bon à soi-même, avec un bandeau rouge
+// « ceci est un test », sans déranger les responsables de magasin.
+function _notifTestCell(r) {
+    var td = document.createElement('td');
+    td.style.cssText = 'padding:9px 8px;';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-transfer-open';
+    btn.style.cssText = 'padding:3px 10px;font-size:0.75rem;margin:0;';
+    btn.textContent = '✉️ Me l\'envoyer en test';
+    btn.title = 'Vous envoie cette notification à vous seule, en test.';
+    btn.addEventListener('click', async function(ev) {
+        ev.stopPropagation();
+        btn.disabled = true;
+        btn.textContent = 'Envoi…';
+        var res = await rpc('/mavie/api/transfer-notif-test', { transfer_id: r.id });
+        btn.disabled = false;
+        btn.textContent = '✉️ Me l\'envoyer en test';
+        if (!res || res.error) {
+            window.alert('Erreur : ' + ((res && res.error) || 'inconnue'));
+            return;
+        }
+        window.alert('Envoyé à ' + res.destinataire + ' : ' + res.messages
+            + ' message' + (res.messages > 1 ? 's' : '') + '.\n'
+            + 'Regardez la cloche dans Odoo.\nLes magasins n\'ont rien reçu.');
+    });
+    td.appendChild(btn);
+    return td;
 }
 
 function _buildExportParams(extra) {
@@ -5197,14 +5311,14 @@ function _raRenderHeader(data) {
     if (data.date_reference && data.aujourdhui) {
         var ecartJours = Math.round((new Date(data.aujourdhui) - new Date(data.date_reference)) / 86400000);
         if (ecartJours > 7) {
-            warns.push('Aucune vente enregistrée depuis ' + ecartJours + ' jours : les vitesses reflètent la période analysée, pas l\'activité actuelle.');
+            warns.push('Aucune vente depuis ' + ecartJours + ' jours : chiffres de la période analysée.');
         }
     }
     if (!k.inclure_negatifs && k.nb_negatifs) {
-        warns.push(formatNumber(k.nb_negatifs) + ' alertes écartées car le stock Odoo du magasin est négatif (donc faux).');
+        warns.push(formatNumber(k.nb_negatifs) + ' alertes écartées : stock Odoo négatif.');
     }
     if (k.nb_jamais_recu) {
-        warns.push(formatNumber(k.nb_jamais_recu) + ' alertes écartées : article vendu par un magasin qui ne l\'a jamais reçu.');
+        warns.push(formatNumber(k.nb_jamais_recu) + ' alertes écartées : magasin qui n\'a jamais reçu cet article.');
     }
     if (data.tronque) {
         warns.push('Seules les ' + formatNumber(raState.rows.length) + ' alertes les plus urgentes sont chargées.');
@@ -5536,7 +5650,9 @@ async function openSoldePanel(articleId, couleur) {
     sdState.noms = {};
     var result = el('sd-result');
     if (result) { result.style.display = 'none'; result.innerHTML = ''; }
-    ['sd-prix', 'sd-remise', 'sd-fin'].forEach(function(id) { var e = el(id); if (e) e.value = ''; });
+    ['sd-prix', 'sd-remise', 'sd-fin', 'sd-code', 'sd-montant'].forEach(function(id) { var e = el(id); if (e) e.value = ''; });
+    var nbC = el('sd-nb-cartes'); if (nbC) nbC.value = '1';
+    _sdMajChamps();
     var debut = el('sd-debut');
     if (debut) debut.value = new Date().toISOString().slice(0, 10);
     var tbody = el('sd-tbody');
@@ -5587,7 +5703,7 @@ function _sdRenderStores() {
             if (autres.length) {
                 liste += '<div style="font-size:0.72rem;color:#B45309;margin-top:3px;" title="' + _escapeHtml(autres.join(', ')) + '">'
                        + '⚠ partagée avec ' + autres.length + ' autre' + (autres.length > 1 ? 's' : '') + ' caisse' + (autres.length > 1 ? 's' : '')
-                       + ' : le prix soldé s\'y appliquera aussi</div>';
+                       + ' : même prix là-bas</div>';
             }
         } else {
             var nom = sdState.noms[m.shop_field] !== undefined ? sdState.noms[m.shop_field] : m.nom_propose;
@@ -5618,12 +5734,52 @@ function _sdPrix() {
 
 // Contrôle et résumé à chaque saisie : le bouton ne s'active que si la
 // solde est applicable — le serveur revérifie de toute façon.
+// Le pop-up porte les 5 types (demande utilisatrice 2026-09-23) : promotion,
+// liste de prix, code promo, carte cadeau, fidélité. On n'affiche que les
+// champs du type choisi.
+var SD_AIDE = {
+    promotion: 'Crée une promotion Remise & Fidélité sur cette référence, dans les caisses choisies.',
+    pricelist: 'Écrit le prix soldé dans la liste de prix de chaque magasin.',
+    promo_code: 'Remise donnée seulement si le client dit le code en caisse.',
+    gift_card: 'Crée des cartes cadeaux : un code et un montant, utilisables comme paiement.',
+    loyalty: 'Le client cumule des points sur ses achats et les échange contre une remise.',
+};
+function _sdMode() {
+    return (el('sd-mode') || {}).value || 'promotion';
+}
+function _sdMajChamps() {
+    var mode = _sdMode();
+    (document.querySelectorAll('.sd-form .rx-field[data-modes]') || []).forEach(function(f) {
+        var ok = f.getAttribute('data-modes').split(' ').indexOf(mode) !== -1;
+        f.style.display = ok ? '' : 'none';
+    });
+    var aide = el('sd-aide');
+    if (aide) aide.textContent = SD_AIDE[mode] || '';
+    var btn = el('btn-sd-apply');
+    if (btn) btn.textContent = mode === 'gift_card' ? 'Créer les cartes'
+        : (mode === 'loyalty' ? 'Créer le programme'
+        : (mode === 'promo_code' ? 'Créer le code' : 'Appliquer la solde'));
+    var titre = el('sd-titre');
+    if (titre) titre.textContent = mode === 'gift_card' ? 'Cartes cadeaux'
+        : (mode === 'loyalty' ? 'Programme de fidélité'
+        : (mode === 'promo_code' ? 'Code promo' : 'Solder une référence'));
+}
+function _sdNum(id) {
+    var e = el(id);
+    var n = e ? parseFloat(e.value) : NaN;
+    return isNaN(n) ? null : n;
+}
+
 function _sdRefresh() {
     var data = sdState.data || {};
     var cat = data.prix_catalogue_ttc || 0;
+    var mode = _sdMode();
     var prix = _sdPrix();
     var prev = el('sd-preview');
     var erreur = '';
+    if (mode === 'gift_card' || mode === 'loyalty' || mode === 'promo_code') {
+        return _sdRefreshProgramme(mode);
+    }
     if (prix !== null) {
         if (prix <= 0) erreur = 'Le prix soldé doit être supérieur à 0.';
         else if (prix >= cat) erreur = 'Le prix soldé doit être inférieur au prix de vente (' + formatMAD(cat) + ').';
@@ -5655,14 +5811,22 @@ async function _sdApply() {
     var data = sdState.data;
     if (!data || sdState.busy) return;
     var prix = _sdPrix();
+    var mode = _sdMode();
     var choisis = (data.magasins || []).filter(function(m) { return sdState.checked[m.shop_field]; });
-    var nouvelles = choisis.filter(function(m) { return !m.liste; });
-    // Confirmation explicite : l'action modifie les prix en caisse.
-    var msg = 'Solder ' + data.reference + (data.couleur ? ' couleur ' + data.couleur : '') + ' à ' + formatMAD(prix) + ' TTC dans ' + choisis.length + ' magasin'
-        + (choisis.length > 1 ? 's' : '') + ' ?\n\n' + choisis.map(function(m) {
-            var n = m.liste && m.liste.autres_caisses ? m.liste.autres_caisses.length : 0;
-            return '• ' + m.magasin + ' → ' + (m.liste ? m.liste.name + (n ? ' (partagée : s\'applique aussi dans ' + n + ' autre(s) caisse(s))' : '') : ((sdState.noms[m.shop_field] || m.nom_propose) + ' (nouvelle liste)'));
-        }).join('\n');
+    var magasinsTxt = choisis.map(function(m) { return '• ' + m.magasin; }).join('\n');
+    // Confirmation explicite : l'action change ce qui se passe en caisse.
+    var msg;
+    if (mode === 'gift_card') {
+        msg = 'Créer ' + (_sdNum('sd-nb-cartes') || 1) + ' carte(s) de ' + formatMAD(_sdNum('sd-montant')) + ' ?';
+    } else if (mode === 'loyalty') {
+        msg = 'Créer le programme de fidélité dans :\n' + magasinsTxt;
+    } else if (mode === 'promo_code') {
+        msg = 'Créer le code ' + ((el('sd-code') || {}).value || '').trim() + ' dans :\n' + magasinsTxt;
+    } else {
+        var quoi = mode === 'promotion' ? 'Promotion' : 'Liste de prix';
+        msg = quoi + ' · ' + data.reference + (data.couleur ? ' ' + data.couleur : '')
+            + ' à ' + formatMAD(prix) + ' TTC dans :\n' + magasinsTxt;
+    }
     if (!window.confirm(msg)) return;
 
     sdState.busy = true;
@@ -5670,7 +5834,15 @@ async function _sdApply() {
     var res = await rpc('/mavie/api/solde-apply', {
         product_tmpl_id: data.product_tmpl_id,
         couleur: data.couleur || '',
+        mode: mode,
         prix_ttc: prix,
+        remise_pct: _sdNum('sd-remise'),
+        code: ((el('sd-code') || {}).value || '').trim(),
+        montant: _sdNum('sd-montant'),
+        nb_cartes: _sdNum('sd-nb-cartes'),
+        points_par_mad: _sdNum('sd-points'),
+        points_requis: _sdNum('sd-points-requis'),
+        remise_fidelite: _sdNum('sd-remise-fid'),
         date_start: (el('sd-debut') || {}).value || '',
         date_end: (el('sd-fin') || {}).value || '',
         magasins: choisis.map(function(m) {
@@ -5691,13 +5863,20 @@ async function _sdApply() {
     }
     if (box) {
         box.className = 'sd-result ok';
-        box.innerHTML = '<b>Solde appliquée.</b><br/>' + res.resultats.map(function(r) {
+        var cartes = [];
+        (res.resultats || []).forEach(function(r) { (r.cartes || []).forEach(function(c) { if (cartes.indexOf(c) === -1) cartes.push(c); }); });
+        var titres = { gift_card: 'Cartes créées.', loyalty: 'Programme de fidélité créé.', promo_code: 'Code promo créé.' };
+        box.innerHTML = '<b>' + (titres[mode] || 'Solde appliquée.') + '</b><br/>' + res.resultats.map(function(r) {
+            if (r.cartes) return '✓ ' + _escapeHtml(r.magasin) + ' — ' + _escapeHtml(r.liste);
+            if (r.fidelite) return '✓ ' + _escapeHtml(r.magasin) + ' — ' + formatNumber(r.points_requis) + ' points = ' + r.remise_pct + ' %';
+            if (r.code) return '✓ ' + _escapeHtml(r.magasin) + ' — code ' + _escapeHtml(r.code) + ' · ' + formatNumber(r.remise_pct) + ' %';
             return '✓ ' + _escapeHtml(r.magasin) + ' — ' + formatMAD(r.prix_ttc) + ' TTC dans « ' + _escapeHtml(r.liste) + ' »'
-                + (r.liste_creee ? ' (liste créée et ajoutée à la caisse)' : '')
+                + (r.promotion ? ' (promotion créée, remise ' + formatNumber(r.remise_pct) + ' %)'
+                               : (r.liste_creee ? ' (liste créée et ajoutée à la caisse)' : ''))
                 + (r.ancien_prix_ttc ? ' · remplace ' + formatMAD(r.ancien_prix_ttc) : '');
         }).join('<br/>')
-            + '<br/><span style="color:#475569;">En caisse, la vendeuse choisit la liste de soldes au moment de l\'encaissement. '
-            + 'Une caisse déjà ouverte la verra après rechargement du point de vente.</span>';
+            + (cartes.length ? '<br/><b>Codes :</b> ' + _escapeHtml(cartes.join(', ')) : '')
+            + '<br/><span style="color:#475569;">Une caisse déjà ouverte le verra après rechargement.</span>';
         box.style.display = '';
     }
     // Recharge l'état réel des magasins (listes créées, solde en place).
@@ -5706,9 +5885,53 @@ async function _sdApply() {
     await _sdLoad(data.product_tmpl_id);
 }
 
+// Aperçu et contrôle des trois autres types.
+function _sdRefreshProgramme(mode) {
+    var data = sdState.data || {};
+    var choisis = (data.magasins || []).filter(function(m) { return sdState.checked[m.shop_field]; });
+    var prev = el('sd-preview');
+    var erreur = '';
+    var texte = '';
+    if (mode === 'promo_code') {
+        var code = ((el('sd-code') || {}).value || '').trim();
+        var prix = _sdPrix();
+        var cat = data.prix_catalogue_ttc || 0;
+        if (!code) erreur = 'Saisissez le code.';
+        else if (prix === null) erreur = 'Saisissez le prix soldé ou la remise.';
+        else if (prix >= cat) erreur = 'Le prix doit être inférieur à ' + formatMAD(cat) + '.';
+        else texte = 'Code <b>' + _escapeHtml(code) + '</b> → ' + formatMAD(prix) + ' TTC ('
+            + Math.round((1 - prix / cat) * 100) + ' % de remise) sur cette référence.';
+    } else if (mode === 'gift_card') {
+        var montant = _sdNum('sd-montant'), nb = _sdNum('sd-nb-cartes') || 1;
+        if (!montant || montant <= 0) erreur = 'Saisissez le montant de la carte.';
+        else if (nb < 1 || nb > 200) erreur = 'Entre 1 et 200 cartes.';
+        else texte = formatNumber(nb) + ' carte' + (nb > 1 ? 's' : '') + ' de ' + formatMAD(montant) + '.';
+    } else {
+        var pts = _sdNum('sd-points'), requis = _sdNum('sd-points-requis'), rem = _sdNum('sd-remise-fid');
+        if (!pts || !requis || !rem) erreur = 'Remplissez les trois champs.';
+        else texte = pts + ' point(s) par MAD · ' + formatNumber(requis) + ' points = ' + rem + ' % de remise.';
+    }
+    var d1 = (el('sd-debut') || {}).value, d2 = (el('sd-fin') || {}).value;
+    if (!erreur && d1 && d2 && d2 < d1) erreur = 'La date de fin est avant la date de début.';
+    if (prev) prev.innerHTML = erreur ? '<span class="sd-err">' + _escapeHtml(erreur) + '</span>' : texte;
+    var sum = el('sd-summary');
+    if (sum) sum.textContent = choisis.length
+        ? choisis.length + ' magasin' + (choisis.length > 1 ? 's' : '') + ' sélectionné' + (choisis.length > 1 ? 's' : '')
+        : 'Aucun magasin sélectionné.';
+    var btn = el('btn-sd-apply');
+    if (btn) btn.disabled = sdState.busy || !!erreur || !choisis.length;
+}
+
 function _sdBindOnce() {
     if (sdState.bound) return;
     sdState.bound = true;
+
+    var modeSel = el('sd-mode');
+    if (modeSel) modeSel.addEventListener('change', function() { _sdMajChamps(); _sdRefresh(); });
+    ['sd-code', 'sd-montant', 'sd-nb-cartes', 'sd-points', 'sd-points-requis', 'sd-remise-fid'].forEach(function(id) {
+        var e = el(id);
+        if (e) e.addEventListener('input', _sdRefresh);
+    });
     var close = el('close-solde-btn');
     if (close) close.addEventListener('click', closeSoldePanel);
     var overlay = el('solde-overlay');
@@ -5891,6 +6114,7 @@ function _popupFermetures() {
         'stock-recon-overlay':     closeStockRecon,
         'product-history-overlay': closeProductHistory,
         'ac-reassort-overlay':     closeActionReassort,
+        'ac-transferts-overlay':   closeHistoriqueTransferts,
     };
 }
 
@@ -5952,6 +6176,7 @@ var AC_COLONNES = [
     ['rang',          '#',                 true,  false],
     ['photo',         'Photo',             true,  false],
     ['ref',           'Référence',         true,  false],
+    ['transferts',    'Transferts',        true,  true],
     ['couleur',       'Couleur',           true,  false],
     ['categorie',     'Catégorie',         true,  false],
     ['prix',          'Prix (TTC)',        true,  true],
@@ -5976,6 +6201,7 @@ var AC_GROUPES = { categorie: 'Catégorie', collection: 'Collection' };
 var acState = {
     rows: [], total: 0, q: '', filtres: [], groupe: null,
     ouvertes: {}, colonnes: null, bound: false, seq: 0, societe_id: '', ordre: 'top',
+    regions: [], villes: [], magasins: [], lieux: null,
 };
 
 // Préférences d'affichage (colonnes, favoris) : propres à ce navigateur,
@@ -5999,6 +6225,20 @@ function _acColonnesVisibles() {
 }
 
 async function loadActions() {
+    // Filet : si quoi que ce soit échoue avant l'affichage, on l'écrit dans
+    // le tableau au lieu de laisser la page vide (constat 2026-09-24).
+    try {
+        await _loadActions();
+    } catch (e) {
+        console.error('Erreur page Actions:', e);
+        var tb = el('ac-tbody');
+        if (tb) tb.innerHTML = '<tr><td class="ac-empty" style="color:#B91C1C;" colspan="'
+            + AC_COLONNES.length + '">Erreur : ' + _escapeHtml(e && e.message || String(e)) + '</td></tr>';
+        showLoading(false);
+    }
+}
+
+async function _loadActions() {
     _acBindOnce();
     var limitEl = el('ac-limit');
     var limit = limitEl ? parseInt(limitEl.value, 10) : 20;
@@ -6009,6 +6249,9 @@ async function loadActions() {
     params.filtres = acState.filtres;
     params.societe_id = acState.societe_id || '';
     params.ordre = acState.ordre || 'top';
+    params.regions = acState.regions;
+    params.villes = acState.villes;
+    params.magasins = acState.magasins;
     var seq = ++acState.seq;
     var tbody = el('ac-tbody');
     if (tbody && !acState.rows.length) {
@@ -6016,7 +6259,11 @@ async function loadActions() {
     }
     showLoading(true);
     var data = await rpc('/mavie/api/actions', params);
-    if (seq !== acState.seq) return;
+    // CORRIGÉ (2026-09-24, « rien ne s'affiche tant que je ne clique pas
+    // sur Top → Flop ») : une réponse dépassée était ignorée, et si c'était
+    // la seule, le tableau restait vide. On ne l'ignore que si quelque
+    // chose est déjà affiché.
+    if (seq !== acState.seq && acState.rows.length) return;
     showLoading(false);
     if (!data || data.error) {
         acState.rows = [];
@@ -6028,14 +6275,23 @@ async function loadActions() {
     acState.total = data.total || 0;
     acState.nbRefs = data.nb_references || 0;
     acState.perimetre = data.perimetre || '';
-    _acFillSocietes(data.societes || []);
-    _acRender();
+    try {
+        _acFillSocietes(data.societes || []);
+        if (data.lieux) acState.lieux = data.lieux;
+        _acMajOrdre();
+        _acRender();
+    } catch (e) {
+        // Une erreur d'affichage laissait un écran blanc : on la montre.
+        console.error('Erreur affichage Actions:', e);
+        if (tbody) tbody.innerHTML = '<tr><td class="ac-empty" style="color:#B91C1C;" colspan="'
+            + AC_COLONNES.length + '">Erreur d\'affichage : ' + _escapeHtml(e && e.message || String(e)) + '</td></tr>';
+    }
 }
 
 var AC_NIVEAUX = {
-    top:   ['▲', '#DC2626', 'Top : fait partie des références qui réalisent 80 % du chiffre d\'affaires'],
-    moyen: ['►', '#D97706', 'Moyen : entre 80 % et 95 % du chiffre d\'affaires cumulé'],
-    flop:  ['▼', '#16A34A', 'Flop : les 5 derniers % du chiffre d\'affaires, ou aucune vente'],
+    top:   ['▲', '#16A34A', 'Top : 80 % des ventes'],
+    moyen: ['►', '#D97706', 'Moyen'],
+    flop:  ['▼', '#DC2626', 'Flop : peu ou pas de ventes'],
 };
 
 // Pastilles « ce que cette référence a eu comme action » (demande
@@ -6054,9 +6310,8 @@ function _acMajOrdre() {
     var b = el('ac-ordre');
     if (!b) return;
     var flop = acState.ordre === 'flop';
-    b.innerHTML = flop ? '<span style="color:#16A34A;">▼</span> Flop → Top' : '<span style="color:#DC2626;">▲</span> Top → Flop';
-    b.title = flop ? 'Affiché du flop au top — cliquer pour afficher du top au flop'
-                   : 'Affiché du top au flop — cliquer pour afficher du flop au top';
+    b.innerHTML = flop ? '<span style="color:#DC2626;">▼</span> Flop → Top' : '<span style="color:#16A34A;">▲</span> Top → Flop';
+    b.title = 'Cliquer pour inverser';
 }
 
 function _acBadges(actions) {
@@ -6067,7 +6322,7 @@ function _acBadges(actions) {
         if (!n) return;
         var a = AC_ACTIONS[k];
         h += '<button type="button" class="ac-badge" data-ac="fiche" style="color:' + a[1] + ';background:' + a[2] + ';" title="'
-           + _escapeHtml(a[3](n)) + ' — cliquer pour voir le détail par magasin">' + a[0] + ' ' + n + '</button>';
+           + _escapeHtml(a[3](n)) + ' — voir la fiche">' + a[0] + ' ' + n + '</button>';
     });
     return h ? ' <span class="ac-badges">' + h + '</span>' : '';
 }
@@ -6102,6 +6357,33 @@ function _acCell(cle, r, estRef) {
                 : '<div class="ac-nophoto">pas de photo</div>';
         case 'ref':
             return estRef ? '<span class="ac-caret">▾</span> ' + _escapeHtml(r.ref) + _acBadges(r.actions) : '';
+        // Transferts. CORRIGÉ le 2026-09-24 : sans magasin choisi, « reçu »
+        // et « envoyé » donnaient le même nombre — normal, chaque bon part
+        // d'un magasin et arrive dans un autre. On montre donc les pièces
+        // réellement déplacées, et le reçu / envoyé seulement quand un
+        // magasin, une ville ou une région est filtré.
+        case 'transferts':
+            if (!estRef) return '';
+            var tr2 = r.transferts || {};
+            if (!tr2.pieces) return '<span class="ac-muted">—</span>';
+            // Une seule colonne (demande utilisatrice 2026-09-24) : les
+            // pièces déplacées, ou le reçu et l'envoyé quand un lieu est
+            // filtré — là seulement les deux sens sont différents.
+            if (!tr2.scope) {
+                return '<button type="button" class="ac-btn" data-ac="histo" style="padding:2px 8px;font-size:0.74rem;" '
+                     + 'title="Reçues dans ' + formatNumber(tr2.nb_magasins_recu) + ' magasins, envoyées depuis '
+                     + formatNumber(tr2.nb_magasins_envoye) + ' — voir le détail">'
+                     + formatNumber(tr2.pieces) + ' pcs déplacées</button>';
+            }
+            var bouts = [];
+            if (tr2.recu) bouts.push('<button type="button" class="ac-btn" data-ac="histo-recu" '
+                + 'style="padding:2px 8px;font-size:0.74rem;color:#1D4ED8;" title="Reçu par ces magasins — voir les bons">+ '
+                + formatNumber(tr2.recu) + '</button>');
+            if (tr2.envoye) bouts.push('<button type="button" class="ac-btn" data-ac="histo-envoye" '
+                + 'style="padding:2px 8px;font-size:0.74rem;color:#3730A3;" title="Envoyé par ces magasins — voir les bons">− '
+                + formatNumber(tr2.envoye) + '</button>');
+            return bouts.length ? '<div class="ac-actions" style="justify-content:flex-end;">' + bouts.join('') + '</div>'
+                                : '<span class="ac-muted">—</span>';
         case 'couleur':
             return estRef ? '' : '<span class="mfl-color">' + _escapeHtml(r.couleur) + '</span>';
         case 'categorie': return estRef ? '<span class="ac-cat">' + _escapeHtml(r.categorie) + '</span>' : '';
@@ -6125,11 +6407,11 @@ function _acCell(cle, r, estRef) {
             // Mêmes boutons sur la référence (toutes couleurs) et sur chaque
             // couleur (demande utilisatrice : « si je veux choisir la
             // variante ? ») : la couleur est alors présélectionnée.
-            var quoi = estRef ? 'cette référence (toutes couleurs)' : 'la couleur ' + r.couleur;
+            var quoi = estRef ? 'toutes couleurs' : r.couleur;
             return '<div class="ac-actions">'
-                + '<button type="button" class="ac-btn" data-ac="transfer" title="Transférer ' + _escapeHtml(quoi) + ' entre magasins">🔄 Transférer</button>'
-                + '<button type="button" class="ac-btn" data-ac="solde" title="Solder ' + _escapeHtml(quoi) + ' dans un ou plusieurs magasins">🏷️ Solder</button>'
-                + '<button type="button" class="ac-btn" data-ac="reassort" title="Ce que le dépôt peut envoyer pour ' + _escapeHtml(quoi) + '">📦 Réassort</button>'
+                + '<button type="button" class="ac-btn" data-ac="transfer" title="Transférer · ' + _escapeHtml(quoi) + '">🔄 Transférer</button>'
+                + '<button type="button" class="ac-btn" data-ac="solde" title="Solder · ' + _escapeHtml(quoi) + '">🏷️ Solder</button>'
+                + '<button type="button" class="ac-btn" data-ac="reassort" title="Réassort · ' + _escapeHtml(quoi) + '">📦 Réassort</button>'
                 + '</div>';
     }
     return '';
@@ -6200,10 +6482,12 @@ function _acRender() {
     }
     var foot = el('ac-foot');
     if (foot) {
-        foot.textContent = 'Classement ' + (acState.ordre === 'flop' ? 'du flop au top' : 'du top au flop')
-            + ' par chiffre d\'affaires vendu (▲ top, ► moyen, ▼ flop), sur les filtres du haut (période, magasin, collection…). '
-            + 'Pastilles à côté de la référence : 🔄 transferts, 🏷️ solde active, 📦 réassorts. '
-            + '« Qté en dépôt » = stock du dépôt MOD FOR LIFE. Cliquez une référence pour voir ses couleurs (et cliquez à nouveau pour les cacher).';
+        // Phrases courtes (demande utilisatrice 2026-09-23).
+        foot.innerHTML = 'Classé par ventes, ' + (acState.ordre === 'flop' ? 'du flop au top' : 'du top au flop') + '.'
+            + '<br>▲ top · ► moyen · ▼ flop.'
+            + '<br>🔄 transferts · 🏷️ en solde · 📦 réassorts.'
+            + '<br>Dépôt = stock MOD FOR LIFE.'
+            + '<br>Cliquez une référence pour voir ses couleurs.';
     }
     _acRenderFacets();
     _acRenderPanels();
@@ -6217,6 +6501,15 @@ function _acRenderFacets() {
         h += '<span class="ac-facet"><b>⏷</b> ' + acState.filtres.map(function(f) { return _escapeHtml(AC_FILTRES[f]); }).join(' ou ')
            + '<button type="button" data-clear="filtres" title="Retirer">×</button></span>';
     }
+    var lieuxActifs = (acState.regions || []).concat(acState.villes || [])
+        .concat((acState.magasins || []).map(function(sf) {
+            var m = ((acState.lieux || {}).magasins || []).filter(function(x) { return x.shop_field === sf; })[0];
+            return m ? m.nom : sf;
+        }));
+    if (lieuxActifs.length) {
+        h += '<span class="ac-facet"><b>📍</b> ' + _escapeHtml(lieuxActifs.join(', '))
+           + '<button type="button" data-clear="lieux" title="Retirer">×</button></span>';
+    }
     if (acState.groupe) {
         h += '<span class="ac-facet grp"><b>☰</b> ' + _escapeHtml(AC_GROUPES[acState.groupe])
            + '<button type="button" data-clear="groupe" title="Retirer">×</button></span>';
@@ -6224,7 +6517,30 @@ function _acRenderFacets() {
     box.innerHTML = h;
 }
 
+// Filtres Lieux : régions, villes, magasins (demande 2026-09-23).
+function _acRenderLieux() {
+    var lieux = acState.lieux || {};
+    function liste(hote, valeurs, cle, libelle) {
+        var box = el(hote);
+        if (!box) return;
+        box.innerHTML = (valeurs || []).map(function(v) {
+            var val = libelle ? v[cle] : v;
+            var txt = libelle ? libelle(v) : v;
+            var on = (acState[hote === 'ac-regions' ? 'regions' : (hote === 'ac-villes' ? 'villes' : 'magasins')] || [])
+                .indexOf(val) !== -1;
+            return '<div class="ac-item' + (on ? ' on' : '') + '" data-lieu="' + hote + '" data-val="'
+                 + _escapeHtml(val) + '">' + _escapeHtml(txt) + '</div>';
+        }).join('') || '<div class="ac-fav-empty">—</div>';
+    }
+    liste('ac-regions', lieux.regions);
+    liste('ac-villes', lieux.villes);
+    liste('ac-magasins', lieux.magasins, 'shop_field', function(m) {
+        return m.nom + (m.ville ? ' · ' + m.ville : '');
+    });
+}
+
 function _acRenderPanels() {
+    _acRenderLieux();
     var panel = el('ac-search-panel');
     if (panel) {
         panel.querySelectorAll('[data-filtre]').forEach(function(it) {
@@ -6354,6 +6670,16 @@ function _acBindOnce() {
             loadActions();
             return;
         }
+        var lieu = t.closest('[data-lieu]');
+        if (lieu) {
+            var hote = lieu.getAttribute('data-lieu');
+            var cleL = hote === 'ac-regions' ? 'regions' : (hote === 'ac-villes' ? 'villes' : 'magasins');
+            var valL = lieu.getAttribute('data-val');
+            var iL = acState[cleL].indexOf(valL);
+            if (iL === -1) acState[cleL].push(valL); else acState[cleL].splice(iL, 1);
+            loadActions();
+            return;
+        }
         var gr = t.closest('[data-group]');
         if (gr) {
             var g = gr.getAttribute('data-group');
@@ -6379,7 +6705,9 @@ function _acBindOnce() {
     if (facets) facets.addEventListener('click', function(e) {
         var b = e.target.closest('[data-clear]');
         if (!b) return;
-        if (b.getAttribute('data-clear') === 'groupe') { acState.groupe = null; _acRender(); }
+        var quoi = b.getAttribute('data-clear');
+        if (quoi === 'groupe') { acState.groupe = null; _acRender(); }
+        else if (quoi === 'lieux') { acState.regions = []; acState.villes = []; acState.magasins = []; loadActions(); }
         else { acState.filtres = []; loadActions(); }
     });
 
@@ -6411,6 +6739,9 @@ function _acBindOnce() {
             else if (a === 'solde') openSoldePanel(r.id, couleur);
             else if (a === 'reassort') openActionReassort(r, couleur);
             else if (a === 'fiche') openDetail(r.id, r.name);
+            else if (a === 'histo') openHistoriqueTransferts(r);
+            else if (a === 'histo-recu') openHistoriqueTransferts(r, 'recu');
+            else if (a === 'histo-envoye') openHistoriqueTransferts(r, 'envoye');
             return;
         }
         if (!estRef) return;
@@ -6418,77 +6749,250 @@ function _acBindOnce() {
         _acRender();
     });
 
+    var closeTr = el('close-ac-transferts-btn');
+    if (closeTr) closeTr.addEventListener('click', closeHistoriqueTransferts);
+    var trOv = el('ac-transferts-overlay');
+    if (trOv) trOv.addEventListener('click', function(e) { if (e.target === trOv) closeHistoriqueTransferts(); });
+
     var closeRa = el('close-ac-reassort-btn');
     if (closeRa) closeRa.addEventListener('click', closeActionReassort);
     var raOv = el('ac-reassort-overlay');
     if (raOv) raOv.addEventListener('click', function(e) { if (e.target === raOv) closeActionReassort(); });
 }
 
-// ── Bouton « Réassort » : ce que le dépôt peut envoyer pour CETTE
-// référence, magasin par magasin (même calcul que le réassort MOD FOR
-// LIFE : /mavie/api/reassort filtré sur l'article).
+// ── Réassort d'une référence, depuis la page Action ──
+// REFAIT le 2026-09-24 : la fenêtre ne montrait que les magasins en alerte,
+// donc souvent rien. Elle montre maintenant TOUS les magasins, avec ce que
+// le dépôt peut envoyer, et prépare les documents Odoo en brouillon :
+// bon d'achat fournisseur si le dépôt manque, bons de vente inter-sociétés
+// sinon.
+var raArticle = { data: null, qtes: {} };
+
 async function openActionReassort(r, couleur) {
     var ov = el('ac-reassort-overlay');
     if (!ov) return;
-    var refEl = el('ac-ra-ref'); if (refEl) refEl.textContent = r.ref + (couleur ? ' — ' + couleur : '');
-    var vc = couleur ? (r.variantes || []).filter(function(x) { return x.couleur === couleur; })[0] : null;
-    var sub = el('ac-ra-sub'); if (sub) sub.textContent = r.name + ' · ' + formatNumber(vc ? vc.depot : r.depot) + ' pièces au dépôt';
+    var refEl = el('ac-ra-ref');
+    if (refEl) refEl.textContent = r.ref + (couleur ? ' — ' + couleur : '');
     var body = el('ac-ra-body');
     if (body) body.innerHTML = '<div class="ac-empty">Calcul du réassort…</div>';
     ov.classList.add('active');
-    var params = { article_id: r.id, shop_field: state.shop_field, societe_id: acState.societe_id || '' };
-    var data = await rpc('/mavie/api/reassort', params);
+    var data = await rpc('/mavie/api/reassort-article', {
+        article_id: r.id, couleur: couleur || '', shop_field: state.shop_field,
+        societe_id: acState.societe_id || '',
+    });
     if (!body) return;
     if (!data || data.error) {
-        body.innerHTML = '<div class="ac-empty" style="color:#B91C1C;">Erreur : ' + _escapeHtml(data && data.error || 'inconnue') + '</div>';
+        body.innerHTML = '<div class="ac-empty" style="color:#B91C1C;">Erreur : '
+            + _escapeHtml((data && data.error) || 'inconnue') + '</div>';
         return;
     }
-    // Bouton d'une ligne couleur : seulement cette couleur.
-    var rows = (data.rows || []).filter(function(x) { return !couleur || x.couleur === couleur; }).sort(function(a, b) { return (b.propose - a.propose) || (a.jours_restants || 0) - (b.jours_restants || 0); });
-    var envoyer = rows.filter(function(x) { return x.propose > 0; });
-    var pieces = envoyer.reduce(function(a, x) { return a + x.propose; }, 0);
-    var manquant = rows.filter(function(x) { return x.propose <= 0 && x.depot <= 0; }).length;
-    var fenetre = (data.params && data.params.fenetre) || 90;
-    var h = '<div class="ac-ra-kpis">'
-          + '<div class="ac-ra-kpi"><b>' + formatNumber(pieces) + '</b><span>pièces à envoyer</span></div>'
-          + '<div class="ac-ra-kpi"><b>' + formatNumber(envoyer.length) + '</b><span>lignes magasin × couleur à livrer</span></div>'
-          + '<div class="ac-ra-kpi"><b>' + formatNumber(manquant) + '</b><span>besoins que le dépôt ne peut pas couvrir</span></div>'
-          + '</div>';
-    if (!rows.length) {
-        h += '<div class="ac-empty">Aucune alerte de réassort pour cette référence : aucun magasin n\'est presque vide ni ne vend trop vite pour son stock.</div>';
-    } else {
-        h += '<div class="ac-table-wrap" style="max-height:52vh;"><table class="ac-table"><thead><tr>'
-           + '<th>Magasin</th><th>Couleur</th><th>Taille</th><th class="num">Stock</th>'
-           + '<th class="num">Vendu (' + fenetre + ' j)</th><th class="num">Jours restants</th>'
-           + '<th class="num">Dépôt</th><th class="num">À envoyer</th><th>Alerte</th><th></th></tr></thead><tbody>';
-        rows.forEach(function(x) {
-            var alerte = x.alerte === 'pct' ? 'Presque vide' : (x.alerte === 'vitesse' ? 'Se vend vite' : '—');
-            h += '<tr class="ac-var">'
-               + '<td><strong>' + _escapeHtml(x.magasin) + '</strong></td>'
-               + '<td><span class="mfl-color">' + _escapeHtml(x.couleur) + '</span></td>'
-               + '<td>' + _escapeHtml(x.taille || '—') + '</td>'
-               + '<td class="num">' + formatNumber(x.stock) + '</td>'
-               + '<td class="num">' + formatNumber(x.vendu) + '</td>'
-               + '<td class="num">' + (x.jours_restants === null || x.jours_restants === undefined ? '—' : formatNumber(Math.round(x.jours_restants))) + '</td>'
-               + '<td class="num">' + formatNumber(x.depot) + '</td>'
-               + '<td class="num">' + (x.propose > 0 ? '<strong style="color:#166534;">' + formatNumber(x.propose) + '</strong>'
-                   : (x.depot <= 0 ? '<span class="ac-neg">manquant</span>' : '<span class="ac-muted">0</span>')) + '</td>'
-               + '<td>' + alerte + '</td>'
-               + '<td>' + (x.propose > 0 ? '<button type="button" class="ac-btn" data-ra-couleur="' + _escapeHtml(x.couleur) + '" data-ra-shop="' + _escapeHtml(x.shop_field || '') + '">🔄 Transférer</button>' : '') + '</td>'
-               + '</tr>';
-        });
-        h += '</tbody></table></div>';
+    data._article = r;
+    data._couleur = couleur || '';
+    raArticle.data = data;
+    raArticle.qtes = {};
+    (data.magasins || []).forEach(function(m) { raArticle.qtes[m.wh_id] = m.propose; });
+    _raArticleRender();
+}
+
+function _raArticleRender() {
+    var data = raArticle.data || {};
+    var body = el('ac-ra-body');
+    var sub = el('ac-ra-sub');
+    if (sub) {
+        sub.textContent = (data.nom || '') + ' · ' + formatNumber(data.depot) + ' pièces au dépôt · '
+            + 'besoin ' + formatNumber(data.besoin_total) + ' pcs sur ' + data.fenetre + ' jours'
+            + (data.fournisseur ? ' · fournisseur ' + data.fournisseur : '');
     }
+    if (!body) return;
+    var aEnvoyer = Object.keys(raArticle.qtes).reduce(function(a, k) { return a + (raArticle.qtes[k] || 0); }, 0);
+    var h = '<div class="ac-ra-kpis">'
+          + '<div class="ac-ra-kpi"><b>' + formatNumber(data.depot) + '</b><span>pièces au dépôt</span></div>'
+          + '<div class="ac-ra-kpi"><b>' + formatNumber(data.besoin_total) + '</b><span>besoin des magasins</span></div>'
+          + '<div class="ac-ra-kpi"><b>' + formatNumber(data.manque_depot) + '</b><span>manquant au dépôt</span></div>'
+          + '</div>';
+    h += '<div class="ac-table-wrap" style="max-height:44vh;"><table class="ac-table"><thead><tr>'
+       + '<th>Magasin</th><th>Société</th><th class="num" title="Stock de ce magasin, pas celui du dépôt">Stock magasin</th>'
+       + '<th class="num">Vendu (' + data.fenetre + ' j)</th>'
+       + '<th class="num">Besoin</th><th class="num">À envoyer</th></tr></thead><tbody>';
+    (data.magasins || []).forEach(function(m) {
+        h += '<tr class="ac-var"><td><strong>' + _escapeHtml(m.magasin) + '</strong></td>'
+           + '<td class="ac-muted">' + _escapeHtml(m.societe) + '</td>'
+           + '<td class="num"' + (m.stock < 0 ? ' style="color:#DC2626;"' : '') + '>' + formatNumber(m.stock) + '</td>'
+           + '<td class="num">' + formatNumber(m.vendu) + '</td>'
+           + '<td class="num">' + (m.besoin ? formatNumber(m.besoin) : '<span class="ac-muted">—</span>') + '</td>'
+           + '<td class="num"><input type="number" min="0" step="1" data-ra-wh="' + m.wh_id + '" value="'
+           + (raArticle.qtes[m.wh_id] || 0) + '" style="width:72px;text-align:right;border:1px solid var(--border);'
+           + 'border-radius:6px;padding:3px 6px;font-family:inherit;"/></td></tr>';
+    });
+    h += '</tbody></table></div>';
+    h += '<div class="sd-foot" style="margin-top:12px;">'
+       + '<div class="sd-summary">' + formatNumber(aEnvoyer) + ' pièces à envoyer depuis le dépôt'
+       + (data.manque_depot ? ' · ' + formatNumber(data.manque_depot) + ' manquantes à commander' : '') + '</div>'
+       + '<div class="ac-actions">'
+       + '<button type="button" class="ac-btn" id="btn-ra-achat" title="Base Pivot génère le bon d\'achat fournisseur dans MOD FOR LIFE">'
+       + '🛒 Générer l\'achat fournisseur</button>'
+       + '<button type="button" class="ac-btn ac-btn-primary" id="btn-ra-vente" title="Base Pivot génère les ventes inter-sociétés MOD FOR LIFE → sociétés">'
+       + '🚚 Générer la vente inter-sociétés</button>'
+       + '</div></div>';
+    h += '<div class="ac-foot">Les documents sont générés par Base Pivot, comme depuis son écran.</div>';
+    h += '<div id="ac-ra-result" style="margin-top:10px;"></div>';
     body.innerHTML = h;
-    body.onclick = function(e) {
-        var b = e.target.closest && e.target.closest('[data-ra-couleur]');
-        if (!b) return;
-        var couleur = b.getAttribute('data-ra-couleur');
-        closeActionReassort();
-        openTransferPanel(r.id, r.name, couleur === '—' ? null : couleur, b.getAttribute('data-ra-shop') || null, (r.variantes || []).map(function(x) { return x.couleur; }));
-        state.transfer.reassort = true;
-        _setRetour('transfer-overlay', function() { openActionReassort(r, couleur); });
-    };
+
+    body.querySelectorAll('[data-ra-wh]').forEach(function(inp) {
+        inp.addEventListener('input', function() {
+            raArticle.qtes[inp.getAttribute('data-ra-wh')] = Math.max(0, parseInt(inp.value, 10) || 0);
+            var somme = Object.keys(raArticle.qtes).reduce(function(a, k) { return a + (raArticle.qtes[k] || 0); }, 0);
+            var res = body.querySelector('.sd-summary');
+            if (res) res.textContent = formatNumber(somme) + ' pièces à envoyer depuis le dépôt';
+        });
+    });
+    var btnA = el('btn-ra-achat');
+    if (btnA) btnA.addEventListener('click', function() { _raGenerer('achat'); });
+    var btnV = el('btn-ra-vente');
+    if (btnV) btnV.addEventListener('click', function() { _raGenerer('vente'); });
+}
+
+async function _raGenerer(mode) {
+    var data = raArticle.data || {};
+    var res = el('ac-ra-result');
+    var params = { article_id: data.article_id, couleur: data._couleur || '', mode: mode };
+    var msg;
+    // Les quantités saisies dans la colonne « À envoyer » suffisent : plus
+    // de seconde question (demande utilisatrice 2026-09-24).
+    params.lignes = Object.keys(raArticle.qtes)
+        .filter(function(k) { return raArticle.qtes[k] > 0; })
+        .map(function(k) { return { wh_id: parseInt(k, 10), qty: raArticle.qtes[k] }; });
+    var total = params.lignes.reduce(function(a, l) { return a + l.qty; }, 0);
+    if (mode === 'achat') {
+        if (!total) {
+            // Rien de saisi : on propose ce qui manque au dépôt.
+            var saisie = window.prompt('Combien de pièces commander au fournisseur '
+                + (data.fournisseur || '') + ' ?', data.manque_depot || data.besoin_total || 0);
+            if (saisie === null) return;
+            total = parseInt(saisie, 10) || 0;
+            if (total <= 0) return;
+            params.quantite = total;
+        }
+        msg = 'Base Pivot va créer le bon d\'achat fournisseur '
+            + (data.fournisseur ? '(' + data.fournisseur + ') ' : '')
+            + 'pour ' + total + ' pièces. Continuer ?';
+    } else {
+        if (!params.lignes.length) { window.alert('Indiquez au moins une quantité à envoyer.'); return; }
+        msg = 'Base Pivot va générer les ventes inter-sociétés pour ' + params.lignes.length
+            + ' magasin(s) : bons de vente confirmés et livraisons créées dans Odoo. Continuer ?';
+    }
+    if (!window.confirm(msg)) return;
+    if (res) res.innerHTML = '<div class="ac-empty">Création…</div>';
+    var out = await rpc('/mavie/api/reassort-generer', params);
+    if (!res) return;
+    if (!out || out.error) {
+        res.innerHTML = '<div class="sd-result ko" style="display:block;">' + _escapeHtml((out && out.error) || 'Erreur inconnue') + '</div>';
+        return;
+    }
+    var lignes = (out.documents || []).map(function(d) {
+        return '✓ <b>' + _escapeHtml(d.document) + '</b> — ' + _escapeHtml(d.partenaire || '')
+             + ' · ' + formatNumber(d.quantite) + ' pcs · ' + _escapeHtml(d.etat || '');
+    });
+    res.innerHTML = '<div class="sd-result ok" style="display:block;"><b>Base Pivot a généré '
+        + lignes.length + ' document' + (lignes.length > 1 ? 's' : '') + '.</b><br/>'
+        + lignes.join('<br/>')
+        + '<br/><span style="color:#475569;">Batch : ' + _escapeHtml(out.batch || '') + '</span></div>';
+}
+
+// Mêmes regroupements de villes que le serveur (ACTION_REGIONS).
+var AC_REGIONS_VILLES = {
+    'Grand Casablanca': ['Casablanca', 'Mohammadia'],
+    'Rabat-Salé': ['Rabat', 'Témara'],
+    'Souss (Agadir)': ['Agadir'],
+    'Nord (Tanger)': ['Tanger'],
+};
+
+// Noms des magasins retenus par les filtres Lieux de la page Action.
+function _acMagasinsFiltresNoms() {
+    var lieux = (acState.lieux || {}).magasins || [];
+    var noms = [];
+    lieux.forEach(function(m) {
+        var pris = (acState.magasins || []).indexOf(m.shop_field) !== -1
+            || (acState.villes || []).indexOf(m.ville) !== -1
+            || (acState.regions || []).some(function(r) {
+                return (AC_REGIONS_VILLES[r] || []).indexOf(m.ville) !== -1;
+            });
+        if (pris && noms.indexOf(m.nom) === -1) noms.push(m.nom);
+    });
+    return noms;
+}
+
+// Historique des transferts d'une référence (colonne Transferts de la page
+// Action) : d'abord ce qui s'est passé par magasin, puis tous les bons.
+async function openHistoriqueTransferts(r, sens) {
+    var ov = el('ac-transferts-overlay');
+    if (!ov) return;
+    var refEl = el('ac-tr-ref');
+    if (refEl) refEl.textContent = r.ref + (sens === 'recu' ? ' · reçu' : (sens === 'envoye' ? ' · envoyé' : ''));
+    var sub = el('ac-tr-sub'); if (sub) sub.textContent = r.name || '';
+    var body = el('ac-tr-body');
+    if (body) body.innerHTML = '<div class="ac-empty">Chargement…</div>';
+    ov.classList.add('active');
+    var data = await rpc('/mavie/api/transferts-reference', { article_id: r.id });
+    if (!body) return;
+    if (!data || data.error) {
+        body.innerHTML = '<div class="ac-empty" style="color:#B91C1C;">Erreur : '
+            + _escapeHtml((data && data.error) || 'inconnue') + '</div>';
+        return;
+    }
+    var lignes = data.lignes || [];
+    var magsFiltres = _acMagasinsFiltresNoms();
+    if (sens && magsFiltres.length) {
+        lignes = lignes.filter(function(l) {
+            return magsFiltres.indexOf(sens === 'recu' ? l.dest : l.source) !== -1;
+        });
+    }
+    var titreSens = sens === 'recu' ? 'Reçu' : (sens === 'envoye' ? 'Envoyé' : '');
+    if (sub) sub.textContent = (data.nom || '')
+        + (titreSens ? ' · ' + titreSens : '')
+        + (magsFiltres.length ? ' · ' + magsFiltres.join(', ') : '')
+        + ' · ' + formatNumber(lignes.length) + ' bons · '
+        + formatNumber(lignes.reduce(function(a, l) { return a + l.qty; }, 0)) + ' pièces';
+    if (!lignes.length) {
+        body.innerHTML = '<div class="ac-empty">Aucun transfert pour cette référence.</div>';
+        return;
+    }
+    var h = '';
+    var mags = data.magasins || [];
+    if (mags.length && !sens) {
+        h += '<div class="ac-table-wrap" style="max-height:32vh;margin-bottom:12px;"><table class="ac-table"><thead><tr>'
+           + '<th>Magasin</th><th class="num">Reçu</th><th class="num">Envoyé</th><th class="num">Net</th>'
+           + '</tr></thead><tbody>';
+        mags.forEach(function(m) {
+            h += '<tr class="ac-var"><td><strong>' + _escapeHtml(m.magasin) + '</strong></td>'
+               + '<td class="num"' + (m.recu ? ' style="color:#1D4ED8;font-weight:700;"' : '') + '>'
+               + (m.recu ? '+ ' + formatNumber(m.recu) : '—') + '</td>'
+               + '<td class="num"' + (m.envoye ? ' style="color:#3730A3;font-weight:700;"' : '') + '>'
+               + (m.envoye ? '− ' + formatNumber(m.envoye) : '—') + '</td>'
+               + '<td class="num"' + (m.net < 0 ? ' style="color:#DC2626;"' : '') + '>' + formatNumber(m.net) + '</td></tr>';
+        });
+        h += '</tbody></table></div><div class="ac-foot" style="margin:0 0 6px;">Tous les bons :</div>';
+    }
+    h += '<div class="ac-table-wrap" style="max-height:44vh;"><table class="ac-table"><thead><tr>'
+       + '<th>Date</th><th>Bon</th><th>Départ</th><th>Arrivée</th><th>Sociétés</th>'
+       + '<th class="num">Qté</th><th>État</th></tr></thead><tbody>';
+    lignes.forEach(function(l) {
+        h += '<tr class="ac-var">'
+           + '<td>' + _escapeHtml(l.date) + '</td>'
+           + '<td><strong>' + _escapeHtml(l.bon) + '</strong>'
+           + (l.reassort ? ' <span style="color:#166534;">réassort</span>' : '') + '</td>'
+           + '<td>' + _escapeHtml(l.source) + '</td>'
+           + '<td>' + _escapeHtml(l.dest) + '</td>'
+           + '<td class="ac-muted">' + _escapeHtml(l.societes) + '</td>'
+           + '<td class="num">' + formatNumber(l.qty) + '</td>'
+           + '<td' + (l.fait ? '' : ' style="color:#B45309;"') + '>' + _escapeHtml(l.etat) + '</td></tr>';
+    });
+    body.innerHTML = h + '</tbody></table></div>';
+}
+
+function closeHistoriqueTransferts() {
+    var ov = el('ac-transferts-overlay');
+    if (ov) ov.classList.remove('active');
 }
 
 function closeActionReassort() {

@@ -102,6 +102,7 @@
                             <table class="table table-sm table-bordered" style="font-size:12px;">
                                 <thead style="background-color:#1F497D; color:#FFFFFF;">
                                     <tr>
+                                        <th class="text-center" style="width:10%;">Photo</th>
                                         <th class="text-center" style="width:18%;">Référence</th>
                                         <th class="text-center">Produit</th>
                                         <th class="text-center" style="width:15%;">Couleur</th>
@@ -112,6 +113,7 @@
                                 <tbody>
                                     <t t-foreach="gdoc.line_ids" t-as="line">
                                         <tr>
+                                            <td class="text-center"><t t-set="img" t-value="line.product_id.product_tmpl_id.image_128"/><img t-if="img" t-att-src="'data:image/png;base64,%s' % img.decode()" style="height:40px;"/><span t-if="not img">—</span></td>
                                             <td t-esc="line.reference or ''"/>
                                             <td t-esc="line.product_id.display_name or ''"/>
                                             <td t-esc="line.color_name or ''"/>
@@ -124,7 +126,7 @@
                                 </tbody>
                                 <tfoot>
                                     <tr style="background-color:#F2F2F2; font-weight:bold;">
-                                        <td colspan="4" class="text-end">Sous-total</td>
+                                        <td colspan="5" class="text-end">Sous-total</td>
                                         <td class="text-center">
                                             <span t-esc="'%.0f' % sum(gdoc.line_ids.mapped('quantity'))"/>
                                         </td>

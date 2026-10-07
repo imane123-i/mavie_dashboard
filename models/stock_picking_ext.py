@@ -46,5 +46,5 @@ class StockPickingTransferExt(models.Model):
             lambda t: t.state == 'transmitted'
         )
         if transfers:
-            transfers.write({'state': 'draft', 'picking_id': False})
+            transfers.write({'state': 'cancelled', 'picking_id': False})
         return res

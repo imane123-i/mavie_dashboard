@@ -39,7 +39,17 @@ export class MaVieDashboardActionAction extends MaVieDashboardAction {
 }
 MaVieDashboardActionAction.template = "mavie_dashboard.IframeView";
 
+// Page « Propositions » : ce que le tableau de bord propose de faire —
+// deux onglets : les soldes, et les transferts.
+export class MaVieDashboardActionPropositions extends MaVieDashboardAction {
+    get page() {
+        return 'propositions';
+    }
+}
+MaVieDashboardActionPropositions.template = "mavie_dashboard.IframeView";
+
 // Register action components
 registry.category("actions").add("mavie_dashboard.action_sales", MaVieDashboardActionSales);
 registry.category("actions").add("mavie_dashboard.action_stock", MaVieDashboardActionStock);
 registry.category("actions").add("mavie_dashboard.action_action", MaVieDashboardActionAction);
+registry.category("actions").add("mavie_dashboard.action_propositions", MaVieDashboardActionPropositions);

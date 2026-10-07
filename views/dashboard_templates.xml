@@ -118,6 +118,80 @@
                     transition: border-color var(--transition), box-shadow var(--transition);
                 }
 
+                /* Filtre à choix multiples (catégories) */
+                .filter-multi { position: relative; }
+                .filter-multi-btn {
+                    width: 100%;
+                    text-align: left;
+                    background: var(--surface2);
+                    color: var(--text);
+                    border: 1px solid var(--border);
+                    border-radius: var(--radius-sm);
+                    padding: 8px 30px 8px 12px;
+                    font-size: 0.875rem;
+                    font-family: inherit;
+                    cursor: pointer;
+                    outline: none;
+                    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23A78BFA' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+                    background-repeat: no-repeat;
+                    background-position: right 10px center;
+                }
+                .filter-multi-btn:hover, .filter-multi-btn:focus {
+                    border-color: #A78BFA;
+                }
+                .filter-multi-panel {
+                    display: none;
+                    position: absolute;
+                    z-index: 60;
+                    top: calc(100% + 4px);
+                    left: 0;
+                    min-width: 240px;
+                    max-width: 320px;
+                    background: #FFFFFF;
+                    border: 1px solid var(--border);
+                    border-radius: var(--radius-sm);
+                    box-shadow: 0 10px 30px rgba(15, 23, 42, 0.14);
+                    padding: 8px;
+                }
+                .filter-multi-panel.open { display: block; }
+                .filter-multi-actions {
+                    display: flex; gap: 8px; margin-bottom: 6px;
+                }
+                .filter-multi-actions button {
+                    flex: 1;
+                    background: #F1F5F9;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 5px 8px;
+                    font-size: 0.75rem;
+                    cursor: pointer;
+                    color: #475569;
+                }
+                .filter-multi-actions button:hover { background: #E2E8F0; }
+                .filter-multi-foot { display:flex; align-items:center; justify-content:space-between;
+                    gap:8px; padding:8px 10px; border-top:1px solid var(--border); background:#F8FAFC; }
+                .filter-multi-foot span { font-size:0.74rem; color:#64748B; }
+                .filter-multi-foot button { border:none; border-radius:6px; padding:5px 12px;
+                    font-size:0.78rem; font-weight:700; cursor:pointer;
+                    background:var(--brand, #6366F1); color:#fff; }
+                .filter-multi-foot button:hover { filter:brightness(1.08); }
+                .filter-multi-list { max-height: 260px; overflow-y: auto; }
+                .filter-multi-list label {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    padding: 5px 6px;
+                    border-radius: 6px;
+                    font-size: 0.85rem;
+                    font-weight: 400;
+                    text-transform: none;
+                    letter-spacing: 0;
+                    color: #0F172A;
+                    cursor: pointer;
+                }
+                .filter-multi-list label:hover { background: #F8FAFC; }
+                .filter-multi-list input { cursor: pointer; }
+
                 .filter-group select {
                     appearance: none;
                     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23A78BFA' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
@@ -204,6 +278,22 @@
                     grid-template-columns: 1fr 1fr;
                     gap: 20px;
                     margin-bottom: 20px;
+                }
+
+                /* Top et Flop ont 8 colonnes chacun : côte à côte sur un
+                   écran ordinaire, le tableau de droite débordait et ses
+                   dernières colonnes devenaient inatteignables (remarque du
+                   2026-09-26). Chaque carte défile maintenant horizontalement,
+                   et en dessous de 1500 px les deux tableaux passent l'un
+                   sous l'autre, pleine largeur. */
+                #section-top-flop .section-card {
+                    overflow-x: auto;
+                }
+                #section-top-flop table {
+                    min-width: 560px;
+                }
+                @media (max-width: 1500px) {
+                    #section-top-flop { grid-template-columns: 1fr; }
                 }
 
                 .section-card {
@@ -943,6 +1033,158 @@
                     animation: fadeInOverlay 0.22s ease;
                 }
 
+                #depot-stock-overlay {
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(15,23,42,0.4);
+                    z-index: 9600;
+                    display: none;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 16px;
+                }
+
+                #depot-stock-overlay.active {
+                    display: flex;
+                    animation: fadeInOverlay 0.22s ease;
+                }
+
+                #as-detail-overlay {
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(15,23,42,0.4);
+                    z-index: 9700;
+                    display: none;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 16px;
+                }
+                #as-detail-overlay.active {
+                    display: flex;
+                    animation: fadeInOverlay 0.22s ease;
+                }
+                .as-det-tete { display:flex; align-items:center; gap:10px;
+                    margin-bottom:6px; padding-right:30px; }
+                .as-det-tete h3 { margin:0; color:#0F172A; font-size:1.12rem;
+                    font-weight:700; }
+                .as-det-resume { font-size:0.9rem; color:#334155; line-height:1.5;
+                    margin-bottom:12px; }
+                .as-det-corps { max-height:58vh; overflow:auto; }
+                .as-det-pied { margin-top:12px; display:flex; gap:8px; align-items:center;
+                    flex-wrap:wrap; font-size:0.82rem; color:#64748B; }
+                /* Une ligne cliquable le montre : curseur, survol, chevron. */
+                .as-rep-table tr.as-clic, .as-det-table tr.as-clic { cursor:pointer; }
+                .as-rep-table tr.as-clic:hover, .as-det-table tr.as-clic:hover {
+                    background:#F5F3FF; }
+                .as-rep-table tr.as-clic td:first-child::after,
+                .as-det-table tr.as-clic td:first-child::after {
+                    content:' \203a'; color:#8B5CF6; font-weight:700; }
+                .as-rep-aide { font-size:0.78rem; color:#7C3AED; margin-top:6px; }
+                /* Les graphiques des reponses. Dessines a la main : aucune
+                   bibliotheque ajoutee au module. */
+                .as-clic-el { cursor:pointer; }
+                /* Carte des categories : la surface fait la valeur. */
+                .as-carte { display:flex; flex-direction:column; gap:3px; margin-top:10px; }
+                .as-carte-rangee { display:flex; gap:3px; }
+                .as-carte-case { background:#2563EB; color:#FFFFFF; border-radius:5px;
+                    padding:7px 9px; overflow:hidden; display:flex;
+                    flex-direction:column; justify-content:space-between; min-width:0; }
+                .as-carte-case:hover { outline:2px solid #1E3A8A; }
+                .as-carte-nom { font-size:0.76rem; font-weight:700; line-height:1.2;
+                    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+                .as-carte-val { font-size:0.7rem; opacity:.9; white-space:nowrap;
+                    overflow:hidden; }
+                /* Les categories trop petites pour un rectangle lisible. */
+                .as-petites { display:flex; flex-wrap:wrap; gap:6px; margin-top:9px;
+                    align-items:center; }
+                .as-petites-titre { font-size:0.76rem; color:#64748B; }
+                .as-pastille { font-size:0.76rem; color:#1E3A8A; background:#EFF6FF;
+                    border:1px solid #DBEAFE; border-radius:999px; padding:3px 10px; }
+                .as-pastille b { font-weight:700; }
+                .as-pastille:hover { background:#DBEAFE; }
+                .as-fiche { cursor:pointer; text-decoration:underline;
+                    text-decoration-style:dotted; }
+                .as-ou { cursor:pointer; color:#5B21B6; font-weight:600;
+                    border-bottom:1px dotted #8B5CF6; }
+                .as-ou:hover { background:#F5F3FF; }
+                /* Barre d'anciennete : une seule barre, decoupee. */
+                .as-barre { display:flex; height:34px; border-radius:6px;
+                    overflow:hidden; gap:2px; margin-top:10px; }
+                .as-barre-seg { display:flex; align-items:center; padding-left:9px;
+                    min-width:3px; overflow:hidden; }
+                .as-barre-seg span { font-size:0.74rem; color:#FFFFFF; font-weight:600;
+                    white-space:nowrap; overflow:hidden; }
+                .as-barre-seg:hover { outline:2px solid #0F172A; outline-offset:-2px; }
+                .as-legende { display:flex; flex-wrap:wrap; gap:14px; margin-top:9px;
+                    font-size:0.76rem; color:#475569; }
+                .as-leg { display:flex; align-items:center; gap:5px; }
+                .as-leg:hover { color:#0F172A; }
+                .as-leg-point { width:10px; height:10px; border-radius:2px;
+                    display:inline-block; }
+                /* Barres horizontales : un magasin par ligne.
+                   DEUX LIGNES EXPLICITES, pas un flex-wrap a 5 elements :
+                   verifie visuellement qu'un flex-wrap avec plusieurs
+                   elements en largeur-auto est imprevisible (selon la
+                   largeur du panneau, n'importe lequel peut deborder ou
+                   disparaitre — constate : la valeur se faisait tronquer
+                   ET la colonne references disparaissait completement).
+                   Ici : nom+barre+valeur en haut (nom et barre retrecissent
+                   pour laisser toujours la place a la valeur), references+
+                   urgentes toujours ensemble sur leur propre ligne en bas —
+                   jamais rognees, quelle que soit la largeur de l'ecran. */
+                .as-barres { margin-top:10px; }
+                .as-barres-ligne { padding:7px 0; }
+                .as-barres-ligne:hover { background:#F8FAFC; }
+                .as-barres-haut { display:flex; align-items:center; gap:10px; }
+                .as-barres-nom { flex:1 1 90px; min-width:0;
+                    font-size:0.84rem; font-weight:600; color:#0F172A;
+                    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+                .as-barres-soc { display:block; font-size:0.7rem; color:#94A3B8;
+                    font-weight:400; overflow:hidden; text-overflow:ellipsis; }
+                .as-barres-piste { flex:1 1 40px; min-width:24px;
+                    background:#EEF2F6; border-radius:4px; height:12px; }
+                .as-barres-trait { display:block; height:12px; border-radius:4px;
+                    background:#2563EB; }
+                .as-barres-val { flex:0 0 auto; white-space:nowrap;
+                    font-size:0.82rem; color:#334155;
+                    font-variant-numeric:tabular-nums; }
+                .as-barres-bas { display:flex; align-items:center; gap:8px;
+                    margin-top:4px; }
+                .as-barres-refs { font-size:0.74rem; color:#64748B;
+                    font-variant-numeric:tabular-nums; white-space:nowrap; }
+                .as-barres-alerte { font-size:0.7rem;
+                    font-weight:700; background:#FEE2E2; color:#B91C1C;
+                    border-radius:10px; padding:1px 6px; white-space:nowrap; }
+                /* Colonnes : l'efficacite des remises, par tranche. */
+                .as-col { display:flex; align-items:flex-end; gap:6px; height:170px;
+                    margin-top:12px; }
+                .as-col-item { flex:1; display:flex; flex-direction:column;
+                    align-items:center; height:100%; }
+                .as-col-val { font-size:0.72rem; color:#94A3B8;
+                    font-variant-numeric:tabular-nums; }
+                .as-col-val-fort { color:#1D4ED8; font-weight:700; }
+                .as-col-piste { flex:1; width:100%; display:flex; align-items:flex-end; }
+                .as-col-barre { width:100%; background:#BFDBFE; border-radius:4px 4px 0 0; }
+                .as-col-fort { background:#2563EB; }
+                .as-col-nom { font-size:0.72rem; color:#64748B; margin-top:5px; }
+                .as-col-nom-fort { color:#1D4ED8; font-weight:700; }
+                .as-col-legende { font-size:0.76rem; color:#64748B; margin-top:8px; }
+                /* La photo de la reference dans le tableau des soldes. */
+                .sp-photo-c { width:46px; padding-right:0 !important; }
+                .sp-photo { width:38px; height:38px; border-radius:6px;
+                    object-fit:cover; background:#F1F5F9; display:block; }
+                .sp-photo-vide { display:flex; align-items:center;
+                    justify-content:center; color:#CBD5E1; font-size:0.8rem; }
+                .as-det-table { width:100%; border-collapse:collapse; font-size:0.84rem;
+                    background:#FFFFFF; }
+                .as-det-table th { text-align:center; padding:7px 10px; background:#EDE9FE;
+                    color:#5B21B6; font-weight:700; position:sticky; top:0; z-index:5;
+                    white-space:nowrap; }
+                .as-det-table th:first-child { text-align:left; }
+                .as-det-table td { padding:6px 10px; border-top:1px solid #EEF2F6;
+                    text-align:center; font-variant-numeric:tabular-nums; }
+                .as-det-table td:first-child { text-align:left; }
+
                 #dormant-overlay {
                     position: fixed;
                     inset: 0;
@@ -1187,7 +1429,7 @@
                     background-color: #F8FAFC;
                 }
 
-                /* ══ MOD FOR LIFE : compte exact + arbre de dispatch ══ */
+                /* ══ le dépôt : compte exact + arbre de dispatch ══ */
                 .mfl-panel {
                     padding: 24px;
                     margin-bottom: 20px;
@@ -1371,7 +1613,14 @@
                     min-width: 130px;
                     text-align: right;
                 }
-                .mfl-chip {
+                /* Code Base Pivot du magasin (« ELITE 04 ») : discret, il ne
+           doit pas concurrencer le nom, juste permettre de retrouver le
+           bon de vente dans Odoo. */
+        .mfl-code { font-size:.72rem; font-weight:600; letter-spacing:.03em;
+            color:#6B7280; background:#F3F4F6; border:1px solid #E5E7EB;
+            border-radius:4px; padding:1px 5px; margin-left:6px;
+            vertical-align:middle; white-space:nowrap; }
+        .mfl-chip {
                     background: #E0F2FE;
                     color: #0369A1;
                     border-radius: 999px;
@@ -1419,7 +1668,7 @@
                 .mfl-empty { color: #94A3B8; text-align: center; padding: 20px; }
 
 
-                /* ══ MOD FOR LIFE : réassort dépôt → magasins (refonte 2026-09-19) ══ */
+                /* ══ le dépôt : réassort dépôt → magasins (refonte 2026-09-19) ══ */
                 .rx { padding: 0; margin-bottom: 20px; overflow: hidden; }
                 .rx-head {
                     display: flex; align-items: flex-start; justify-content: space-between;
@@ -1555,6 +1804,17 @@
 
                 .rx-ref { font-weight: 700; color: #0F172A; cursor: pointer; white-space: nowrap; }
                 .rx-ref:hover { color: #4338CA; text-decoration: underline; }
+                /* Bouton de réassort posé sur la cellule Référence de
+                   chaque ligne : c'est de là qu'on lance un envoi. */
+                /* Bouton « Solder » de la page Soldes. */
+                .sp-btn-solder { border:none; border-radius:6px; padding:4px 10px;
+                    font-size:0.76rem; font-weight:700; cursor:pointer; white-space:nowrap;
+                    background:#FEF3C7; color:#92400E; }
+                .sp-btn-solder:hover { background:#FDE68A; }
+                .ra-btn-reassort { display:inline-block; margin-left:8px; border:none;
+                    border-radius:6px; padding:2px 8px; font-size:0.72rem; font-weight:700;
+                    background:#EDE9FE; color:#6D28D9; cursor:pointer; white-space:nowrap; }
+                .ra-btn-reassort:hover { background:#DDD6FE; }
                 .rx-prod { display: block; font-size: 0.74rem; color: #94A3B8; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
                 .rx-var { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
                 .rx-var-size { color: #64748B; }
@@ -1671,8 +1931,245 @@
                 }
                 .rb-num-green { background: #16A34A; }
                 .rb-num-red { background: #DC2626; }
+                .rb-num-violet { background:#EDE9FE; color:#6D28D9; }
                 .rb-num-grey { background: #94A3B8; }
                 .rx-summary-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+                /* Pastille d'urgence du tableau Soldes. */
+                .sp-urg { font-size:0.68rem; font-weight:700; letter-spacing:.02em;
+                    border-radius:4px; padding:1px 6px; white-space:nowrap; }
+                .sp-urg-1 { background:#FEE2E2; color:#B91C1C; }
+                .sp-urg-2 { background:#FEF3C7; color:#92400E; }
+                /* Selection multiple : cocher plusieurs references, lire le
+                   recap, solder en un geste. */
+                .sp-c { width:30px; text-align:center; }
+                .sp-c input { cursor:pointer; }
+                .sp-expand { border:none; background:transparent; cursor:pointer;
+                    color:#64748B; font-size:0.8rem; padding:0 2px; font-family:inherit; }
+                .sp-expand:hover { color:#0F172A; }
+                .sp-remise-sel { border:1px solid #FCD34D; background:#FFFBEB;
+                    color:#B45309; font-weight:700; border-radius:5px; padding:2px 4px;
+                    font-size:0.8rem; font-family:inherit; cursor:pointer; }
+                .sp-bar { position:sticky; bottom:0; display:flex; flex-wrap:wrap;
+                    gap:14px; align-items:center; justify-content:space-between;
+                    background:#0F172A; color:#FFFFFF; padding:12px 16px;
+                    border-radius:0 0 var(--radius-sm) var(--radius-sm); }
+                .sp-bar-chiffres { display:flex; flex-wrap:wrap; gap:18px; }
+                .sp-bar-c { font-size:0.72rem; color:#CBD5E1; text-transform:uppercase;
+                    letter-spacing:.03em; line-height:1.3; }
+                .sp-bar-c span { display:block; font-size:1.02rem; font-weight:700;
+                    color:#FFFFFF; text-transform:none; letter-spacing:0;
+                    font-variant-numeric:tabular-nums; }
+                .sp-bar-ok span { color:#6EE7B7; }
+                .sp-bar-ko span { color:#FCA5A5; }
+                .sp-bar-actions { display:flex; gap:8px; align-items:center; }
+                .sp-bar-avert { flex:1 1 100%; font-size:0.78rem; color:#FCD34D; }
+                .sp-det-aide { font-size:0.78rem; color:#64748B; margin-bottom:8px; }
+                .sp-f-aide { font-size:0.78rem; color:#64748B; align-self:center; }
+                .rb-num-bleu { background:#1D4ED8; }
+                /* Fleche source -> destination d'un transfert. */
+                .tr-fleche { color:#1D4ED8; font-weight:700; padding:0 6px; }
+                .tr-mag { font-weight:600; color:#0F172A; }
+                .tr-soc { font-size:0.74rem; color:#94A3B8; display:block; }
+                .tr-urg { font-size:0.68rem; font-weight:700; border-radius:4px;
+                    padding:1px 6px; white-space:nowrap; }
+                .tr-urg-1 { background:#FEE2E2; color:#B91C1C; }
+                .tr-urg-2 { background:#FEF3C7; color:#92400E; }
+                .tr-lien { background:#DBEAFE; color:#1E40AF; font-size:0.68rem;
+                    font-weight:700; border-radius:4px; padding:1px 6px; }
+                .tr-btn { border:none; border-radius:6px; padding:4px 10px;
+                    background:#1D4ED8; color:#FFFFFF; font-weight:600;
+                    font-size:0.78rem; cursor:pointer; font-family:inherit;
+                    white-space:nowrap; }
+                .tr-btn:hover { background:#1E40AF; }
+                .tr-btn:disabled { opacity:.5; cursor:not-allowed; }
+                /* Les deux onglets de la page Propositions. */
+                .pr-onglets { display:flex; gap:4px; border-bottom:2px solid #E2E8F0;
+                    margin-bottom:18px; }
+                .pr-onglet { border:none; background:transparent; font-family:inherit;
+                    font-size:0.94rem; font-weight:600; color:#64748B; cursor:pointer;
+                    padding:10px 18px; border-bottom:2px solid transparent;
+                    margin-bottom:-2px; }
+                .pr-onglet:hover { color:#0F172A; }
+                .pr-onglet.pr-on { color:#0F172A; border-bottom-color:#0F172A; }
+                /* La pile de bons : une carte a la fois. */
+                .tr-pile { max-width:860px; }
+                .tr-progres { display:flex; align-items:center; gap:10px;
+                    margin-bottom:12px; font-size:0.82rem; color:#64748B; }
+                .tr-jauge { flex:1; height:6px; background:#E2E8F0; border-radius:3px;
+                    overflow:hidden; }
+                .tr-jauge-faite { height:100%; background:#1D4ED8; }
+                .tr-carte { border:1px solid #CBD5E1; border-radius:12px;
+                    background:#FFFFFF; box-shadow:0 2px 10px rgba(15,23,42,.06);
+                    overflow:hidden; }
+                .tr-carte-tete { background:#1E3A8A; color:#FFFFFF; padding:16px 20px; }
+                .tr-carte-num { font-size:0.72rem; text-transform:uppercase;
+                    letter-spacing:.06em; color:#BFDBFE; }
+                .tr-carte-trajet { font-size:1.18rem; font-weight:700; margin-top:4px;
+                    display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+                .tr-carte-trajet .tr-fleche { color:#93C5FD; font-size:1.3rem; }
+                .tr-carte-soc { font-size:0.76rem; color:#BFDBFE; font-weight:500; }
+                .tr-carte-chiffres { display:flex; gap:22px; margin-top:10px;
+                    flex-wrap:wrap; }
+                .tr-carte-c { font-size:0.72rem; color:#BFDBFE; text-transform:uppercase;
+                    letter-spacing:.03em; }
+                .tr-carte-c span { display:block; font-size:1.05rem; font-weight:700;
+                    color:#FFFFFF; text-transform:none; letter-spacing:0;
+                    font-variant-numeric:tabular-nums; }
+                .tr-carte-corps { padding:4px 0; max-height:40vh; overflow:auto; }
+                .tr-art { display:grid; grid-template-columns: 28px 1fr 120px 86px 96px;
+                    gap:10px; align-items:center; padding:8px 20px;
+                    border-bottom:1px solid #F1F5F9; font-size:0.86rem; }
+                .tr-art:last-child { border-bottom:none; }
+                .tr-art-hors { opacity:.42; }
+                .tr-art-ref { font-weight:600; color:#0F172A; }
+                .tr-art { cursor:pointer; }
+                .tr-art:hover .tr-art-ref { color:#4338CA; text-decoration:underline; }
+                .tr-art-cat { font-size:0.74rem; color:#94A3B8; display:block; }
+                .tr-art-qte { text-align:right; font-weight:700; color:#1E3A8A;
+                    font-variant-numeric:tabular-nums; }
+                .tr-art-info { text-align:right; font-size:0.76rem; color:#64748B;
+                    font-variant-numeric:tabular-nums; }
+                .tr-carte-pied { display:flex; gap:10px; align-items:center;
+                    flex-wrap:wrap; padding:14px 20px; background:#F8FAFC;
+                    border-top:1px solid #E2E8F0; }
+                .tr-btn-creer { border:none; border-radius:8px; padding:10px 18px;
+                    background:#1D4ED8; color:#FFFFFF; font-weight:700; font-size:0.9rem;
+                    cursor:pointer; font-family:inherit; }
+                .tr-btn-creer:hover { background:#1E40AF; }
+                .tr-btn-creer:disabled { opacity:.5; cursor:not-allowed; }
+                .tr-btn-ecarter { border:1px solid #CBD5E1; border-radius:8px;
+                    padding:10px 16px; background:#FFFFFF; color:#475569;
+                    font-weight:600; font-size:0.9rem; cursor:pointer;
+                    font-family:inherit; }
+                .tr-btn-ecarter:hover { background:#F1F5F9; }
+                .tr-nav { margin-left:auto; display:flex; gap:6px; align-items:center; }
+                .tr-nav button { border:1px solid #CBD5E1; background:#FFFFFF;
+                    border-radius:6px; padding:6px 12px; cursor:pointer;
+                    font-family:inherit; font-size:0.84rem; color:#334155; }
+                .tr-nav button:disabled { opacity:.4; cursor:not-allowed; }
+                .tr-fini { text-align:center; padding:40px 20px; }
+                .tr-fini-titre { font-size:1.15rem; font-weight:700; color:#0F172A; }
+                .tr-fini-sous { font-size:0.9rem; color:#64748B; margin-top:6px; }
+                .tr-urg { font-size:0.68rem; font-weight:700; border-radius:4px;
+                    padding:1px 6px; white-space:nowrap; }
+                .tr-urg-1 { background:#FEE2E2; color:#B91C1C; }
+                .tr-urg-2 { background:#FEF3C7; color:#92400E; }
+                .tr-lien { background:#DBEAFE; color:#1E40AF; font-size:0.68rem;
+                    font-weight:700; border-radius:4px; padding:1px 6px; }
+                #tr-bar { background:#1E3A8A; }
+                #tr-bar .sp-btn-lot { background:#1D4ED8; }
+                #tr-bar .sp-btn-lot:hover { background:#1E40AF; }
+                .rb-num-violet { background:#6D28D9; }
+                .sp-portee { background:#FFFBEB; border:1px solid #FCD34D;
+                    border-radius:var(--radius-sm); padding:11px 14px; margin-bottom:14px;
+                    font-size:0.85rem; color:#7C2D12; line-height:1.5; }
+                .sp-portee b { color:#92400E; }
+                .sp-calibrage { background:#F5F3FF; border:1px solid #DDD6FE;
+                    border-radius:var(--radius-sm); padding:11px 14px; margin-bottom:12px;
+                    font-size:0.85rem; color:#4C1D95; line-height:1.5; }
+                .sp-calibrage b { color:#5B21B6; }
+                /* L'operation de soldes en cours. */
+                .sp-operation:empty { display:none; }
+                .sp-operation { display:flex; align-items:center; gap:14px;
+                    flex-wrap:wrap; background:#ECFDF5; border:1px solid #A7F3D0;
+                    border-radius:var(--radius-sm); padding:11px 14px; margin-bottom:12px; }
+                .sp-op-muette { background:#F8FAFC; border-color:#E2E8F0; }
+                .sp-op-finie { background:#FEF2F2; border-color:#FECACA; }
+                .sp-op-nom { font-size:0.98rem; font-weight:700; color:#065F46; }
+                .sp-op-finie .sp-op-nom { color:#B91C1C; }
+                .sp-op-muette .sp-op-nom { color:#475569; }
+                .sp-op-dates { font-size:0.84rem; color:#047857; }
+                .sp-op-finie .sp-op-dates { color:#B91C1C; }
+                .sp-op-muette .sp-op-dates { color:#64748B; }
+                .sp-op-compte { font-size:0.8rem; color:#065F46; background:#D1FAE5;
+                    border-radius:999px; padding:2px 10px; font-weight:600; }
+                .sp-op-actions { display:flex; gap:8px; align-items:flex-end; }
+                .sp-op-form { display:flex; gap:14px; flex-wrap:wrap;
+                    background:#F8FAFC; border:1px solid var(--border);
+                    border-radius:var(--radius-sm); padding:12px 14px; margin-bottom:12px; }
+                .sp-op-droite { margin-left:auto; display:flex; gap:8px; }
+                .sj-etat { font-size:0.68rem; font-weight:700; border-radius:4px;
+                    padding:1px 6px; white-space:nowrap; }
+                .sj-vend { background:#DCFCE7; color:#166534; }
+                .sj-muet { background:#FEE2E2; color:#B91C1C; }
+                .sj-fini { background:#E2E8F0; color:#475569; }
+                .sp-bar-actions .rx-btn { background:#1E293B; border-color:#334155;
+                    color:#E2E8F0; }
+                .sp-bar-actions .rx-btn:hover { background:#334155; }
+                .sp-btn-lot { border:none; border-radius:6px; padding:8px 14px;
+                    background:#B45309; color:#FFFFFF; font-weight:700;
+                    font-size:0.86rem; cursor:pointer; font-family:inherit; }
+                .sp-btn-lot:hover { background:#92400E; }
+                .sp-btn-lot:disabled { opacity:.55; cursor:not-allowed; }
+                /* Detail par magasin, deplie sous la ligne. */
+                .sp-det-cell { background:#F8FAFC; padding:12px 16px !important; }
+                .sp-det-titre { font-size:0.86rem; font-weight:700; color:#0F172A;
+                    margin-bottom:8px; }
+                .sp-det-table { border-collapse:collapse; font-size:0.82rem;
+                    background:#FFFFFF; min-width:560px; }
+                .sp-det-table th { text-align:center; padding:5px 10px; background:#EEF2F6;
+                    color:#475569; font-weight:700; white-space:nowrap; }
+                .sp-det-table th:first-child { text-align:left; }
+                .sp-det-table td { padding:5px 10px; border-top:1px solid #EEF2F6;
+                    text-align:center; font-variant-numeric:tabular-nums; }
+                .sp-det-table td:first-child { text-align:left; }
+                /* Assistant a questions fermees */
+                .as-bloc { background:#F8FAFC; border:1px solid var(--border);
+                    border-radius:var(--radius-sm); padding:16px 18px; margin-bottom:18px; }
+                .as-titre { font-size:0.82rem; font-weight:700; color:#475569;
+                    text-transform:uppercase; letter-spacing:.04em; margin-bottom:10px; }
+                .as-questions { display:flex; flex-wrap:wrap; gap:8px; }
+                .as-q { border:1px solid #DDD6FE; background:#FFFFFF; color:#5B21B6;
+                    border-radius:999px; padding:7px 14px; font-size:0.84rem;
+                    font-weight:600; cursor:pointer; font-family:inherit; }
+                .as-q:hover { background:#F5F3FF; }
+                .as-q.as-on { background:#6D28D9; color:#FFFFFF; border-color:#6D28D9; }
+                .as-reponse { margin-top:14px; }
+                .as-reponse:empty { display:none; }
+                /* Assistant des transferts : meme principe (question
+                   fermee -> graphique), AUTRE allure — un bandeau bleu
+                   marine et une colonne de questions qui reste visible a
+                   cote de la reponse, pas des pastilles violettes. */
+                .tra-bloc { background:#0B1E3A; border-radius:var(--radius-sm);
+                    margin-bottom:18px; overflow:hidden; }
+                .tra-tete { padding:14px 18px 10px; }
+                .tra-titre { font-size:0.95rem; font-weight:700; color:#FFFFFF; }
+                .tra-actions { margin-bottom:10px; }
+                .sp-op-categ-liste { max-height:170px; overflow:auto; border:1px solid #DDD6FE; border-radius:8px; padding:6px 10px; background:#FFFFFF; }
+                .sp-op-cat { display:block; font-size:0.86rem; padding:3px 0; cursor:pointer; }
+                .tra-sous { font-size:0.8rem; color:#93C5FD; margin-top:2px; }
+                .tra-corps { display:flex; background:#FFFFFF; }
+                .tra-questions { display:flex; flex-direction:column; flex:0 0 220px;
+                    border-right:1px solid #EEF2F6; }
+                .tra-q { text-align:left; border:none; border-bottom:1px solid #EEF2F6;
+                    background:#FFFFFF; color:#1E3A8A; padding:12px 16px; font-size:0.84rem;
+                    font-weight:600; cursor:pointer; font-family:inherit; }
+                .tra-q:hover { background:#EFF6FF; }
+                .tra-q.tra-on { background:#1D4ED8; color:#FFFFFF; }
+                .tra-reponse { flex:1 1 auto; padding:16px 18px; min-width:0; }
+                .tra-vide { color:#94A3B8; font-size:0.86rem; font-style:italic; }
+                @media (max-width: 680px) {
+                    .tra-corps { flex-direction:column; }
+                    .tra-questions { flex-direction:row; flex-wrap:wrap; flex:none;
+                        border-right:none; border-bottom:1px solid #EEF2F6; }
+                    .tra-q { flex:1 1 auto; border-bottom:none; border-right:1px solid #EEF2F6; }
+                }
+                .as-rep-titre { font-size:1.05rem; font-weight:700; color:#0F172A; }
+                .as-rep-texte { font-size:0.92rem; color:#334155; line-height:1.5;
+                    margin-top:4px; }
+                .as-rep-table { width:100%; border-collapse:collapse; margin-top:12px;
+                    font-size:0.86rem; background:#FFFFFF; }
+                .as-rep-table th { text-align:center; padding:7px 10px; background:#EDE9FE;
+                    color:#5B21B6; font-weight:700; }
+                .as-rep-table th:first-child { text-align:left; }
+                .as-rep-table td { padding:6px 10px; border-top:1px solid #EEF2F6;
+                    text-align:center; font-variant-numeric:tabular-nums; }
+                .as-rep-table td:first-child { text-align:left; }
+                .as-choix { margin-top:10px; display:flex; gap:8px; align-items:center;
+                    flex-wrap:wrap; font-size:0.86rem; color:#475569; }
+                @media (max-width: 1100px) {
+                    .rx-summary-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+                }
                 @media (max-width: 900px) {
                     .rx-summary.rx-summary-3 { grid-template-columns: 1fr; }
                     .rx-summary-3 .rx-stat { border-left: none; }
@@ -1853,6 +2350,9 @@
                             <input type="week" id="filter-period-week" style="display:none; flex:1; min-width:0;"/>
                             <select id="filter-period-year" style="display:none; flex:1; min-width:0;"></select>
                         </div>
+                        <!-- Le calcul part une fois la saisie terminée : ce mot
+                             dit qu'il arrive. -->
+                        <div id="filter-periode-attente" style="font-size:0.72rem; color:#B45309; margin-top:4px; min-height:14px;"></div>
                     </div>
 
                     <div class="filter-group" id="filter-period-custom-group" style="display:none; min-width:260px;">
@@ -1861,6 +2361,9 @@
                             <input type="date" id="filter-date-start" style="flex:1; min-width:0;"/>
                             <input type="date" id="filter-date-end" style="flex:1; min-width:0;"/>
                         </div>
+                        <!-- Le calcul n'est lancé qu'une fois les deux bornes
+                             saisies : cet indice dit ce qui manque. -->
+                        <div id="filter-date-hint" style="font-size:0.72rem; margin-top:4px; min-height:14px;"></div>
                     </div>
 
                     <div class="filter-group">
@@ -1886,9 +2389,28 @@
 
                     <div class="filter-group">
                         <label>🗂 Catégorie</label>
-                        <select id="filter-category">
-                            <option value="">Toutes les catégories</option>
-                        </select>
+                        <!-- Plusieurs catégories peuvent être cochées
+                             (demande du 2026-09-25) : un menu à cocher
+                             remplace la liste à choix unique. -->
+                        <div class="filter-multi" id="filter-category-wrap">
+                            <button type="button" class="filter-multi-btn" id="filter-category-btn">
+                                Toutes les catégories
+                            </button>
+                            <div class="filter-multi-panel" id="filter-category-panel">
+                                <div class="filter-multi-actions">
+                                    <button type="button" id="filter-category-all">Tout cocher</button>
+                                    <button type="button" id="filter-category-none">Tout décocher</button>
+                                </div>
+                                <div class="filter-multi-list" id="filter-category-list"></div>
+                                <!-- Le tableau de bord ne se recalcule qu'ici (ou à la
+                                     fermeture du menu) : cocher case par case relançait
+                                     un calcul complet à chaque clic. -->
+                                <div class="filter-multi-foot">
+                                    <span id="filter-category-hint">Cochez, puis Appliquer</span>
+                                    <button type="button" id="filter-category-apply">Appliquer</button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -1914,16 +2436,16 @@
                         <div class="kpi-label">Panier Moyen</div>
                         <div class="kpi-value" id="kpi-panier-moyen">—</div>
                     </div>
+                    <div class="kpi-card kpi-blue" id="card-qty-purchased" title="Quantité RÉELLEMENT REÇUE sur les commandes fournisseur confirmées (qty_received), nette des retours au fournisseur : une commande confirmée mais jamais réceptionnée, ou reçue puis renvoyée, ne compte pas.">
+                        <span class="kpi-icon">📥</span>
+                        <div class="kpi-label">Qté Achetée <span style="opacity:.6;font-weight:400">(reçue)</span></div>
+                        <div class="kpi-value" id="kpi-qty-purchased">—</div>
+                    </div>
                     <div class="kpi-card kpi-green" id="card-qty-sold">
                         <span class="kpi-icon">📤</span>
                         <div class="kpi-label">Qté Vendue</div>
                         <div class="kpi-value" id="kpi-qty-sold">—</div>
                         <div class="kpi-subtext" id="kpi-qty-sold-solde"></div>
-                    </div>
-                    <div class="kpi-card kpi-blue" id="card-qty-purchased" title="Quantité RÉELLEMENT REÇUE sur les commandes fournisseur confirmées (qty_received), nette des retours au fournisseur : une commande confirmée mais jamais réceptionnée, ou reçue puis renvoyée, ne compte pas.">
-                        <span class="kpi-icon">📥</span>
-                        <div class="kpi-label">Qté Achetée <span style="opacity:.6;font-weight:400">(reçue)</span></div>
-                        <div class="kpi-value" id="kpi-qty-purchased">—</div>
                     </div>
                     <div class="kpi-card kpi-amber" id="card-stock-total" title="Stock réellement présent en rayon dans les magasins actifs. Les emplacements en stock négatif sont exclus : un stock négatif n'est pas de la marchandise, c'est la trace d'une vente sur un article jamais entré dans ce magasin. Le détail est rappelé sous le chiffre.">
                         <span class="kpi-icon">📦</span>
@@ -1943,34 +2465,34 @@
                     </div>
                 </div>
 
-                <!-- ══════════ VUE DÉDIÉE MOD FOR LIFE (société entrepôt/importateur, pas un magasin) ══════════ -->
+                <!-- ══════════ VUE DÉDIÉE le dépôt (société entrepôt/importateur, pas un magasin) ══════════ -->
                 <div id="modforlife-kpi-grid" style="display:none;">
                     <div class="kpi-grid">
-                        <div class="kpi-card kpi-blue" id="card-mfl-qty-achats" title="Ce que de vrais fournisseurs externes (Tom&amp;Eva, DIVERS, ABC…) ont vendu à MOD FOR LIFE : quantité RÉCEPTIONNÉE (qty_received) sur bon d&#39;achat confirmé, nette des retours au fournisseur. Un bon confirmé mais jamais réceptionné, ou reçu puis renvoyé, ne compte pas. Les bons où MOD FOR LIFE est le fournisseur sont exclus : c&#39;est le sens inverse. Ce chiffre ne bouge pas quand la marchandise repart vers les magasins.">
+                        <div class="kpi-card kpi-blue" id="card-mfl-qty-achats" title="Ce que de vrais fournisseurs externes (Tom&amp;Eva, DIVERS, ABC…) ont vendu au dépôt : quantité RÉCEPTIONNÉE (qty_received) sur bon d&#39;achat confirmé, nette des retours au fournisseur. Un bon confirmé mais jamais réceptionné, ou reçu puis renvoyé, ne compte pas. Les bons où le dépôt est le fournisseur sont exclus : c&#39;est le sens inverse. Ce chiffre ne bouge pas quand la marchandise repart vers les magasins.">
                             <span class="kpi-icon">📥</span>
                             <div class="kpi-label">Qté achetée <span style="opacity:.6;font-weight:400">(reçue)</span></div>
                             <div class="kpi-value" id="mfl-qty-achats">—</div>
                             <div class="kpi-subtext" id="mfl-qty-achats-sub"></div>
                         </div>
-                        <div class="kpi-card kpi-green" id="card-mfl-qty-dispatch" title="Ce qui est sorti de l'entrepôt vers les magasins : quantité livrée (qty_delivered) sur les bons de vente inter-sociétés de MOD FOR LIFE, nette des retours. Base Pivot crée UN bon de vente PAR MAGASIN ; le magasin destinataire est lu sur le bon d'achat miroir de la société qui reçoit.">
+                        <div class="kpi-card kpi-green" id="card-mfl-qty-dispatch" title="Ce qui est sorti de l'entrepôt vers les magasins : quantité livrée (qty_delivered) sur les bons de vente inter-sociétés du dépôt, nette des retours. Base Pivot crée UN bon de vente PAR MAGASIN ; le magasin destinataire est lu sur le bon d'achat miroir de la société qui reçoit.">
                             <span class="kpi-icon">🚚</span>
                             <div class="kpi-label">Dispatché</div>
                             <div class="kpi-value" id="mfl-qty-dispatch">—</div>
                             <div class="kpi-subtext" id="mfl-qty-dispatch-sub"></div>
                         </div>
-                        <div class="kpi-card kpi-amber" id="card-mfl-stock" title="Stock physique restant dans l'entrepôt MOD FOR LIFE, en pièces (stock.quant, emplacements internes de la société).">
+                        <div class="kpi-card kpi-amber is-clickable" id="card-mfl-stock" style="cursor:pointer;" title="Cliquer pour voir le détail, référence par référence. Ce qui reste dans l'entrepôt sur les références que le dépôt a lui-même achetées — c'est ce chiffre qui fait tomber juste le compte « acheté − dispatché = stock ». Le total réel de l'entrepôt, retours de magasins compris, est rappelé juste en dessous.">
                             <span class="kpi-icon">📦</span>
                             <div class="kpi-label">Stock entrepôt</div>
                             <div class="kpi-value" id="mfl-stock">—</div>
                             <div class="kpi-subtext" id="mfl-stock-sub"></div>
                         </div>
-                        <div class="kpi-card kpi-blue" id="card-mfl-achats" title="Montant TTC des bons d'achat confirmés de MOD FOR LIFE chez de vrais fournisseurs externes (hors flux inter-sociétés). Vérifiable dans Achats → Analyse, société MOD FOR LIFE.">
+                        <div class="kpi-card kpi-blue" id="card-mfl-achats" title="Montant TTC des bons d'achat confirmés du dépôt chez de vrais fournisseurs externes (hors flux inter-sociétés). Vérifiable dans Achats → Analyse, sur la société dépôt.">
                             <span class="kpi-icon">🧾</span>
                             <div class="kpi-label">Achats fournisseurs (TTC)</div>
                             <div class="kpi-value" id="mfl-ca-achats">—</div>
                             <div class="kpi-subtext" id="mfl-ca-achats-sub"></div>
                         </div>
-                        <div class="kpi-card" id="card-mfl-ventes" title="Montant TTC des bons de vente confirmés de MOD FOR LIFE vers les 3 sociétés magasins, au prix coûtant. Vérifiable dans Ventes → Analyse → Ventes, filtre « Bons de commande », société MOD FOR LIFE.">
+                        <div class="kpi-card" id="card-mfl-ventes" title="Montant TTC des bons de vente confirmés du dépôt vers les sociétés magasins, au prix coûtant. Vérifiable dans Ventes → Analyse → Ventes, filtre « Bons de commande », sur la société dépôt.">
                             <span class="kpi-icon">💰</span>
                             <div class="kpi-label">Envoyé aux sociétés (TTC)</div>
                             <div class="kpi-value" id="mfl-ca-ventes">—</div>
@@ -2054,22 +2576,19 @@
                          design, je veux quelque chose de professionnel ») :
                          l'ordre suit celui d'un écran de préparation — ce
                          qu'il faut faire d'abord, les réglages repliés en
-                         dernier. Source des envois = dépôt MOD FOR LIFE
+                         dernier. Source des envois = le dépôt
                          uniquement. Chargé par /mavie/api/reassort. -->
                     <div class="section-card full-width rx" id="mfl-reassort-section">
 
                         <div class="rx-head">
                             <div>
                                 <div class="rx-title">Réassort dépôt → magasins</div>
-                                <div class="rx-sub" id="ra-periode-note">Calcul en cours…</div>
                             </div>
                             <div class="rx-head-actions">
                                 <button type="button" id="btn-ra-settings" class="rx-btn" aria-expanded="false">Réglages</button>
                                 <button type="button" id="btn-ra-export" class="rx-btn rx-btn-primary">Exporter</button>
                             </div>
                         </div>
-
-                        <div class="rx-warn" id="ra-warn" style="display:none;"></div>
 
                         <div class="rx-settings" id="ra-settings" style="display:none;">
                             <label class="rx-field">
@@ -2092,6 +2611,11 @@
                                 <span class="rx-input"><input type="number" id="ra-cible" value="30" min="1" max="365"/><em>jours</em></span>
                                 <span class="rx-help">Quantité à envoyer = de quoi tenir ce nombre de jours, moins le stock.</span>
                             </label>
+                            <label class="rx-field">
+                                <span class="rx-field-label">Plafond d’envoi</span>
+                                <span class="rx-input"><input type="number" id="ra-plafond" value="90" min="7" max="365"/><em>jours</em></span>
+                                <span class="rx-help">Bloc ④ : on n’envoie jamais à un magasin plus que ce nombre de jours de vente.</span>
+                            </label>
                             <div class="rx-settings-foot" style="justify-content:flex-end;">
                                 <button type="button" id="btn-ra-recalc" class="rx-btn rx-btn-primary">Appliquer</button>
                             </div>
@@ -2112,10 +2636,14 @@
                                 <div class="rx-stat-value" id="ra-kpi-vide">—</div>
                                 <div class="rx-stat-sub">articles à acheter</div>
                             </div>
+                            <!-- DEMANDE UTILISATRICE (2026-09-28) : le calcul
+                                 par ruptures ne mobilisait que 4,7 % du stock du
+                                 dépôt. Cette carte compte ce que le mode
+                                 « sortir le stock » propose de placer. -->
                             <div class="rx-stat">
-                                <div class="rx-stat-label">À surveiller</div>
-                                <div class="rx-stat-value" id="ra-kpi-surveiller">—</div>
-                                <div class="rx-stat-sub">rien à envoyer pour l'instant</div>
+                                <div class="rx-stat-label">À placer</div>
+                                <div class="rx-stat-value" id="ra-kpi-placer">—</div>
+                                <div class="rx-stat-sub">pièces qui dorment au dépôt</div>
                             </div>
                         </div>
 
@@ -2127,7 +2655,9 @@
                         </div>
 
                         <!-- ① À envoyer maintenant -->
-                        <div class="rb" id="ra-bloc-envoyer" data-open="1">
+                        <!-- Replié par défaut comme les autres (2026-09-28) :
+                             on ouvre le bloc en cliquant sa carte ou son en-tête. -->
+                        <div class="rb" id="ra-bloc-envoyer" data-open="0">
                             <div class="rb-head">
                                 <span class="rb-num rb-num-green">1</span>
                                 <div class="rb-titles">
@@ -2141,12 +2671,15 @@
                         </div>
 
                         <!-- ② Manquant au dépôt -->
-                        <div class="rb" id="ra-bloc-vide" data-open="1">
+                        <!-- Replié par défaut : ce bloc porte plusieurs milliers
+                             de lignes et écrasait le bloc ①, le seul sur lequel on
+                             agit tout de suite. -->
+                        <div class="rb" id="ra-bloc-vide" data-open="0">
                             <div class="rb-head">
                                 <span class="rb-num rb-num-red">2</span>
                                 <div class="rb-titles">
                                     <div class="rb-title">Manquant au dépôt <span class="rb-title-hint">— à acheter</span></div>
-                                    <div class="rb-sub">Le magasin en a besoin, mais le dépôt n'a plus cet article.</div>
+                                    <div class="rb-sub">Le magasin en a besoin et le dépôt ne peut pas le servir : soit il n'a plus l'article, soit ses dernières pièces sont déjà parties à un magasin qui vend plus vite. Ces dernières sont listées en premier.</div>
                                 </div>
                                 <div class="rb-count" id="ra-cnt-vide">—</div>
                                 <span class="rb-caret">▾</span>
@@ -2154,18 +2687,19 @@
                             <div class="rb-body" id="ra-body-vide"></div>
                         </div>
 
-                        <!-- ③ À surveiller (replié par défaut) -->
-                        <div class="rb" id="ra-bloc-surveiller" data-open="0">
+                        <!-- ④ À placer : on part du stock du dépôt, pas des
+                             ruptures. Voir api_reassort_a_placer. -->
+                        <div class="rb" id="ra-bloc-placer" data-open="0">
                             <div class="rb-head">
-                                <span class="rb-num rb-num-grey">3</span>
+                                <span class="rb-num rb-num-violet">4</span>
                                 <div class="rb-titles">
-                                    <div class="rb-title">À surveiller</div>
-                                    <div class="rb-sub">Le dépôt a l'article, mais rien n'est à envoyer : pas de vente récente, ou stock suffisant.</div>
+                                    <div class="rb-title">À placer <span class="rb-title-hint">— le stock qui dort au dépôt</span></div>
+                                    <div class="rb-sub">Le surplus du dépôt, proposé aux magasins qui vendent bien cette référence et qui sont déjà couverts. Les magasins en rupture ne sont pas ici : ils sont dans « À envoyer maintenant ».</div>
                                 </div>
-                                <div class="rb-count" id="ra-cnt-surveiller">—</div>
+                                <div class="rb-count" id="ra-cnt-placer">—</div>
                                 <span class="rb-caret">▾</span>
                             </div>
-                            <div class="rb-body" id="ra-body-surveiller"></div>
+                            <div class="rb-body" id="ra-body-placer"></div>
                         </div>
 
                         <div class="rx-foot" id="ra-foot" style="margin-bottom:22px;"></div>
@@ -2192,7 +2726,7 @@
                     <div class="kpi-card stock-kpi-card border-orange" id="card-stock-dormant" style="cursor:pointer;">
                         <div class="kpi-label">Stock dormant</div>
                         <div class="kpi-value value-orange" id="kpi-stock-dormant">—</div>
-                        <div class="kpi-subtext">Seuil : 10%</div>
+                        <div class="kpi-subtext" id="kpi-stock-dormant-sub">Seuil : 10%</div>
                     </div>
                     <div class="kpi-card stock-kpi-card border-green" id="card-stock-precision" style="cursor:pointer;" title="Part des références présentant un stock NÉGATIF, c'est-à-dire plus de sorties enregistrées dans Odoo que d'entrées. Doit valoir 0 %. Cliquer pour voir les références concernées et l'origine exacte du manque.">
                         <div class="kpi-label">Écarts d'inventaire</div>
@@ -2237,7 +2771,7 @@
                                 <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Référence</th>
                                 <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Magasin</th>
                                 <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Stock</th>
-                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Ventes / jour</th>
+                                <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Ventes / semaine</th>
                                 <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;">Jours restants</th>
                                 <th style="padding:12px 8px; font-size:0.75rem; font-weight:700; color:#64748B; text-transform:uppercase;"></th>
                             </tr>
@@ -2261,6 +2795,7 @@
                         <div class="kpi-card stock-kpi-card border-brown">
                             <div class="kpi-label">Valeur totale au coût</div>
                             <div class="kpi-value" id="kpi-valeur-cost">—</div>
+                            <div class="kpi-subtext" id="kpi-valeur-cost-note"></div>
                         </div>
                     </div>
                     <table class="stock-table" style="width:100%; border-collapse:collapse; margin-top:16px;">
@@ -2355,6 +2890,288 @@
                      et ses couleurs dessous, avec Catégorie, Prix, Qté en dépôt
                      et trois boutons d'action. Rempli par loadActions()
                      (dashboard.js). -->
+                <!-- ══════════ PAGE PROPOSITIONS ══════════
+                     Ce que le tableau de bord propose de faire : les soldes
+                     aujourd'hui, les transferts entre magasins ensuite. Un
+                     bloc par sujet. Remplie par loadPropositions(). -->
+                <div class="section-card full-width rx" id="propositions-page" style="display:none;">
+                    <div class="rx-head">
+                        <div>
+                            <div class="rx-title">Propositions</div>
+                        </div>
+                        <div class="rx-head-actions" id="sp-head-actions">
+                            <button type="button" id="btn-sp-settings" class="rx-btn" aria-expanded="false">Réglages</button>
+                            <button type="button" id="btn-sp-export" class="rx-btn rx-btn-primary">Exporter</button>
+                        </div>
+                    </div>
+
+                    <!-- Deux sujets, deux onglets : solder, c'est renoncer a
+                         de la marge ; transferer, c'est la sauver. Les
+                         melanger embrouille la decision. -->
+                    <div class="pr-onglets" role="tablist">
+                        <button type="button" class="pr-onglet pr-on" id="onglet-btn-soldes"
+                                data-onglet="soldes" role="tab">🏷️ Soldes</button>
+                        <button type="button" class="pr-onglet" id="onglet-btn-transferts"
+                                data-onglet="transferts" role="tab">🚚 Transferts</button>
+                    </div>
+
+                    <div id="onglet-soldes">
+
+                    <div class="rx-settings" id="sp-settings" style="display:none;">
+                        <label class="rx-field">
+                            <span class="rx-field-label">Sans vente depuis</span>
+                            <span class="rx-input"><input type="number" id="sp-fenetre" value="90" min="7" max="365"/><em>jours</em></span>
+                            <span class="rx-help">Une référence n'est proposée que si elle n'a rien vendu sur cette période.</span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Stock minimum</span>
+                            <span class="rx-input"><input type="number" id="sp-stock-min" value="5" min="1" max="500"/><em>pièces</em></span>
+                            <span class="rx-help">En dessous, l'opération ne vaut pas le temps qu'elle coûte.</span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Couverture au-delà de</span>
+                            <span class="rx-input"><input type="number" id="sp-couverture" value="120" min="7" max="3650"/><em>jours</em></span>
+                            <span class="rx-help">Une référence qui vend encore un peu est retenue si son stock met plus de ce délai à s'écouler.</span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Remise</span>
+                            <span class="rx-input"><input type="number" id="sp-remise1" value="30" min="5" max="90"/><em>%</em></span>
+                            <span class="rx-help">Appliquée au stock dormant depuis une période.</span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Remise forte</span>
+                            <span class="rx-input"><input type="number" id="sp-remise2" value="50" min="5" max="90"/><em>%</em></span>
+                            <span class="rx-help">Au-delà de deux périodes sans vente, ou jamais vendu.</span>
+                        </label>
+                        <div class="rx-settings-foot" style="justify-content:flex-end;">
+                            <button type="button" id="btn-sp-recalc" class="rx-btn rx-btn-primary">Appliquer</button>
+                        </div>
+                    </div>
+
+                    <!-- Assistant : des questions fermées, pas un chatbot.
+                         Chacune interroge les mêmes moteurs que les tableaux
+                         et rend une réponse chiffrée, toujours la même pour
+                         les mêmes données. -->
+                    <div class="as-bloc">
+                        <div class="as-titre">Posez votre question</div>
+                        <div class="as-questions" id="as-questions"></div>
+                        <div class="as-reponse" id="as-reponse"></div>
+                    </div>
+
+                    <div class="rx-summary rx-summary-3">
+                        <div class="rx-stat rx-stat-main">
+                            <div class="rx-stat-label">À solder</div>
+                            <div class="rx-stat-value" id="sp-kpi-refs">—</div>
+                            <div class="rx-stat-sub" id="sp-kpi-refs-sub">références</div>
+                        </div>
+                        <div class="rx-stat">
+                            <div class="rx-stat-label">Déjà soldées</div>
+                            <div class="rx-stat-value" id="sp-kpi-deja">—</div>
+                            <div class="rx-stat-sub">une remise existe déjà</div>
+                        </div>
+                        <!-- Le gisement à traiter en premier : ces références
+                             dorment en magasin ET le dépôt en garde encore.
+                             Les solder libère les deux côtés. -->
+                        <div class="rx-stat">
+                            <div class="rx-stat-label">Dort aussi au dépôt</div>
+                            <div class="rx-stat-value" id="sp-kpi-urgent">—</div>
+                            <div class="rx-stat-sub" id="sp-kpi-urgent-sub">à traiter en premier</div>
+                        </div>
+                    </div>
+
+                    <div class="rx-toolbar">
+                        <div class="rx-toolbar-right" style="margin-left:0;">
+                            <select id="sp-f-etat" class="rx-select">
+                                <option value="toutes" title="Tout le tableau, y compris les références qui portent déjà une remise.">Toutes</option>
+                                <option value="urgent" selected="selected" title="Elles dorment en magasin ET il en reste au dépôt : la marchandise est bloquée des deux côtés.">Urgentes (aussi au dépôt)</option>
+                                <option value="deja" title="Une remise est déjà posée sur ces références. La resolder écrase la remise existante.">Déjà soldées</option>
+                                <option value="a_traiter" title="Aucune remise posée pour le moment : tout reste à faire.">À traiter</option>
+                            </select>
+                            <span class="sp-f-aide" id="sp-f-aide"></span>
+                            <input type="search" id="sp-f-search" class="rx-select rx-search" placeholder="Rechercher une référence, une catégorie…" autocomplete="off"/>
+                        </div>
+                    </div>
+
+                    <!-- Portee reelle d'une remise : si une seule liste de
+                         prix est partagee par plusieurs magasins, la remise
+                         s'applique partout. Mieux vaut le dire. -->
+                    <!-- D'ou viennent les paliers proposes. -->
+                    <!-- L'operation en cours : ses dates sont posees sur
+                         tout ce qu'on solde tant qu'elle dure. -->
+                    <div class="sp-operation" id="sp-operation"></div>
+                    <div class="sp-op-form" id="sp-op-form" style="display:none;">
+                        <label class="rx-field">
+                            <span class="rx-field-label">Nom de l'opération</span>
+                            <span class="rx-input"><input type="text" id="sp-op-nom" maxlength="80" placeholder="Black Friday 2026"/></span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Début</span>
+                            <span class="rx-input"><input type="date" id="sp-op-debut"/></span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Fin <span class="rx-help-inline">(facultatif)</span></span>
+                            <span class="rx-input"><input type="date" id="sp-op-fin"/></span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Catégories <span class="rx-help-inline">(vide = toutes ; Ctrl + clic pour en choisir plusieurs)</span></span>
+                            <span class="rx-input"><div id="sp-op-categ" class="sp-op-categ-liste"></div></span>
+                        </label>
+                        <div class="sp-op-actions">
+                            <button type="button" class="rx-btn rx-btn-primary" id="btn-sp-op-ok">Enregistrer</button>
+                            <button type="button" class="rx-btn" id="btn-sp-op-annuler">Annuler</button>
+                            <button type="button" class="rx-btn" id="btn-sp-op-effacer">Arrêter l'opération</button>
+                        </div>
+                    </div>
+                    <div class="sp-calibrage" id="sp-calibrage" style="display:none;"></div>
+                    <div class="sp-portee" id="sp-portee" style="display:none;"></div>
+
+                    <div class="rb" id="sp-bloc" data-open="1">
+                        <div class="rb-head">
+                            <span class="rb-num rb-num-red">1</span>
+                            <div class="rb-titles">
+                                <div class="rb-title">Soldes <span class="rb-title-hint">— les plus urgentes d'abord</span></div>
+                                <div class="rb-sub">Du stock en magasin qui ne tourne pas.</div>
+                            </div>
+                            <div class="rb-count" id="sp-cnt">—</div>
+                            <span class="rb-caret">▾</span>
+                        </div>
+                        <div class="rb-body" id="sp-body"></div>
+                        <!-- Recap de la selection : elle ne s'affiche que quand
+                             au moins une reference est cochee. -->
+                        <div class="sp-bar" id="sp-bar" style="display:none;"></div>
+                    </div>
+
+                    <div class="rx-foot" id="sp-foot" style="margin-bottom:22px;"></div>
+
+                    <!-- Ce qui a ete POSE, a ne pas confondre avec la
+                         section Historique du tableau de bord, qui liste
+                         les VENTES faites sous le prix catalogue. Une
+                         remise posee aujourd'hui apparait ici tout de
+                         suite, et la-bas seulement quand elle vend. -->
+                    <div class="rb" id="sj-bloc" data-open="0">
+                        <div class="rb-head">
+                            <span class="rb-num rb-num-violet">2</span>
+                            <div class="rb-titles">
+                                <div class="rb-title">Remises posées <span class="rb-title-hint">— le journal de ce que vous avez soldé</span></div>
+                                <div class="rb-sub">Ce que vous avez soldé, et ce que ça a vendu depuis.</div>
+                            </div>
+                            <div class="rb-count" id="sj-cnt">—</div>
+                            <span class="rb-caret">▾</span>
+                        </div>
+                        <div class="rb-body" id="sj-body"></div>
+                    </div>
+                    <div class="rx-foot" id="sj-foot" style="margin-bottom:22px;"></div>
+                    </div>
+
+                    <div id="onglet-transferts" style="display:none;">
+
+                    <!-- TRANSFERTS : une reference qui se vend ici et dort
+                         la-bas n'a pas besoin d'une remise, elle a besoin
+                         d'un camion. Solder ce qui se vendrait ailleurs au
+                         plein tarif, c'est jeter de la marge. -->
+                    <!-- Assistant des transferts : memes questions
+                         fermees que Soldes, une AUTRE mise en scene (la
+                         liste reste a cote de la reponse, pas des pastilles
+                         qui disparaissent) — demande utilisatrice explicite
+                         de ne pas copier Soldes. -->
+                    <div class="tra-bloc" id="tra-bloc">
+                        <div class="tra-tete">
+                            <div class="tra-titre">Le tableau de bord des flux</div>
+                            <div class="tra-sous">Posez une question, la réponse est un graphique.</div>
+                        </div>
+                        <div class="tra-corps">
+                            <div class="tra-questions" id="tra-questions"></div>
+                            <div class="tra-reponse" id="tra-reponse">
+                                <div class="tra-vide">Choisissez une question à gauche.</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="rx-summary rx-summary-3" id="tr-cartes">
+                        <div class="rx-stat rx-stat-main">
+                            <div class="rx-stat-label">À transférer</div>
+                            <div class="rx-stat-value" id="tr-kpi-nb">—</div>
+                            <div class="rx-stat-sub" id="tr-kpi-nb-sub">propositions</div>
+                        </div>
+                        <div class="rx-stat">
+                            <div class="rx-stat-label">Bons à créer</div>
+                            <div class="rx-stat-value" id="tr-kpi-paires">—</div>
+                            <div class="rx-stat-sub" id="tr-kpi-paires-sub">paires de magasins</div>
+                        </div>
+                        <div class="rx-stat">
+                            <div class="rx-stat-label">Déjà en rupture</div>
+                            <div class="rx-stat-value" id="tr-kpi-rupture">—</div>
+                            <div class="rx-stat-sub" id="tr-kpi-rupture-sub">à servir en premier</div>
+                        </div>
+                    </div>
+
+                    <div class="rx-toolbar">
+                        <div class="rx-toolbar-right" style="margin-left:0;">
+                            <select id="tr-f-circuit" class="rx-select">
+                                <option value="toutes">Tous les circuits</option>
+                                <option value="interne">Même société</option>
+                                <option value="inter">Entre sociétés</option>
+                            </select>
+                            <select id="tr-f-urgence" class="rx-select">
+                                <option value="toutes" title="Toutes les propositions.">Toutes</option>
+                                <option value="urgentes" title="Le magasin destinataire est à sec ou tient moins d'une semaine.">Urgentes seulement</option>
+                            </select>
+                            <input type="search" id="tr-f-search" class="rx-select rx-search" placeholder="Rechercher une référence, un magasin…" autocomplete="off"/>
+                            <button type="button" class="rx-btn rx-btn-sm" id="btn-tr-settings" aria-expanded="false">⚙ Réglages</button>
+                            <button type="button" class="rx-btn rx-btn-sm" id="btn-tr-recalc">↻ Recalculer</button>
+                            <button type="button" class="rx-btn rx-btn-sm" id="btn-tr-export">⬇ Exporter</button>
+                        </div>
+                    </div>
+
+                    <div class="rx-settings" id="tr-settings" style="display:none;">
+                        <label class="rx-field">
+                            <span class="rx-field-label">Couverture visée</span>
+                            <span class="rx-input"><input type="number" id="tr-cible" value="60" min="7" max="180"/><em>jours</em></span>
+                            <span class="rx-help">Ce que chaque magasin doit pouvoir tenir.</span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Quantité minimum</span>
+                            <span class="rx-input"><input type="number" id="tr-min-qte" value="3" min="1" max="100"/><em>pièces</em></span>
+                            <span class="rx-help">En dessous, le transport coûte plus que la marchandise.</span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Donneur au-delà de</span>
+                            <span class="rx-input"><input type="number" id="tr-couv-donneur" value="120" min="30" max="3650"/><em>jours</em></span>
+                            <span class="rx-help">Un magasin ne cède que ce sur quoi il dort.</span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Demandeur en deçà de</span>
+                            <span class="rx-input"><input type="number" id="tr-couv-demandeur" value="45" min="1" max="180"/><em>jours</em></span>
+                            <span class="rx-help">Un magasin ne reçoit que s'il est vraiment court.</span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Fenêtre de ventes</span>
+                            <span class="rx-input"><input type="number" id="tr-fenetre" value="90" min="7" max="365"/><em>jours</em></span>
+                            <span class="rx-help">Période sur laquelle les vitesses sont mesurées.</span>
+                        </label>
+                    </div>
+
+                    <div class="rb" id="tr-bloc" data-open="1">
+                        <div class="rb-head" style="cursor:default;">
+                            <span class="rb-num rb-num-bleu">🚚</span>
+                            <div class="rb-titles">
+                                <div class="rb-title">Bons de transfert <span class="rb-title-hint">— déplacer plutôt que démarquer</span></div>
+                                <div class="rb-sub">Ce qui se vend ici et dort là-bas.</div>
+                            </div>
+                            <div class="rb-count" id="tr-cnt">—</div>
+                        </div>
+                        <div class="rb-body" id="tr-body">
+                            <!-- Une carte = un bon de transfert deja redige.
+                                 On le cree, ou on l'ecarte, et on passe au
+                                 suivant. -->
+                            <div id="tr-pile"></div>
+                        </div>
+                    </div>
+                    <div class="rx-foot" id="tr-foot" style="margin-bottom:22px;"></div>
+                                    </div>
+
+                </div>
+
                 <div class="section-card full-width" id="action-page" style="display:none;">
                     <!-- Recherche + Filtres / Regrouper par / Favoris : tout en
                          haut de la page (demande utilisatrice 2026-09-22). -->
@@ -2386,6 +3203,7 @@
                             </div>
                             <div class="ac-col">
                                 <div class="ac-col-title"><span style="color:var(--brand);">📍</span> Lieux</div>
+                                <div id="ac-lieux-aide" class="ac-fav-empty" style="display:none; line-height:1.4;"></div>
                                 <div class="ac-sous-titre">Région</div>
                                 <div id="ac-regions"></div>
                                 <div class="ac-sep"></div>
@@ -2525,17 +3343,17 @@
                             <div class="d-value" id="detail-prix-vente">—</div>
                         </div>
                         <div class="detail-kpi-card">
-                            <div class="d-label" title="Ventes en caisse au client final uniquement (pos.order.line). Les transferts MOD FOR LIFE vers une société magasin (sale.order) ne sont PAS des ventes et sont exclus — c'est pourquoi ce chiffre est inférieur au bouton « Vendu » de la fiche produit Odoo, qui additionne les deux.">📤 Qté vendue <span style="opacity:.6;font-weight:400">(caisse)</span></div>
-                            <div class="d-value" id="detail-qty-sold">—</div>
-                            <div class="d-sublabel" id="detail-qty-sold-solde"></div>
-                        </div>
-                        <div class="detail-kpi-card">
-                            <div class="d-label" title="Quantité RÉELLEMENT REÇUE sur les commandes fournisseur confirmées (qty_received), nette des retours au fournisseur : une commande confirmée mais jamais réceptionnée, ou reçue puis renvoyée, ne compte pas. Achats des sociétés magasins uniquement — les achats de MOD FOR LIFE chez le fournisseur externe sont exclus pour ne pas compter deux fois la même marchandise.">📥 Qté achetée <span style="opacity:.6;font-weight:400">(reçue)</span></div>
+                            <div class="d-label" title="Quantité RÉELLEMENT REÇUE sur les commandes fournisseur confirmées (qty_received), nette des retours au fournisseur : une commande confirmée mais jamais réceptionnée, ou reçue puis renvoyée, ne compte pas. Achats des sociétés magasins uniquement — les achats du dépôt chez le fournisseur externe sont exclus pour ne pas compter deux fois la même marchandise.">📥 Qté achetée <span style="opacity:.6;font-weight:400">(reçue)</span></div>
                             <div class="d-value" id="detail-qty-purchased">—</div>
                             <div class="d-sublabel" id="detail-qty-purchased-note"></div>
                         </div>
+                        <div class="detail-kpi-card">
+                            <div class="d-label" title="Ventes en caisse au client final uniquement (pos.order.line). Les transferts du dépôt vers une société magasin (sale.order) ne sont PAS des ventes et sont exclus — c'est pourquoi ce chiffre est inférieur au bouton « Vendu » de la fiche produit Odoo, qui additionne les deux.">📤 Qté vendue <span style="opacity:.6;font-weight:400">(caisse)</span></div>
+                            <div class="d-value" id="detail-qty-sold">—</div>
+                            <div class="d-sublabel" id="detail-qty-sold-solde"></div>
+                        </div>
                         <div class="detail-kpi-card is-clickable" id="detail-stock-card" title="Cliquer pour voir le détail : comment on passe des achats reçus au stock réel, ligne par ligne.">
-                            <div class="d-label" title="Stock physique présent dans les magasins actifs configurés. Le stock restant dans l'entrepôt MOD FOR LIFE, à DIGITAL SHOP ou dans un entrepôt non rattaché à un magasin actif est exclu — c'est pourquoi ce chiffre peut être inférieur au stock total affiché dans Inventaire.">📦 Stock Réel Odoo <span style="opacity:.6;font-weight:400">(magasins)</span></div>
+                            <div class="d-label" title="Stock physique présent dans les magasins actifs configurés. Le stock restant dans l'entrepôt du dépôt, à DIGITAL SHOP ou dans un entrepôt non rattaché à un magasin actif est exclu — c'est pourquoi ce chiffre peut être inférieur au stock total affiché dans Inventaire.">📦 Stock Réel Odoo <span style="opacity:.6;font-weight:400">(magasins)</span></div>
                             <div class="d-value" id="detail-stock-total">—</div>
                             <div class="d-sublabel" id="detail-stock-ecart" style="display:none"></div>
                             <div class="d-sublabel" style="color:#6366F1;font-weight:600;margin-top:2px;">🔍 Voir le détail</div>
@@ -2876,7 +3694,7 @@
                              reste signalé par le bandeau d'alerte au-dessus
                              du tableau. -->
                         <div class="detail-kpi-card">
-                            <div class="d-label" title="Stock physique de cette couleur sur le périmètre actuellement filtré (sociétés cochées dans le sélecteur Odoo). Le tableau ci-dessous liste, lui, tout le réseau — utile pour repérer d'où faire venir la marchandise.">🏬 Stock total</div>
+                            <div class="d-label" title="Stock physique de cette couleur dans les MAGASINS du périmètre filtré. Le dépôt est rappelé à côté du chiffre quand il en détient, et le tableau ci-dessous liste tout le réseau — utile pour repérer d'où faire venir la marchandise.">🏬 Stock magasins</div>
                             <div class="d-value" id="color-detail-stock-total">—</div>
                         </div>
                     </div>
@@ -3001,12 +3819,64 @@
                 </div>
             </div>
 
+            <!-- DEMANDE UTILISATRICE (2026-09-28) : la carte « Stock
+                 entrepôt » donnait deux totaux sans jamais dire de quoi ils
+                 sont faits. Cette fenêtre liste ce qui reste réellement
+                 dans l'entrepôt du dépôt, ligne par ligne. -->
+            <div id="depot-stock-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-depot-stock-btn" title="Fermer">✕</button>
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; padding-right:30px;">
+                        <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700; display:flex; align-items:center; gap:8px;">
+                            <span>📦</span> Ce qui reste dans l'entrepôt
+                            <span id="depot-stock-badge" style="background:#FEF3C7; color:#92400E; font-weight:700; font-size:0.8rem; padding:3px 10px; border-radius:12px;">0</span>
+                        </h3>
+                        <button id="btn-export-depot-stock" class="btn-transfer-open" style="padding:4px 10px;font-size:0.78rem;">↓ CSV</button>
+                    </div>
+                    <div class="rx-sub" id="depot-stock-sub" style="margin-bottom:14px;">Chargement…</div>
+                    <div style="margin-bottom:14px;">
+                        <input type="text" id="search-depot-stock" placeholder="🔍 Rechercher une référence, une couleur, un emplacement…" style="width:100%; padding:10px 14px; border:1px solid #CBD5E1; border-radius:8px; font-size:0.9rem; outline:none; background:#F8FAFC; color:#0F172A; font-weight:500;"/>
+                    </div>
+                    <div style="max-height:55vh; overflow-y:auto;">
+                        <table style="width:100%; border-collapse:collapse;">
+                            <thead>
+                                <tr style="border-bottom:2px solid #E2E8F0; text-align:left; background:#F1F5F9; position:sticky; top:0; z-index:10;">
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Référence</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Article / déclinaison</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Emplacement</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">Quantité</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;" title="Une ligne « achetée par le dépôt » compte dans le premier total de la carte ; les autres n'y sont pas.">Origine</th>
+                                </tr>
+                            </thead>
+                            <tbody id="depot-stock-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Detail d'une ligne de reponse de l'assistant. Le meme
+                 popup sert a tout : une reference et ses magasins, un
+                 magasin et ses references, une categorie, un palier. -->
+            <div id="as-detail-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-as-detail-btn" title="Fermer">✕</button>
+                    <div class="as-det-tete">
+                        <button type="button" class="rx-btn rx-btn-sm" id="as-det-retour"
+                                style="display:none;">← Retour</button>
+                        <h3 id="as-det-titre">Détail</h3>
+                    </div>
+                    <div class="as-det-resume" id="as-det-resume"></div>
+                    <div class="as-det-corps" id="as-det-corps"></div>
+                    <div class="as-det-pied" id="as-det-pied"></div>
+                </div>
+            </div>
+
             <div id="dormant-overlay">
                 <div class="ruptures-panel">
                     <button class="close-detail-btn" id="close-dormant-btn" title="Fermer">✕</button>
                     <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding-right:30px;">
                         <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700; display:flex; align-items:center; gap:8px;">
-                            <span>💤</span> Stock dormant (aucune vente depuis 90 jours)
+                            <span>💤</span> Stock dormant (aucune vente, ou stock trop lent à s'écouler)
                             <span id="dormant-count-badge" style="background:#FEF3C7; color:#92400E; font-weight:700; font-size:0.8rem; padding:3px 10px; border-radius:12px;">0</span>
                         </h3>
                         <button id="btn-export-dormant" class="btn-transfer-open" title="Exporter le stock dormant en Excel (.xlsx), photos incrustées" style="padding:4px 10px;font-size:0.78rem;">📊 Excel</button>
@@ -3022,6 +3892,8 @@
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Désignation / Article</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;" title="Magasin où cette référence n'a plus bougé depuis le plus longtemps, avec la quantité qui s'y trouve — c'est là que le stock est réellement bloqué. Survolez une ligne pour voir la répartition dans les autres magasins.">Magasin le plus figé</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;" title="Stock total de la référence sur TOUT le réseau, pas seulement dans le magasin principal indiqué à gauche.">Stock total réseau</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;" title="Pièces vendues en caisse sur les 90 derniers jours. 0 = la référence n'a rien vendu du tout.">Vendu 90 j</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;" title="Jours nécessaires pour écouler ce stock au rythme des 90 derniers jours. Au-delà du seuil, la référence dort même si elle vend un peu.">Couverture</th>
                                 </tr>
                             </thead>
                             <tbody id="dormant-tbody"></tbody>
@@ -3089,6 +3961,7 @@
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Produit</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Société</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Magasin</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Achat au dépôt</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Manque</th>
                                 </tr>
                             </thead>
@@ -3173,5 +4046,44 @@
     </html>
 </template>
 
+<template id="report_soldes_template">
+<html>
+<head><meta charset="utf-8"/>
+<style>
+body { font-family: Arial, sans-serif; font-size: 11px; color: #111; }
+h2 { margin: 0 0 4px 0; }
+p { margin: 0 0 10px 0; color: #444; }
+table { width: 100%; border-collapse: collapse; }
+th { background: #1F497D; color: #fff; padding: 4px; text-align: center; }
+td { border-bottom: 1px solid #ddd; padding: 3px 4px; text-align: center; }
+td.g { text-align: left; }
+img { height: 36px; }
+</style></head>
+<body>
+<h2 t-esc="titre"/>
+<p t-esc="sous_titre"/>
+<table>
+<thead><tr><th>Photo</th><th>Référence</th><th>Produit</th><th>Variante</th><th>Magasin</th><th>Société</th><th>Prix catalogue</th><th>Prix soldé</th><th>Remise</th><th>Début</th><th>Fin</th><th>Vendu depuis</th></tr></thead>
+<tbody>
+<t t-foreach="lignes" t-as="l">
+<tr>
+<td><img t-if="l['photo']" t-att-src="l['photo']"/><span t-else="">—</span></td>
+<td class="g" t-esc="l['reference']"/>
+<td class="g" t-esc="l['produit']"/>
+<td t-esc="l['variante']"/>
+<td t-esc="l['magasin']"/>
+<td t-esc="l['societe']"/>
+<td t-esc="l['catalogue']"/>
+<td t-esc="l['solde']"/>
+<td t-esc="l['remise']"/>
+<td t-esc="l['debut']"/>
+<td t-esc="l['fin']"/>
+<td t-esc="l['vendu']"/>
+</tr>
+</t>
+</tbody>
+</table>
+</body></html>
+</template>
 </data>
 </odoo>

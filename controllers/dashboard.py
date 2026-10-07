@@ -6,6 +6,7 @@ import json
 import re
 import base64
 import os
+import time
 import csv
 import io
 from datetime import datetime, timedelta, date
@@ -17,6 +18,40 @@ from markupsafe import Markup, escape
 from ..models.mv_batch_shop_mapping_ext import CITY_PROXIMITY
 
 _logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────
+# CACHE COURT DES ÉCRANS LOURDS (A18, 2026-09-24)
+#
+# Constat : le premier affichage demande 5 à 30 secondes selon la taille
+# de la base (mesuré : 5,6 s sur Elite, 33 s sur MaVie), parce que chaque
+# rafraîchissement refait la totalité des agrégats ventes/achats/stock.
+# Changer de page ou revenir en arrière relançait tout.
+#
+# On garde donc le résultat quelques secondes, par base, par utilisateur
+# et par jeu de filtres. Deux garde-fous pour ne jamais afficher un
+# chiffre périmé après une action :
+#   • toute écriture faite depuis le dashboard (transfert, solde,
+#     réassort) vide le cache immédiatement (_vider_cache_dashboard) ;
+#   • au-delà de CACHE_TTL secondes, l'entrée est recalculée de toute
+#     façon.
+# ─────────────────────────────────────────────────────────────
+# En dessous de ce pourcentage de pièces ayant un coût réellement saisi
+# dans Odoo, la « valeur au coût » ne repose sur rien : les trois écrans qui
+# l'affichent (carte, tableau par société, pop-up par magasin) annoncent
+# alors « non disponible » au lieu d'un montant estimé. Une seule règle, pour
+# qu'ils ne se contredisent jamais (constaté le 2026-09-25 : la carte disait
+# « non disponible » pendant que le tableau affichait 754 220,93).
+COUT_COUVERTURE_MIN = 5.0   # %
+
+CACHE_TTL = 90          # secondes
+CACHE_MAX = 40          # entrées gardées au maximum
+_CACHE = {}
+
+
+def _vider_cache_dashboard():
+    """Après une écriture : le prochain affichage doit tout recalculer."""
+    _CACHE.clear()
+
 
 # Sociétés qui ne sont PAS des magasins de vente au détail (société grossiste
 # d'import "MOD FOR LIFE" utilisée pour les ventes inter-sociétés, et "PAIE"
@@ -64,6 +99,25 @@ def resolve_variant_color_size(product_variant):
     return color_name, size_name
 
 
+def _arrondi_prix_solde(p):
+    """Prix soldé arrondi à l'entier : sous 0,50 on descend (99,30 -> 99), à partir de 0,50 on monte (99,60 -> 100)."""
+    n = int(p // 1)
+    return float(n) if round(p - n, 2) < 0.5 else float(n + 1)
+
+
+def _fr_nombre(valeur):
+    """Nombre a la francaise : espace pour les milliers, virgule pour les
+    decimales. Les reponses de l'assistant sont lues telles quelles."""
+    try:
+        v = float(valeur or 0)
+    except (TypeError, ValueError):
+        return str(valeur)
+    txt = '{:,.0f}'.format(v) if v == int(v) else '{:,.2f}'.format(v)
+    entier, _, decimales = txt.partition('.')
+    entier = entier.replace(',', ' ')
+    return (entier + ',' + decimales) if decimales else entier
+
+
 class MaVieDashboardController(http.Controller):
     """Dashboard analytique MaVie - données depuis tout le catalogue Odoo (product.template)"""
 
@@ -85,6 +139,63 @@ class MaVieDashboardController(http.Controller):
             _logger.error(f"Erreur dashboard_page: {str(e)}")
             return f"<h1>Erreur</h1><p>{str(e)}</p>"
 
+    def _cache_cle(self, nom, kw):
+        """Clé du cache : base, utilisateur, sociétés cochées, filtres."""
+        try:
+            filtres = tuple(sorted(
+                (k, str(v)) for k, v in (kw or {}).items()
+                if k not in ('_', 'callback')))
+            return (request.env.cr.dbname, request.env.uid,
+                    tuple(sorted(self._get_context_company_ids())), nom, filtres)
+        except Exception:
+            return None
+
+    def _cache_lire(self, cle):
+        if not cle:
+            return None
+        entree = _CACHE.get(cle)
+        if not entree:
+            return None
+        pose_a, valeur = entree
+        if time.time() - pose_a > CACHE_TTL:
+            _CACHE.pop(cle, None)
+            return None
+        return valeur
+
+    def _cache_ecrire(self, cle, valeur):
+        if not cle or not isinstance(valeur, dict) or valeur.get('error'):
+            return valeur
+        if len(_CACHE) >= CACHE_MAX:
+            # On retire la plus ancienne plutôt que de laisser grossir.
+            plus_vieille = min(_CACHE.items(), key=lambda kv: kv[1][0])[0]
+            _CACHE.pop(plus_vieille, None)
+        _CACHE[cle] = (time.time(), valeur)
+        return valeur
+
+    def _societe_depot(self):
+        """La société entrepôt/importateur : celle qui achète aux vrais
+        fournisseurs puis revend aux sociétés magasin.
+
+        Elle s'appelle MOD FOR LIFE chez MaVie, mais pas ailleurs (sur la
+        base Elite c'est STE XD MAX AMUSEMENT TECHNOLOGY). On lit donc
+        d'abord le paramètre de Base Pivot — Paramètres généraux → Base
+        Pivot, « Société importatrice », le même que celui utilisé pour
+        générer les achats et les ventes inter-sociétés — et on retombe sur
+        le nom historique quand ce paramètre n'existe pas, pour que rien ne
+        change sur la base MaVie.
+        """
+        Company = request.env['res.company'].sudo()
+        param = request.env['ir.config_parameter'].sudo().get_param(
+            'mv_base_pivot.default_importer_company_id')
+        if param:
+            try:
+                depot = Company.browse(int(param)).exists()
+            except (TypeError, ValueError):
+                depot = Company
+            if depot:
+                return depot
+        return Company.search([('name', '=', 'MOD FOR LIFE')], limit=1)
+
     def _get_non_retail_company_ids(self):
         """
         Résout NON_RETAIL_COMPANIES en IDs une seule fois (recherche triviale,
@@ -96,7 +207,9 @@ class MaVieDashboardController(http.Controller):
         nettement le chargement du dashboard.
         """
         companies = request.env['res.company'].sudo().search([('name', 'in', NON_RETAIL_COMPANIES)])
-        return companies.ids
+        # Le dépôt ne s'appelle pas MOD FOR LIFE partout : on l'ajoute par
+        # son identifiant, lu dans le paramètre de Base Pivot.
+        return list({c.id for c in companies} | set(self._societe_depot().ids))
 
     def _get_excluded_non_retail_ids(self, kw=None):
         """Sociétés non-retail à RÉELLEMENT exclure des KPIs.
@@ -121,6 +234,23 @@ class MaVieDashboardController(http.Controller):
         if kw and kw.get('shop_field'):
             return non_retail_ids
         context_company_ids = self._get_context_company_ids()
+
+        # A02 (2026-09-25) : le dépôt achète au fournisseur, revend aux
+        # magasins, qui revendent au client. Quand il est coché EN MÊME
+        # TEMPS que des magasins, additionner les deux compte la même
+        # marchandise deux fois. Mesuré sur Elite avec les trois sociétés
+        # cochées — l'état par défaut du sélecteur Odoo :
+        #   CA        2 989 731,90  ->  4 056 357,12
+        #   vendues        15 673   ->      111 015
+        #   achetées       81 347   ->      169 290
+        #   sell-through     19,3 % ->         65,6 %
+        # Le dépôt reste donc exclu tant qu'un magasin est coché. Coché
+        # SEUL, il bascule sur sa vue dédiée (_compute_kpis_modforlife),
+        # qui montre ses achats fournisseurs et ses dispatchs.
+        magasins_coches = [cid for cid in context_company_ids
+                           if cid not in non_retail_ids]
+        if magasins_coches:
+            return non_retail_ids
         return [cid for cid in non_retail_ids if cid not in context_company_ids]
 
     def _get_explicit_non_retail_ids(self, kw=None):
@@ -160,7 +290,7 @@ class MaVieDashboardController(http.Controller):
         elles se réapprovisionnent auprès d'elle plutôt qu'un vrai
         fournisseur externe. Permet de distinguer "achat externe" d'"achat
         interne" sur CA Achat/Qté Achetée."""
-        company = request.env['res.company'].sudo().search([('name', '=', 'MOD FOR LIFE')], limit=1)
+        company = self._societe_depot()
         return company.partner_id.id if company and company.partner_id else None
 
     def _get_context_company_ids(self):
@@ -309,6 +439,200 @@ class MaVieDashboardController(http.Controller):
     # contienne une URL que quand une photo existe vraiment.
     # ─────────────────────────────────────────────────────────────
 
+    def _fichiers_images_presents(self, attachments):
+        """Ne garde que les pièces jointes dont le FICHIER existe vraiment.
+
+        Constaté sur la base Elite (2026-09-24) : la base référence 12 532
+        photos, mais l'export est arrivé sans les fichiers. Odoo annonçait
+        donc une photo pour des fiches qui n'en affichaient qu'une icône
+        cassée. On vérifie la présence du fichier avant de promettre une
+        image ; un fichier absent est traité comme « pas de photo ».
+        """
+        if not attachments:
+            return []
+        try:
+            racine = request.env['ir.attachment'].sudo()._filestore()
+        except Exception:
+            return attachments
+        gardes = []
+        for row in attachments:
+            nom = row.get('store_fname')
+            # Pièce jointe stockée en base (db_datas) : pas de fichier à
+            # vérifier, on la garde.
+            if not nom or os.path.exists(os.path.join(racine, nom)):
+                gardes.append(row)
+        return gardes
+
+    def _ruptures_par_magasin(self, tmpl_ids, kw=None):
+        """Références vendues qui sont à zéro dans AU MOINS un magasin.
+
+        Le compte « ruptures » historique raisonne toutes boutiques
+        confondues : une référence présente ailleurs n'y apparaît pas, même
+        si le magasin qui la vend est vide (A08). On compte ici les couples
+        référence × magasin manquants, sur le périmètre affiché.
+        """
+        vide = {'count': 0, 'refs': 0, 'lignes': []}
+        if not tmpl_ids:
+            return vide
+        mappings = self._get_active_shop_mappings()
+        wh_ids = [m.warehouse_id.id for m in mappings if m.warehouse_id]
+        if kw and kw.get('shop_field'):
+            choisi = [m.warehouse_id.id for m in mappings
+                      if m.shop_field == kw.get('shop_field') and m.warehouse_id]
+            wh_ids = choisi or wh_ids
+        exclues = self._get_excluded_non_retail_ids(kw)
+        wh_ids = [w for w in wh_ids if w] or []
+        if not wh_ids:
+            return vide
+        request.env.cr.execute("""
+            WITH mag AS (
+                SELECT w.id, w.name, w.view_location_id, w.company_id
+                  FROM stock_warehouse w
+                 WHERE w.id IN %(wh)s
+                   AND (%(nb_exclues)s = 0 OR w.company_id <> ALL(%(exclues)s))
+            ), stk AS (
+                SELECT pp.product_tmpl_id AS tid, m.id AS wh_id, SUM(q.quantity) AS qte
+                  FROM stock_quant q
+                  JOIN stock_location l ON l.id = q.location_id
+                  JOIN mag m ON l.parent_path LIKE '%%/' || m.view_location_id || '/%%'
+                  JOIN product_product pp ON pp.id = q.product_id
+                 WHERE l.usage = 'internal' AND pp.product_tmpl_id IN %(tids)s
+                 GROUP BY 1, 2
+            )
+            SELECT t.tid, m.name,
+                   COALESCE(NULLIF(pt.base_pivot_reference, ''), NULLIF(pt.default_code, ''),
+                            pt.name->>'fr_FR', pt.name->>'en_US')
+              FROM (SELECT UNNEST(%(tids_arr)s) AS tid) t
+              CROSS JOIN mag m
+              LEFT JOIN stk ON stk.tid = t.tid AND stk.wh_id = m.id
+              JOIN product_template pt ON pt.id = t.tid
+             WHERE COALESCE(stk.qte, 0) <= 0
+             ORDER BY 3, 2
+        """, {'wh': tuple(wh_ids), 'tids': tuple(tmpl_ids),
+               'tids_arr': list(tmpl_ids), 'exclues': exclues or [0],
+               'nb_exclues': len(exclues or [])})
+        lignes = [{'id': tid, 'magasin': mag, 'ref': ref or '—'}
+                  for tid, mag, ref in request.env.cr.fetchall()]
+        return {'count': len(lignes), 'refs': len({l['id'] for l in lignes}),
+                'lignes': lignes[:500]}
+
+    def _alerte_rupture_par_magasin(self, kw, tmpl_ids, tmpl_by_id,
+                                    days_in_period, limite_jours=30):
+        """Références qui vont manquer DANS UN MAGASIN sous 30 jours.
+
+        Une ligne = une référence dans un magasin : le stock affiché est
+        celui de ce magasin, la vitesse de vente est celle de ses caisses.
+        C'est la seule façon d'avoir un « jours restants » vrai — le stock
+        du réseau ne dit rien de la boutique qui va se retrouver vide.
+        """
+        if not tmpl_ids:
+            return []
+        mappings = [m for m in self._get_active_shop_mappings() if m.warehouse_id]
+        if kw.get('shop_field'):
+            mappings = [m for m in mappings if m.shop_field == kw['shop_field']] or mappings
+        wh_ids = [m.warehouse_id.id for m in mappings]
+        noms = {m.warehouse_id.id: m.warehouse_id.name for m in mappings}
+        champs = {m.warehouse_id.id: m.shop_field for m in mappings}
+        if not wh_ids:
+            return []
+
+        # Stock par (référence, entrepôt).
+        request.env.cr.execute("""
+            SELECT pp.product_tmpl_id, w.id, SUM(q.quantity)
+              FROM stock_quant q
+              JOIN stock_location l ON l.id = q.location_id
+              JOIN stock_warehouse w ON l.parent_path LIKE '%%/' || w.view_location_id || '/%%'
+              JOIN product_product pp ON pp.id = q.product_id
+             WHERE l.usage = 'internal' AND w.id = ANY(%(wh)s)
+               AND pp.product_tmpl_id = ANY(%(tids)s)
+             GROUP BY 1, 2
+            HAVING SUM(q.quantity) > 0
+        """, {'wh': wh_ids, 'tids': list(tmpl_ids)})
+        stock = {(t, w): q for t, w, q in request.env.cr.fetchall()}
+        if not stock:
+            return []
+
+        # Ventes par (référence, entrepôt) sur la même fenêtre que la
+        # vitesse générale : la période choisie, sinon 90 jours glissants.
+        debut = kw.get('date_start')
+        fin = kw.get('date_end')
+        if not debut:
+            debut = (datetime.now() - timedelta(days=days_in_period)).strftime('%Y-%m-%d')
+        params = {'wh': wh_ids, 'tids': list(tmpl_ids), 'debut': debut + ' 00:00:00'}
+        borne_fin = " AND o.date_order <= %(fin)s" if fin else ""
+        if fin:
+            params['fin'] = fin + ' 23:59:59'
+        request.env.cr.execute("""
+            SELECT pp.product_tmpl_id, w.id, SUM(pol.qty)
+              FROM pos_order_line pol
+              JOIN pos_order o ON o.id = pol.order_id
+              JOIN pos_session ps ON ps.id = o.session_id
+              JOIN pos_config pc ON pc.id = ps.config_id
+              JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+              JOIN stock_warehouse w ON w.id = spt.warehouse_id
+              JOIN product_product pp ON pp.id = pol.product_id
+             WHERE o.state IN ('paid', 'done', 'invoiced')
+               -- is_reward_line vaut NULL sur les lignes jamais touchées
+               -- par la fidélité (15 362 sur 15 365 ici) : « = false » les
+               -- écartait toutes et l'alerte sortait vide.
+               AND COALESCE(pol.is_reward_line, false) = false
+               AND w.id = ANY(%(wh)s) AND pp.product_tmpl_id = ANY(%(tids)s)
+               AND o.date_order >= %(debut)s""" + borne_fin + """
+             GROUP BY 1, 2
+        """, params)
+        ventes = {(t, w): q for t, w, q in request.env.cr.fetchall()}
+
+        lignes = []
+        for (tid, wh_id), stk in stock.items():
+            vendu = ventes.get((tid, wh_id)) or 0
+            if vendu <= 0:
+                continue
+            par_jour = vendu / float(days_in_period or 1)
+            jours = round(stk / par_jour, 1)
+            if jours > limite_jours:
+                continue
+            t = tmpl_by_id.get(tid, {})
+            lignes.append({
+                'id': tid,
+                'name': t.get('name') or '—',
+                'ref': (t.get('base_pivot_reference') or t.get('default_code')
+                        or t.get('name') or '—'),
+                'magasin': noms.get(wh_id) or '—',
+                # Permet d'ouvrir la fiche produit filtrée sur CE magasin :
+                # sinon le pop-up montre le réseau entier et ses chiffres ne
+                # correspondent pas à la ligne cliquée.
+                'shop_field': champs.get(wh_id),
+                'stock': int(stk),
+                'qty_sold': int(vendu),
+                'daily_rate': round(par_jour, 2),
+                'days_left': jours,
+            })
+        lignes.sort(key=lambda x: x['days_left'])
+        return lignes[:200]
+
+    def _receptions_recentes(self, tmpl_ids, jours=90):
+        """{product_tmpl_id: 'AAAA-MM-JJ'} des articles reçus récemment.
+
+        Réception = mouvement validé entrant depuis un fournisseur ou une
+        autre société. Sert à ne pas traiter en « stock dormant » un article
+        arrivé il y a quelques jours (A09).
+        """
+        if not tmpl_ids:
+            return {}
+        depuis = (datetime.now() - timedelta(days=jours)).strftime('%Y-%m-%d 00:00:00')
+        request.env.cr.execute("""
+            SELECT pp.product_tmpl_id, MAX(sml.date)::date
+              FROM stock_move_line sml
+              JOIN product_product pp ON pp.id = sml.product_id
+              JOIN stock_location src ON src.id = sml.location_id
+              JOIN stock_location dst ON dst.id = sml.location_dest_id
+             WHERE sml.state = 'done' AND sml.date >= %s
+               AND dst.usage = 'internal' AND src.usage <> 'internal'
+               AND pp.product_tmpl_id IN %s
+             GROUP BY 1
+        """, (depuis, tuple(tmpl_ids)))
+        return {tid: str(d) for tid, d in request.env.cr.fetchall()}
+
     def _image_availability(self, product_tmpl_ids, size='image_128'):
         """{product_tmpl_id: 'product' | 'article' | None} en 2 requêtes."""
         result = {tid: None for tid in product_tmpl_ids}
@@ -320,8 +644,8 @@ class MaVieDashboardController(http.Controller):
             ('res_model', '=', 'product.template'),
             ('res_field', '=', size),
             ('res_id', 'in', list(product_tmpl_ids)),
-        ], ['res_id'])
-        for row in tmpl_with_image:
+        ], ['res_id', 'store_fname'])
+        for row in self._fichiers_images_presents(tmpl_with_image):
             result[row['res_id']] = 'product'
 
         missing = [tid for tid, src in result.items() if not src]
@@ -331,6 +655,13 @@ class MaVieDashboardController(http.Controller):
                     [('product_tmpl_id', 'in', missing), ('image_1920', '!=', False)],
                     ['id', 'product_tmpl_id'],
                 )
+                presents = {r['res_id'] for r in self._fichiers_images_presents(
+                    request.env['ir.attachment'].sudo().search_read([
+                        ('res_model', '=', 'mv.article.base'),
+                        ('res_field', '=', 'image_1920'),
+                        ('res_id', 'in', [a['id'] for a in articles]),
+                    ], ['res_id', 'store_fname']))}
+                articles = [a for a in articles if a['id'] in presents]
                 for art in articles:
                     tmpl_ref = art.get('product_tmpl_id')
                     if tmpl_ref:
@@ -460,6 +791,33 @@ class MaVieDashboardController(http.Controller):
     # DOMAINS
     # ─────────────────────────────────────────────────────────────
 
+    def _categories_choisies(self, kw):
+        """Catégories cochées dans le filtre, en IDs.
+
+        Le filtre acceptait une seule catégorie (`categ_id`). Il en accepte
+        maintenant plusieurs (`categ_ids`) — l'ancienne clé reste comprise
+        pour ne rien casser ailleurs.
+        """
+        brut = (kw or {}).get('categ_ids')
+        if brut in (None, '', []):
+            brut = (kw or {}).get('categ_id')
+        if brut in (None, '', []):
+            return []
+        if not isinstance(brut, (list, tuple, set)):
+            brut = [x for x in str(brut).split(',') if x.strip()]
+        ids = []
+        for v in brut:
+            try:
+                ids.append(int(v))
+            except (TypeError, ValueError):
+                continue
+        return ids
+
+    def _filtre_produit_actif(self, kw):
+        """Un filtre catégorie / collection / arrivage est-il posé ?"""
+        return bool((kw or {}).get('collection_id') or (kw or {}).get('batch_id')
+                    or self._categories_choisies(kw))
+
     def _build_product_domain(self, kw):
         domain = []
 
@@ -494,9 +852,10 @@ class MaVieDashboardController(http.Controller):
             else:
                 domain.append(('id', '=', -1))
 
-        if kw.get('categ_id'):
+        categ_ids = self._categories_choisies(kw)
+        if categ_ids:
             try:
-                categ_id = int(kw['categ_id'])
+                categ_id = categ_ids if len(categ_ids) > 1 else categ_ids[0]
                 # CORRECTION #3 : le filtre catégorie s'applique TOUJOURS,
                 # même en combinaison avec collection/batch.
                 # Si collection filtre déjà un domaine (id, 'in', [...]),
@@ -586,10 +945,12 @@ class MaVieDashboardController(http.Controller):
         if product_tmpl_ids is not None:
             domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
 
-        if kw.get('date_start'):
-            domain.append(('order_id.date_order', '>=', kw['date_start'] + ' 00:00:00'))
-        if kw.get('date_end'):
-            domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
+        # DEMANDE UTILISATRICE (2026-09-25) : « Qté achetée et CA Achat
+        # doivent être fixes, même si je change la date ». La marchandise
+        # est achetée en une fois puis vendue sur des mois : filtrer les
+        # achats sur la même période que les ventes faisait tomber la
+        # quantité achetée à presque rien et rendait le sell-through
+        # illisible. Le filtre Période ne s'applique donc plus aux achats.
 
         # CORRECTION : la Qté achetée ne bougeait jamais avec le filtre
         # société/magasin car ce domaine, contrairement à _build_pos_domain,
@@ -606,7 +967,17 @@ class MaVieDashboardController(http.Controller):
             if scope:
                 if scope['company_id']:
                     domain.append(('order_id.company_id', '=', scope['company_id']))
-                if scope['warehouse']:
+                # L'entrepôt du magasin n'est ajouté que s'il reçoit
+                # réellement des bons d'achat. Sur Elite, les 118 bons des
+                # magasins sont tous réceptionnés dans l'entrepôt GÉNÉRIQUE
+                # de la société (« SQUARE TARGA »), jamais dans celui de la
+                # boutique : ce filtre vidait donc la Qté achetée dès qu'on
+                # choisissait un magasin, et la fiche produit affichait
+                # « aucune commande fournisseur » avec des « — » partout.
+                # Sur MaVie, où les bons visent bien l'entrepôt du magasin
+                # (MARINA AGADIR : 299 bons), le filtre s'applique comme
+                # avant.
+                if scope['warehouse'] and self._entrepot_recoit_des_achats(scope['warehouse'].id):
                     domain.append(('order_id.picking_type_id.warehouse_id', '=', scope['warehouse'].id))
         else:
             # Pas de magasin précis choisi dans le dashboard : on retombe sur
@@ -615,6 +986,62 @@ class MaVieDashboardController(http.Controller):
             if context_company_ids:
                 domain.append(('order_id.company_id', 'in', context_company_ids))
         return domain
+
+    def _achats_depot_externes_domain(self, kw, product_tmpl_ids):
+        """Achats du dépôt chez de VRAIS fournisseurs (hors inter-sociétés).
+
+        Constaté sur Elite le 2026-09-25 : les magasins n'achètent rien à
+        l'extérieur, la totalité de leurs bons vient de la société dépôt.
+        L'argent réellement dépensé chez les fournisseurs est donc porté par
+        le dépôt — 9 504 DH, dont toute la catégorie BALLERINES. Sans ces
+        lignes, « Analyse des achats » d'Odoo affichait 1 247 499,87 et la
+        carte CA Achat 1 237 995,87, et une catégorie achetée uniquement par
+        le dépôt tombait à zéro.
+
+        Les quantités de ce domaine ne sont PAS ajoutées : les pièces sont
+        déjà comptées à la réception des magasins (A02, double comptage).
+        """
+        depot = self._societe_depot()
+        if not depot or depot.id not in self._get_context_company_ids():
+            return None
+        if kw.get('shop_field'):
+            # Un magasin précis est demandé : le dépôt n'en est pas un.
+            return None
+        partenaires_societes = [
+            c.partner_id.id for c in request.env['res.company'].sudo().search([])
+            if c.partner_id
+        ]
+        domain = [
+            ('order_id.state', 'in', ['purchase', 'done']),
+            ('order_id.company_id', '=', depot.id),
+        ]
+        if partenaires_societes:
+            domain.append(('order_id.partner_id', 'not in', partenaires_societes))
+        domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+        if product_tmpl_ids is not None:
+            domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
+        # Comme pour les achats des magasins : pas de filtre Période.
+        return domain
+
+    def _entrepot_recoit_des_achats(self, warehouse_id):
+        """Cet entrepôt est-il la destination d'au moins un bon d'achat ?
+
+        Sert à savoir si filtrer les achats par magasin a un sens sur cette
+        base. Le résultat est gardé le temps de la requête HTTP : la
+        question revient pour chaque écran.
+        """
+        if not warehouse_id:
+            return False
+        cache = getattr(request, '_mavie_wh_achats', None)
+        if cache is None:
+            cache = {}
+            setattr(request, '_mavie_wh_achats', cache)
+        if warehouse_id not in cache:
+            cache[warehouse_id] = bool(request.env['purchase.order'].sudo().search_count([
+                ('state', 'in', ['purchase', 'done']),
+                ('picking_type_id.warehouse_id', '=', warehouse_id),
+            ]))
+        return cache[warehouse_id]
 
     def _get_stock_quants(self, product_tmpl_ids=None, shop_field=None):
         """Get stock.quant records for internal locations, optionally filtered by templates and shop."""
@@ -659,10 +1086,27 @@ class MaVieDashboardController(http.Controller):
         Le seul filtre restant est `active` — c'est la case à cocher du
         modèle, donc la décision revient à l'utilisateur dans Odoo, plus au
         code.
+
+        DOUBLONS D'ENTREPÔT (constaté sur la base Elite le 2026-09-24) :
+        deux mappings actifs peuvent pointer le MÊME entrepôt — « ELITE 01 »
+        et « TARGA » désignent tous deux l'entrepôt Elite Carrefour Targa.
+        Le magasin sortait alors deux fois dans les listes et son stock
+        était compté deux fois dans les totaux par magasin. On n'en garde
+        qu'un par entrepôt (le plus ancien, celui qui sert déjà de
+        référence), sans rien modifier dans Base Pivot.
         """
-        return request.env['mv.batch.shop.mapping'].sudo().search([
-            ('active', '=', True)
-        ])
+        mappings = request.env['mv.batch.shop.mapping'].sudo().search(
+            [('active', '=', True)], order='id')
+        vus = set()
+        gardes = mappings.browse()
+        for m in mappings:
+            cle = m.warehouse_id.id
+            if cle and cle in vus:
+                continue
+            if cle:
+                vus.add(cle)
+            gardes |= m
+        return gardes
 
     # ─────────────────────────────────────────────────────────────
     # MAGASINS EN LIGNE (points de vente e-commerce)
@@ -688,8 +1132,17 @@ class MaVieDashboardController(http.Controller):
     ONLINE_SHOP_PREFIX = 'pos:'
 
     def _is_online_config_name(self, name):
+        """Caisse e-commerce, reconnue à son nom.
+
+        A16 (2026-09-24) : seuls les noms commençant par « Online » étaient
+        reconnus. Sur Elite les caisses s'appellent « Elite Menara Mall —
+        En ligne » : aucune n'était détectée. On accepte donc aussi « en
+        ligne » et « e-commerce », où qu'ils soient dans le nom.
+        """
         normalized = (name or '').strip().lower().replace('–', '-').replace('—', '-')
-        return normalized.startswith('online') or 'digital' in normalized
+        return (normalized.startswith('online') or 'digital' in normalized
+                or 'en ligne' in normalized or 'e-commerce' in normalized
+                or 'ecommerce' in normalized)
 
     def _get_online_pos_configs(self):
         """pos.config considérés comme "magasin en ligne".
@@ -1140,7 +1593,11 @@ class MaVieDashboardController(http.Controller):
 
     @http.route('/mavie/api/kpis', type='json', auth='user', methods=['POST'], csrf=False)
     def api_kpis(self, **kw):
-        return self._compute_kpis(kw)
+        cle = self._cache_cle('kpis', kw)
+        garde = self._cache_lire(cle)
+        if garde is not None:
+            return garde
+        return self._cache_ecrire(cle, self._compute_kpis(kw))
 
     def _compute_kpis(self, kw):
         try:
@@ -1154,18 +1611,23 @@ class MaVieDashboardController(http.Controller):
             # n'est choisi), on bascule vers un calcul dédié plutôt que de
             # forcer ce cas dans la logique retail.
             if not kw.get('shop_field'):
-                mod_for_life = request.env['res.company'].sudo().search(
-                    [('name', '=', 'MOD FOR LIFE')], limit=1
-                )
+                mod_for_life = self._societe_depot()
                 if mod_for_life and self._get_context_company_ids() == [mod_for_life.id]:
                     return self._compute_kpis_modforlife(kw, mod_for_life)
 
-            is_filtered = bool(kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'))
+            is_filtered = bool(self._filtre_produit_actif(kw))
 
             product_tmpl_ids = None
             if is_filtered:
                 domain = self._build_product_domain(kw)
-                ProductTemplate = request.env['product.template'].sudo()
+                # Les articles ARCHIVÉS gardent leurs achats, leurs ventes et leur
+                # stock : « Analyse des achats » d'Odoo les compte, le
+                # dashboard les perdait dès qu'on filtrait sur une
+                # catégorie. Vérifié sur Elite : la catégorie BALLERINES
+                # affichait 0 au lieu de 9 504 DH, tout l'achat étant sur
+                # une référence archivée (AP3689-022).
+                ProductTemplate = request.env['product.template'].sudo().with_context(
+                    active_test=False)
                 products = ProductTemplate.search(domain)
                 if not products:
                     return {
@@ -1388,6 +1850,19 @@ class MaVieDashboardController(http.Controller):
             ca_achat_total = sum(g.get('price_total') or 0.0 for g in po_grouped)
             ca_achat_ht_total = sum(g.get('price_subtotal') or 0.0 for g in po_grouped)
 
+            # Achats du dépôt chez de vrais fournisseurs : c'est la dépense
+            # réelle du groupe, et Odoo la compte dans « Analyse des achats ».
+            # Montant seulement — les pièces sont déjà comptées côté magasins.
+            ca_achat_depot = 0.0
+            dom_depot = self._achats_depot_externes_domain(kw, product_tmpl_ids)
+            if dom_depot:
+                for g in self._group_sums('purchase.order.line', dom_depot,
+                                          ['price_total', 'price_subtotal']):
+                    ca_achat_depot += g.get('price_total') or 0.0
+                    ca_achat_total += g.get('price_total') or 0.0
+                    ca_achat_ht_total += g.get('price_subtotal') or 0.0
+
+
             # NB (décision utilisateur 2026-08-17) : la répartition du CA Achat
             # en externe/interne (MOD FOR LIFE) et par société magasin a été
             # retirée — le sélecteur de société standard permet déjà de voir
@@ -1412,7 +1887,11 @@ class MaVieDashboardController(http.Controller):
             ca_achat_by_tmpl = {}
             ca_achat_ht_by_tmpl = {}
             if po_pids:
-                po_prods = request.env['product.product'].sudo().search_read(
+                # active_test=False : une variante archivee garde ses achats,
+                # comme dans « Analyse des achats » d'Odoo. Sans ca, le CA
+                # Achat par reference perdait ces lignes.
+                po_prods = request.env['product.product'].sudo().with_context(
+                    active_test=False).search_read(
                     [('id', 'in', po_pids)],
                     ['id', 'product_tmpl_id']
                 )
@@ -1641,7 +2120,13 @@ class MaVieDashboardController(http.Controller):
                 )
                 tmpl_by_id = {t['id']: t for t in tmpl_data}
 
-                for tid in relevant_tmpl_ids:
+                # Une référence ARCHIVÉE n'est pas « en rupture » : elle est
+                # retirée du catalogue. Ses achats comptent bien dans le CA
+                # Achat (comme dans Odoo), mais elle n'a rien à faire dans
+                # les alertes. tmpl_by_id ne contient que les actives : on
+                # s'appuie dessus plutôt que sur relevant_tmpl_ids, qui les
+                # inclut depuis qu'on lit aussi les variantes archivées.
+                for tid in tmpl_by_id:
                     stock = int(stock_by_tmpl.get(tid, 0))
                     if stock <= 0:
                         t = tmpl_by_id.get(tid, {})
@@ -1661,77 +2146,43 @@ class MaVieDashboardController(http.Controller):
                         })
 
             ruptures_count = len(all_ruptures)
+            # A08 (2026-09-24) : une référence n'était « en rupture » que si
+            # elle manquait dans TOUS les magasins à la fois. Un article
+            # absent d'une seule boutique — le cas qui intéresse le magasin —
+            # n'apparaissait nulle part. On ajoute le compte par magasin, le
+            # total toutes boutiques confondues reste affiché à côté.
+            ruptures_magasin = self._ruptures_par_magasin(
+                set(sales_by_tmpl.keys()), kw)
             ruptures_list = sorted(all_ruptures, key=lambda a: a['qty_sold'], reverse=True)[:500]
 
-            # CORRECTION #2c : references_count = nombre RÉEL de références Achats.
-            # On exclut la collection "Sachet 2026" via son vrai lien relationnel
-            # (collection_id), pas via un filtre texte sur le nom du produit
-            # (voir _sachet_exclude_domain).
-            # CORRECTION (vérifiée en base) : il manquait le filtre purchase_ok.
-            # Le catalogue product.template contient de nombreuses fiches
-            # incomplètes/non achetables (ex: 1020 produits actifs sans aucun
-            # prix de vente) qui gonflaient le chiffre à 5995 au lieu des 4972
-            # vraies références achetables ("Achats > Produits" dans Odoo
-            # filtre lui aussi sur purchase_ok=True — le commentaire ci-dessus
-            # visait déjà ce chiffre-là, le filtre manquait juste).
-            references_exclude_domain = self._sachet_exclude_domain('collection_id') + [('purchase_ok', '=', True)]
-
-            # Si filtré par collection/batch/catégorie : on compte les produits du filtre.
-            # Si filtré par société/magasin (shop_field) : on compte les produits
-            # réellement présents en stock dans CETTE société — la référence
-            # "bouge" donc avec la société sélectionnée.
-            # Sinon (vue globale) : on compte le vrai catalogue actif tel qu'affiché
-            # dans Achats > Produits (product.template.search_count live, donc les
-            # ajouts/suppressions de produits se répercutent automatiquement),
-            # et non plus seulement les SKUs ayant déjà une vente/achat/stock —
-            # c'est ce sous-ensemble qui faisait chuter le chiffre affiché très en
-            # dessous du total réel du catalogue (ex: 3922 affiché pour 5996 produits).
+            # DEMANDE UTILISATRICE (2026-09-25) : « je dois avoir TOUTES les
+            # références, pas seulement celles vendues ou achetées ». La
+            # carte comptait les références présentes en stock dans les
+            # sociétés cochées — 1 215 sur un catalogue de 3 570. Elle compte
+            # désormais le catalogue actif, restreint seulement par le filtre
+            # catégorie / collection / arrivage. Le nombre de références qui
+            # ont réellement bougé reste affiché juste en dessous.
+            # Le filtre purchase_ok est retiré : sur Elite il ne laissait que
+            # 1 380 fiches sur 3 570, alors que les autres se vendent bien.
+            references_actives = len(relevant_tmpl_ids)
             if is_filtered and product_tmpl_ids:
-                # product_tmpl_ids vient déjà de _build_product_domain, qui
-                # filtre sur les champs natifs collection_id/arrivage_id —
-                # pas besoin d'un second comptage via mv.article.base.
-                references_count = len(product_tmpl_ids)
-            elif shop_field:
-                quant_domain_refs = [('location_id.usage', '=', 'internal')]
-                if shop_scope and shop_scope['company_id']:
-                    quant_domain_refs.append(('company_id', '=', shop_scope['company_id']))
-                else:
-                    quant_domain_refs.append(('company_id', 'not in', self._get_non_retail_company_ids()))
-                if shop_scope and shop_scope['warehouse'] and shop_scope['warehouse'].lot_stock_id:
-                    quant_domain_refs.append(
-                        ('location_id', 'child_of', shop_scope['warehouse'].lot_stock_id.id)
-                    )
-                tmpl_ids_here = request.env['stock.quant'].sudo().search(quant_domain_refs).mapped(
-                    'product_id.product_tmpl_id'
-                ).ids
-                references_count = (
-                    ProductTemplate.search_count(references_exclude_domain + [('id', 'in', tmpl_ids_here)])
-                    if tmpl_ids_here else 0
-                )
+                # ProductTemplate est ici en active_test=False (le filtre
+                # doit retrouver les achats des articles archivés) : on
+                # recompte sur les seuls articles actifs, comme le total
+                # sans filtre.
+                references_count = ProductTemplate.search_count(
+                    self._sachet_exclude_domain('collection_id')
+                    + [('id', 'in', product_tmpl_ids), ('active', '=', True)])
             else:
-                context_company_ids = self._get_context_company_ids()
-                if context_company_ids:
-                    # Même règle que stock_total : un entrepôt hors magasins
-                    # actifs mappés (retail_lot_stock_ids, calculé plus haut)
-                    # ne doit pas suffire à compter une référence comme
-                    # "présente" dans le réseau.
-                    refs_domain = [
-                        ('location_id.usage', '=', 'internal'),
-                        ('company_id', 'in', context_company_ids),
-                    ]
-                    if retail_lot_stock_ids:
-                        refs_domain.append(('location_id', 'child_of', retail_lot_stock_ids))
-                    tmpl_ids_ctx = request.env['stock.quant'].sudo().search(refs_domain).mapped(
-                        'product_id.product_tmpl_id'
-                    ).ids
-                    references_count = (
-                        ProductTemplate.search_count(references_exclude_domain + [('id', 'in', tmpl_ids_ctx)])
-                        if tmpl_ids_ctx else 0
-                    )
-                else:
-                    references_count = ProductTemplate.search_count(references_exclude_domain)
+                references_count = ProductTemplate.search_count(
+                    self._sachet_exclude_domain('collection_id'))
 
-            total_active_skus = len(relevant_tmpl_ids) or 1
+            # DEMANDE UTILISATRICE (2026-09-26) : la carte Références compte
+            # tout le catalogue (3 570), les taux doivent se calculer sur la
+            # même base, sinon deux dénominateurs coexistent à l'écran.
+            # `references_actives` reste affiché à côté pour savoir combien
+            # de références tournent réellement.
+            total_active_skus = references_count or 1
             taux_rupture = round((ruptures_count / total_active_skus) * 100, 1)
 
             date_start = kw.get('date_start')
@@ -1798,20 +2249,32 @@ class MaVieDashboardController(http.Controller):
                 ('order_id.state', 'in', ['paid', 'done', 'invoiced']),
                 ('is_reward_line', '=', False),
             ] + self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
+            # On releve les QUANTITES, pas seulement la liste des articles
+            # vendus : sans elles, impossible de savoir si une reference
+            # vend assez vite pour ne pas dormir.
             pos_90d_grouped = request.env['pos.order.line'].sudo().read_group(
                 pos_90d_domain,
-                ['product_id'],
+                ['product_id', 'qty'],
                 ['product_id'],
                 lazy=False
             )
-            pids_90d = [g['product_id'][0] for g in pos_90d_grouped if g.get('product_id')]
+            qty_90d_by_pid = {g['product_id'][0]: float(g.get('qty') or 0.0)
+                              for g in pos_90d_grouped if g.get('product_id')}
+            pids_90d = list(qty_90d_by_pid)
             sold_90d_tmpl_ids = set()
+            qty_90d_by_tmpl = {}
             if pids_90d:
                 p90_prods = request.env['product.product'].sudo().search_read(
                     [('id', 'in', pids_90d)],
                     ['product_tmpl_id']
                 )
-                sold_90d_tmpl_ids = {p['product_tmpl_id'][0] for p in p90_prods if p.get('product_tmpl_id')}
+                for prod in p90_prods:
+                    if not prod.get('product_tmpl_id'):
+                        continue
+                    tid = prod['product_tmpl_id'][0]
+                    sold_90d_tmpl_ids.add(tid)
+                    qty_90d_by_tmpl[tid] = (qty_90d_by_tmpl.get(tid, 0.0)
+                                            + qty_90d_by_pid.get(prod['id'], 0.0))
 
             # ✅ CORRECTION : le pourcentage pouvait dépasser 100% quand des
             # stock.quant négatifs (écarts d'inventaire) faisaient chuter
@@ -1819,28 +2282,60 @@ class MaVieDashboardController(http.Controller):
             # (celle-ci ignorant volontairement les négatifs). On calcule donc
             # le dénominateur de la même façon que le numérateur : uniquement
             # sur les stocks positifs, pour que le ratio reste borné à 100%.
+            # A09 (2026-09-24) : un article RÉCEPTIONNÉ il y a moins de 90
+            # jours n'a pas encore eu le temps de se vendre — le classer
+            # « dormant » avec ceux qui traînent depuis un an est trompeur
+            # (constaté sur Elite : MRC-8830 reçu la veille, 72 pièces par
+            # magasin, compté dormant). On récupère la date de dernière
+            # réception et on les met de côté, en les comptant à part.
+            recus_recemment = self._receptions_recentes(relevant_tmpl_ids, jours=90)
             dormant_stock_total = 0
             positive_stock_total = 0
             dormant_products = []
+            recents_count = 0
+            recents_stock = 0
+            lents_count = 0
             for tid in relevant_tmpl_ids:
                 stock = stock_by_tmpl.get(tid, 0)
-                if stock > 0:
-                    positive_stock_total += stock
-                    if tid not in sold_90d_tmpl_ids:
-                        dormant_stock_total += stock
-                        t = tmpl_by_id.get(tid, {})
-                        ref = (
-                            t.get('base_pivot_reference')
-                            or t.get('default_code')
-                            or t.get('name')
-                            or '—'
-                        )
-                        dormant_products.append({
-                            'id': tid,
-                            'name': t.get('name') or '—',
-                            'ref': ref,
-                            'stock': stock
-                        })
+                if stock <= 0:
+                    continue
+                positive_stock_total += stock
+                vendu_90j = qty_90d_by_tmpl.get(tid, 0.0)
+                couverture = None
+                if vendu_90j <= 0:
+                    # Aucune vente. Une reference qui vient d'arriver n'a pas
+                    # eu le temps : on la met de cote et on la compte a part.
+                    if tid in recus_recemment:
+                        recents_count += 1
+                        recents_stock += stock
+                        continue
+                else:
+                    # Elle vend : sa couverture est mesurable, la date de
+                    # reception ne l'excuse plus.
+                    # On arrondit AVANT de comparer : la liste affiche des
+                    # jours entiers, la regle doit porter sur ce nombre-la.
+                    couverture = round(stock / (vendu_90j / 90.0))
+                    if couverture <= self.COUVERTURE_DORMANTE_JOURS:
+                        continue
+                    lents_count += 1
+                dormant_stock_total += stock
+                t = tmpl_by_id.get(tid, {})
+                ref = (
+                    t.get('base_pivot_reference')
+                    or t.get('default_code')
+                    or t.get('name')
+                    or '—'
+                )
+                dormant_products.append({
+                    'id': tid,
+                    'name': t.get('name') or '—',
+                    'ref': ref,
+                    'stock': stock,
+                    'recu_le': recus_recemment.get(tid) or '',
+                    'vendu_90j': int(round(vendu_90j)),
+                    'couverture_jours': (int(round(couverture))
+                                         if couverture is not None else None),
+                })
             stock_dormant_pct = round((dormant_stock_total / positive_stock_total) * 100, 1) if positive_stock_total > 0 else 0.0
 
             inv_adjustments_count = request.env['stock.move'].sudo().search_count([
@@ -2062,6 +2557,7 @@ class MaVieDashboardController(http.Controller):
                 vendu_avec_cout_total += cost
             marge_total = ca_ht_total - vendu_avec_cout_total
 
+            retours = []
             if page == 'stock':
                 top_products = sorted(product_stats, key=lambda a: a['stock'], reverse=True)[:top_limit]
                 flop_products = sorted(product_stats, key=lambda a: a['stock'])[:flop_limit]
@@ -2070,11 +2566,20 @@ class MaVieDashboardController(http.Controller):
                 flop_products = sorted(product_stats, key=lambda a: a['qty_purchased'])[:flop_limit]
             else:
                 top_products = sorted(product_stats, key=lambda a: a['ca'], reverse=True)[:top_limit]
-                flops_avec_stock = sorted([p for p in product_stats if p['stock'] > 0], key=lambda a: a['ca'])
+                # A10 (2026-09-24) : le Flop remontait d'abord les RETOURS —
+                # une référence rendue par un client finit à quantité et CA
+                # négatifs, donc tout en haut d'un tri croissant. Ce n'est
+                # pas un produit qui se vend mal, c'est une vente annulée.
+                # Le Flop ne garde donc que les références réellement
+                # vendues ; les retours nets sont listés à part.
+                retours = sorted([p for p in product_stats if (p.get('qty_sold') or 0) < 0],
+                                 key=lambda a: a['qty_sold'])[:flop_limit]
+                vendus = [p for p in product_stats if (p.get('qty_sold') or 0) > 0]
+                flops_avec_stock = sorted([p for p in vendus if p['stock'] > 0], key=lambda a: a['ca'])
                 if flops_avec_stock:
                     flop_products = flops_avec_stock[:flop_limit]
                 else:
-                    flop_products = sorted(product_stats, key=lambda a: a['ca'])[:flop_limit]
+                    flop_products = sorted(vendus, key=lambda a: a['ca'])[:flop_limit]
 
             # ✅ VALORISATION DU STOCK (Société & Par Magasin)
             # BUG CORRIGÉ (2026-08-18) : la valorisation gardait TOUTES les
@@ -2118,6 +2623,8 @@ class MaVieDashboardController(http.Controller):
 
             val_pids = [g['product_id'][0] for g in quant_val_grouped if g.get('product_id')]
             val_cost_estime = False
+            val_qty_total = 0.0
+            val_qty_avec_cout = 0.0
             if val_pids:
                 val_prods = request.env['product.product'].sudo().with_context(active_test=False).search_read(
                     [('id', 'in', val_pids)],
@@ -2137,11 +2644,15 @@ class MaVieDashboardController(http.Controller):
                 # l'utilise comme repli plutôt que d'afficher zéro. La valeur
                 # est alors signalée comme estimée (val_cost_estime) pour ne
                 # pas la confondre avec un coût réellement saisi.
-                prix_achat_moyen_by_tmpl = {}
-                for tid, qte in ordered_by_tmpl.items():
-                    montant = ca_achat_ht_by_tmpl.get(tid) or 0.0
-                    if qte and montant > 0:
-                        prix_achat_moyen_by_tmpl[tid] = montant / qte
+                # Même calcul que le pop-up de valorisation : un seul
+                # endroit, sinon les deux écrans divergent (constaté :
+                # 714 749,55 contre 357 243,25 pour SQUARE TARGA).
+                tmpl_sans_cout = {
+                    p.get('product_tmpl_id')[0] for p in val_prod_map.values()
+                    if p.get('product_tmpl_id') and not p.get('standard_price')
+                }
+                prix_achat_moyen_by_tmpl = self._prix_achat_moyen_par_reference(
+                    tmpl_sans_cout, kw)
 
                 val_by_company = {}
                 for g in quant_val_grouped:
@@ -2158,6 +2669,13 @@ class MaVieDashboardController(http.Controller):
                     p_data = val_prod_map[pid]
                     price_ht = p_data.get('list_price') or 0.0
                     cost_price = p_data.get('standard_price') or 0.0
+                    # A07 : on mesure la part des pièces dont le coût est
+                    # VRAIMENT saisi, pour pouvoir dire sur quoi porte la
+                    # « valeur au coût » au lieu d'afficher un total qui
+                    # repose sur quatre articles.
+                    val_qty_total += qty
+                    if cost_price:
+                        val_qty_avec_cout += qty
                     if not cost_price:
                         tmpl_ref = p_data.get('product_tmpl_id')
                         tmpl_id_val = tmpl_ref[0] if tmpl_ref else None
@@ -2194,38 +2712,18 @@ class MaVieDashboardController(http.Controller):
                     })
 
             # ✅ ALERTE RUPTURE SOUS 30 JOURS (Prévision de rupture)
-            proches_rupture_30j = []
-            for tid in relevant_tmpl_ids:
-                stk = stock_by_tmpl.get(tid, 0)
-                qs = sales_by_tmpl_velocity.get(tid, 0)
-                daily_rate = qs / days_in_period if days_in_period > 0 else 0.0
-                if stk > 0 and daily_rate > 0:
-                    days_left = round(stk / daily_rate, 1)
-                    if days_left <= 30:
-                        t = tmpl_by_id.get(tid, {})
-                        ref = (
-                            t.get('base_pivot_reference')
-                            or t.get('default_code')
-                            or t.get('name')
-                            or '—'
-                        )
-                        proches_rupture_30j.append({
-                            'id': tid,
-                            'name': t.get('name') or '—',
-                            'ref': ref,
-                            'stock': int(stk),
-                            'qty_sold': int(qs),
-                            'daily_rate': round(daily_rate, 2),
-                            'days_left': days_left
-                        })
-
-            proches_rupture_30j.sort(key=lambda x: x['days_left'])
-
-            magasin_by_tid_30j = self._resolve_magasin_batch(
-                [p['id'] for p in proches_rupture_30j], shop_mappings, kw.get('shop_field')
-            )
-            for p in proches_rupture_30j:
-                p['magasin'] = magasin_by_tid_30j.get(p['id'], 'Réseau')
+            #
+            # CORRIGÉ le 2026-09-26 : l'alerte comparait le stock du RÉSEAU
+            # à la vitesse de vente du RÉSEAU, puis collait à côté le nom
+            # d'UN magasin choisi à part. Les deux ne parlaient donc pas du
+            # même endroit : 98-73 s'affichait « Elite Carrefour Targa,
+            # stock 5 » alors que les 5 pièces sont à Elite Auderby, et
+            # EL1520 « Elite Menara Mall, stock 1 » alors que ce magasin est
+            # à −1. Le calcul se fait maintenant magasin par magasin : une
+            # ligne = une référence DANS un magasin, avec le stock de ce
+            # magasin et ses ventes à lui.
+            proches_rupture_30j = self._alerte_rupture_par_magasin(
+                kw, relevant_tmpl_ids, tmpl_by_id, days_in_period)
 
             # Photos du Top/Flop — résolues en 2 requêtes pour l'ensemble des
             # lignes affichées, pas une par ligne.
@@ -2240,10 +2738,15 @@ class MaVieDashboardController(http.Controller):
                 'ca_total': round(ca_total, 2),
                 'ca_ht': round(ca_ht_total, 2),
                 'ca_achat': round(ca_achat_total, 2),
+                'ca_achat_depot': round(ca_achat_depot, 2),
                 'vendu_avec_cout': round(vendu_avec_cout_total, 2),
                 'marge': round(marge_total, 2),
                 'tickets': tickets,
                 'references_count': references_count,
+                # Le compte porte sur les références AYANT UNE ACTIVITÉ
+                # (vendue, achetée ou en stock). On renvoie aussi la taille
+                # du catalogue : 1 215 sur 3 570 sur Elite, et l'écart
+                # surprenait (remarque du 2026-09-25).
                 'panier_moyen': round(panier_moyen, 2),
                 'qty_sold': qty_sold_total,
                 'qty_sold_normal': qty_sold_normal_total,
@@ -2260,6 +2763,14 @@ class MaVieDashboardController(http.Controller):
                 'nb_magasins_negatifs': nb_magasins_negatifs,
                 'valeur_stock_ht': round(val_ht_total, 2),
                 'valeur_stock_cost': round(val_cost_total, 2),
+                # A07 / A15 : part des pièces dont le coût est réellement
+                # renseigné. En dessous, la valeur au coût et le GMROI ne
+                # veulent pas dire grand-chose : l'écran le signale.
+                'valeur_cost_couverture': (round(val_qty_avec_cout / val_qty_total * 100, 1)
+                                           if val_qty_total else 0.0),
+                'valeur_cost_disponible': bool(
+                    val_qty_total and
+                    val_qty_avec_cout / val_qty_total * 100 >= COUT_COUVERTURE_MIN),
                 'valeur_stock_cost_estime': val_cost_estime,
                 'stock_val_by_store': stock_val_by_store,
                 'sell_through': sell_through,
@@ -2267,16 +2778,29 @@ class MaVieDashboardController(http.Controller):
                 'ruptures_list': ruptures_list,
                 'top_products': [dict(p, rank=idx + 1) for idx, p in enumerate(top_products)],
                 'flop_products': [dict(p, rank=idx + 1) for idx, p in enumerate(flop_products)],
+                # A10 : les références en retour net, sorties du Flop.
+                'retours_products': [dict(p, rank=idx + 1) for idx, p in enumerate(retours)],
                 'abc_analysis': {
                     'A': abc['A'][:10],
                     'B': abc['B'][:10],
                     'C': abc['C'][:10],
                 },
                 'taux_rupture': taux_rupture,
+                'ruptures_magasin_count': ruptures_magasin['count'],
+                'ruptures_magasin_list': ruptures_magasin['lignes'],
+                'ruptures_magasin_refs': ruptures_magasin['refs'],
                 'total_active_skus': total_active_skus,
                 'couverture_moy': couverture_moy,
                 'stock_dormant_pct': stock_dormant_pct,
                 'dormant_count': len(dormant_products),
+                # A09 : références sans vente mais reçues depuis moins de
+                # 90 jours — écartées du dormant, signalées à part.
+                'dormant_recents_count': recents_count,
+                'dormant_recents_stock': recents_stock,
+                # Combien dorment parce qu'elles vendent trop lentement,
+                # et non parce qu'elles ne vendent rien du tout.
+                'dormant_lents_count': lents_count,
+                'dormant_seuil_couverture': self.COUVERTURE_DORMANTE_JOURS,
                 'dormant_list': sorted(dormant_products, key=lambda x: x['stock'], reverse=True)[:500],
                 'precision_inventaire': precision_inventaire,
                 'ecarts_inventaire_pct': ecarts_inventaire_pct,
@@ -2321,12 +2845,34 @@ class MaVieDashboardController(http.Controller):
     # ─────────────────────────────────────────────────────────────
 
     def _modforlife_shop_by_warehouse(self):
-        """{entrepôt -> libellé magasin} d'après les mappings configurés."""
+        """{entrepôt -> nom du magasin}.
+
+        On affiche le NOM DE L'ENTREPÔT (« Elite Auderby »), pas le libellé
+        technique de Base Pivot (« ELITE 04 ») : c'est celui que montre le
+        sélecteur Magasin en haut de l'écran, et deux noms différents pour
+        le même magasin d'un bloc à l'autre prêtaient à confusion
+        (remarque utilisatrice du 2026-09-25).
+        """
         labels = {}
         for m in self._get_active_shop_mappings():
             if m.warehouse_id:
-                labels[m.warehouse_id.id] = m.shop_label or m.warehouse_id.name
+                labels[m.warehouse_id.id] = m.warehouse_id.name or m.shop_label
         return labels
+
+    def _modforlife_code_by_warehouse(self):
+        """{entrepôt -> code Base Pivot, « ELITE 04 »}.
+
+        Le nom de l'entrepôt reste le libellé affiché — c'est celui du
+        sélecteur Magasin. Mais Odoo n'écrit que ce code-là dans le
+        « Document d'origine » des bons de vente inter-sociétés : on le
+        montre à côté du nom pour que la ligne du dashboard et le bon
+        d'Odoo se rapprochent sans table de correspondance.
+        """
+        codes = {}
+        for m in self._get_active_shop_mappings():
+            if m.warehouse_id and m.shop_field:
+                codes[m.warehouse_id.id] = m.shop_field.replace('_', ' ').upper()
+        return codes
 
     def _modforlife_order_to_shop(self, mod_for_life, retail_companies, sale_orders):
         """{sale_order_id -> (warehouse_id, libellé magasin)}.
@@ -2359,7 +2905,20 @@ class MaVieDashboardController(http.Controller):
                 'partner': mod_for_life.partner_id.id,
                 'companies': retail_companies.ids,
             })
+            # Le bon d'achat miroir ne pointe le magasin que si son type
+            # d'opération est celui d'un entrepôt MAPPÉ. Sur Elite il pointe
+            # l'entrepôt générique de la société (« SQUARE TARGA »), et le
+            # dispatch affichait alors le nom de la société à la place du
+            # magasin — un seul magasin visible sur sept. Dans ce cas on
+            # laisse la main au repli, qui lit le libellé magasin écrit par
+            # Base Pivot dans l'origine du bon de vente (« … — ELITE 05 »).
+            entrepots_magasins = {
+                m.warehouse_id.id for m in self._get_active_shop_mappings()
+                if m.warehouse_id
+            }
             for origin, wh_id, wh_name in request.env.cr.fetchall():
+                if wh_id not in entrepots_magasins:
+                    continue
                 for so_name, so_id in so_by_name.items():
                     if so_id not in result and so_name in origin:
                         result[so_id] = (wh_id, shop_labels.get(wh_id) or wh_name)
@@ -2368,19 +2927,55 @@ class MaVieDashboardController(http.Controller):
         # bon de vente par Base Pivot.
         restants = [so for so in sale_orders if so.id not in result]
         if restants:
+            # Mots distinctifs du nom de chaque entrepôt : « Elite Carrefour
+            # Targa » -> CARREFOUR, TARGA. On écarte les mots partagés par
+            # plusieurs magasins (ELITE), qui ne distinguent rien.
+            by_mot = {}
+            compte_mots = {}
+            mags = [m for m in self._get_active_shop_mappings() if m.warehouse_id]
+            for m in mags:
+                for mot in (m.warehouse_id.name or '').upper().split():
+                    if len(mot) >= 4:
+                        compte_mots[mot] = compte_mots.get(mot, 0) + 1
+            for m in mags:
+                for mot in (m.warehouse_id.name or '').upper().split():
+                    if len(mot) >= 4 and compte_mots.get(mot) == 1:
+                        by_mot[mot] = (m.warehouse_id.id, m.warehouse_id.name)
+
             by_label = {}
             for m in self._get_active_shop_mappings():
                 if m.shop_label and m.warehouse_id:
+                    # On reconnaît le magasin par son libellé Base Pivot
+                    # (« ELITE 04 », écrit dans l'origine du bon de vente),
+                    # mais on l'affiche sous son nom d'entrepôt.
                     by_label[m.shop_label.strip().upper()] = (
-                        m.warehouse_id.id, m.shop_label)
+                        m.warehouse_id.id, m.warehouse_id.name or m.shop_label)
             for so in restants:
                 origin = (so.origin or '').strip().upper()
                 if not origin:
                     continue
-                for label, val in by_label.items():
-                    if origin.endswith(label):
-                        result[so.id] = val
-                        break
+                # Le libellé est écrit en fin d'origine (« … — ELITE 05 »),
+                # mais on accepte aussi qu'il soit suivi d'autre chose : on
+                # prend le libellé le plus long qui correspond, pour ne pas
+                # confondre « ELITE 0 » avec « ELITE 05 ».
+                candidats = [
+                    (label, val) for label, val in by_label.items()
+                    if origin.endswith(label) or ('— ' + label) in origin
+                    or (' ' + label) in origin
+                ]
+                if not candidats:
+                    # Certains bons portent une origine libre, saisie à la
+                    # main : « UNIFORMES SQUARE 11/09/2026 »,
+                    # « VALISES-AUDERBY-2026-08-10 ». Le nom du magasin y est,
+                    # mais pas sous la forme « — ELITE 02 ». On cherche donc
+                    # les mots du nom de l'entrepôt (SQUARE, TARGA, AUDERBY…),
+                    # en ignorant ceux communs à tous (ELITE).
+                    candidats = [
+                        (mot, val) for mot, val in by_mot.items() if mot in origin
+                    ]
+                if candidats:
+                    label, val = max(candidats, key=lambda c: len(c[0]))
+                    result[so.id] = val
         return result
 
     # Articles de TEST exclus de toute la vue MOD FOR LIFE (achats, stock,
@@ -2579,6 +3174,31 @@ class MaVieDashboardController(http.Controller):
         shop_by_order = self._modforlife_order_to_shop(
             mod_for_life, retail_companies, sale_orders)
 
+        # Tous les bons rattaches a un magasin, et ceux qui n'ont rien
+        # livre : sert a expliquer, sous la ligne du magasin, pourquoi
+        # Odoo compte parfois plus de bons que le tableau.
+        bons_du_magasin = {}
+        for so_id, (wh_id_, _lab) in shop_by_order.items():
+            bons_du_magasin.setdefault(wh_id_, set()).add(so_id)
+        request.env.cr.execute("""
+            SELECT so.id, COALESCE(SUM(sol.qty_delivered), 0)
+              FROM sale_order so
+              LEFT JOIN sale_order_line sol ON sol.order_id = so.id
+             WHERE so.id = ANY(%s)
+             GROUP BY so.id
+        """, (sale_orders.ids,))
+        bons_sans_livraison = {i for i, q in request.env.cr.fetchall()
+                               if not float(q or 0.0)}
+        # Bons saisis sans aucun prix : ce sont eux qui remplissent la
+        # colonne « Montant TTC » de zeros.
+        request.env.cr.execute("""
+            SELECT so.id FROM sale_order so
+             WHERE so.id = ANY(%s)
+               AND NOT EXISTS (SELECT 1 FROM sale_order_line l
+                                WHERE l.order_id = so.id AND l.price_unit > 0)
+        """, (sale_orders.ids,))
+        bons_sans_prix = {i for (i,) in request.env.cr.fetchall()}
+
         params = {'orders': sale_orders.ids}
         filters = self._mfl_sans_test_sql('pt')
         if product_tmpl_ids is not None:
@@ -2723,10 +3343,27 @@ class MaVieDashboardController(http.Controller):
 
         # Qté vendue en caisse par le magasin (demande utilisatrice
         # 2026-09-22), mêmes variantes que la ligne, sur la période choisie.
-        ventes = self._ventes_caisse_par_magasin(
-            kw, {pid for s in societes.values() for m in s['magasins'].values()
-                 for l in m['refs'].values() for pid in l.get('pids', ())})
+        variantes_vues = {pid for s in societes.values()
+                          for m in s['magasins'].values()
+                          for l in m['refs'].values() for pid in l.get('pids', ())}
+        ventes = self._ventes_caisse_par_magasin(kw, variantes_vues)
 
+        # Ce qu'il reste de chaque variante DANS L'ENTREPOT DU DEPOT, pour
+        # que la ligne dise aussi si le magasin peut encore etre servi.
+        stock_depot = {}
+        if variantes_vues:
+            request.env.cr.execute("""
+                SELECT q.product_id, SUM(q.quantity)
+                  FROM stock_quant q
+                  JOIN stock_location l ON l.id = q.location_id
+                 WHERE l.usage = 'internal' AND l.company_id = %s
+                   AND q.product_id = ANY(%s)
+                 GROUP BY q.product_id
+            """, (mod_for_life.id, list(variantes_vues)))
+            stock_depot = {pid: float(q or 0.0)
+                           for pid, q in request.env.cr.fetchall()}
+
+        codes_magasin = self._modforlife_code_by_warehouse()
         par_societe = []
         nb_magasins = 0
         for soc in societes.values():
@@ -2742,12 +3379,29 @@ class MaVieDashboardController(http.Controller):
                         'tailles': _tailles_txt(ligne['tailles']),
                         'qty': int(round(ligne['qty'])),
                         'ca': round(ligne['ca'], 2),
+                        'depot': int(round(sum(stock_depot.get(pid, 0.0)
+                                               for pid in ligne.get('pids', ())))),
                         'vendu': int(round(sum(ventes.get((mag['warehouse_id'], pid), 0.0)
                                                for pid in ligne.get('pids', ())))),
                     })
                 refs.sort(key=lambda r: (-r['qty'], r['reference']))
+                # Bons rattaches au magasin mais dont rien n'est retenu :
+                # soit ils n'ont rien livre, soit ils ne portent que de la
+                # marchandise sans bon d'achat fournisseur derriere.
+                tous = bons_du_magasin.get(mag['warehouse_id'], set())
+                retenus = {i for i in tous if so_names.get(i) in mag['bons']}
+                ecartes = tous - retenus
                 magasins.append({
                     'magasin': mag['magasin'],
+                    'code': codes_magasin.get(mag['warehouse_id'], ''),
+                    'bons_ecartes': len(ecartes),
+                    'bons_sans_livraison': len(ecartes & bons_sans_livraison),
+                    # Combien de bons retenus n'ont aucun prix, et combien de
+                    # pieces ils emportent : sans ce compte, une colonne de
+                    # zeros passe pour une panne du tableau de bord.
+                    'bons_sans_prix': len(retenus & bons_sans_prix),
+                    'qty_sans_prix': int(round(sum(
+                        l['qty'] for l in mag['refs'].values() if not l['ca']))),
                     'warehouse_id': mag['warehouse_id'],
                     'qty': int(round(mag['qty'])),
                     'ca': round(mag['ca'], 2),
@@ -2756,7 +3410,7 @@ class MaVieDashboardController(http.Controller):
                     # Les bons de vente derrière la ligne : indispensable sur
                     # « Magasin non identifié », où la seule façon de savoir
                     # ce qui est parti est d'ouvrir le bon dans Odoo.
-                    'bons': sorted(b for b in mag['bons'] if b)[:20],
+                    'bons': sorted(b for b in mag['bons'] if b)[:60],
                     'nb_bons': len(mag['bons']),
                     'references': refs,
                 })
@@ -2920,21 +3574,119 @@ class MaVieDashboardController(http.Controller):
         """.replace('{FILTERS}', filters), params)
         return request.env.cr.fetchall()
 
+    @http.route('/mavie/api/mfl-stock-entrepot', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_mfl_stock_entrepot(self, **kw):
+        """Ce qui reste dans l'entrepôt du dépôt, ligne par ligne.
+
+        La carte affiche deux totaux : le stock des références que le dépôt
+        a lui-même achetées (celui qui équilibre « acheté − dispatché ») et
+        le stock réel de l'entrepôt, retours de magasins compris. Le
+        détail nomme chaque ligne et dit à laquelle des deux elle compte,
+        sinon l'écart entre les deux chiffres reste inexplicable.
+        """
+        try:
+            depot = self._societe_depot()
+            if not depot:
+                return {'error': "Société dépôt introuvable."}
+            request.env.cr.execute("""
+                SELECT DISTINCT pol.product_id
+                  FROM purchase_order_line pol
+                  JOIN purchase_order po ON po.id = pol.order_id
+                 WHERE po.company_id = %s AND po.state IN ('purchase', 'done')
+            """, (depot.id,))
+            achetees = {r[0] for r in request.env.cr.fetchall()}
+
+            request.env.cr.execute("""
+                SELECT pp.id,
+                       COALESCE(pt.default_code, pt.name->>'fr_FR',
+                                pt.name->>'en_US') AS reference,
+                       COALESCE(pt.name->>'fr_FR', pt.name->>'en_US') AS produit,
+                       pt.active,
+                       l.complete_name,
+                       SUM(q.quantity) AS qte
+                  FROM stock_quant q
+                  JOIN stock_location l ON l.id = q.location_id
+                  JOIN product_product pp ON pp.id = q.product_id
+                  JOIN product_template pt ON pt.id = pp.product_tmpl_id
+                 WHERE l.usage = 'internal' AND l.company_id = %s AND pt.active
+                 GROUP BY 1, 2, 3, 4, 5
+                HAVING SUM(q.quantity) <> 0
+                 ORDER BY SUM(q.quantity) DESC
+            """, (depot.id,))
+            brut = request.env.cr.fetchall()
+
+            variantes = request.env['product.product'].sudo().with_context(
+                active_test=False).browse([r[0] for r in brut])
+            noms = {v.id: v for v in variantes}
+            rows = []
+            total = total_achetees = total_negatif = 0.0
+            for pid, ref, produit, actif, emplacement, qte in brut:
+                v = noms.get(pid)
+                qte = float(qte or 0.0)
+                total += qte
+                if pid in achetees:
+                    total_achetees += qte
+                if qte < 0:
+                    total_negatif += qte
+                rows.append({
+                    'product_id': pid,
+                    'reference': ref or '—',
+                    'produit': produit or '—',
+                    'variante': v.display_name if v else (produit or '—'),
+                    'couleur': ' / '.join(
+                        v.product_template_attribute_value_ids.mapped('name')) if v else '',
+                    'emplacement': emplacement or '—',
+                    'qty': int(round(qte)),
+                    'achetee': pid in achetees,
+                    'archive': not actif,
+                })
+            # Articles archivés : hors de la liste, mais comptés dans la carte.
+            # Seuls leurs totaux sont renvoyés, pour que la décomposition
+            # tombe juste sans les afficher.
+            request.env.cr.execute("""
+                SELECT pp.id, SUM(q.quantity)
+                  FROM stock_quant q
+                  JOIN stock_location l ON l.id = q.location_id
+                  JOIN product_product pp ON pp.id = q.product_id
+                  JOIN product_template pt ON pt.id = pp.product_tmpl_id
+                 WHERE l.usage = 'internal' AND l.company_id = %s AND NOT pt.active
+                 GROUP BY pp.id
+            """, (depot.id,))
+            archives = request.env.cr.fetchall()
+            archives_total = sum(float(q or 0.0) for _pid, q in archives)
+            archives_achetees = sum(float(q or 0.0) for pid, q in archives if pid in achetees)
+            return {
+                'rows': rows,
+                'societe': depot.name,
+                'total_non_achetees_actifs': int(round(total - total_achetees)),
+                'total_archives': int(round(archives_total)),
+                'total_archives_achetees': int(round(archives_achetees)),
+                'total': int(round(total)),
+                'total_achetees': int(round(total_achetees)),
+                'total_negatif': int(round(total_negatif)),
+                'nb_lignes': len(rows),
+                'nb_references': len({r['reference'] for r in rows}),
+            }
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_mfl_stock_entrepot: %s", e, exc_info=True)
+            return {'error': str(e)}
+
     @http.route('/mavie/api/mfl-achats-directs', type='json', auth='user', methods=['POST'], csrf=False)
     def api_mfl_achats_directs(self, **kw):
         """Lignes « achat magasin » d'UN magasin, chargées au dépliage dans
         l'arbre du dispatch MOD FOR LIFE (voir _modforlife_achats_directs).
         Mêmes filtres que la vue : dates, collection / batch / catégorie."""
         try:
-            mod_for_life = request.env['res.company'].sudo().search(
-                [('name', '=', 'MOD FOR LIFE')], limit=1)
+            mod_for_life = self._societe_depot()
             if not mod_for_life:
-                return {'error': 'Société MOD FOR LIFE introuvable.'}
+                return {'error': "Société entrepôt introuvable : renseignez-la dans Paramètres généraux → Base Pivot (Société importatrice)."}
             retail_companies = request.env['res.company'].sudo().search([
                 ('id', '!=', mod_for_life.id), ('name', 'not in', ['PAIE'])])
             product_tmpl_ids = None
-            if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
-                product_tmpl_ids = request.env['product.template'].sudo().search(
+            if self._filtre_produit_actif(kw):
+                product_tmpl_ids = request.env['product.template'].sudo().with_context(
+                    active_test=False).search(
                     self._build_product_domain(kw)).ids or [-1]
             rows = self._modforlife_achats_directs(
                 kw, mod_for_life, retail_companies, product_tmpl_ids,
@@ -3186,8 +3938,9 @@ class MaVieDashboardController(http.Controller):
             # catalogue entier, sans que rien ne l'indique à l'écran. On
             # applique désormais le même filtre produit que la vue retail.
             product_tmpl_ids = None
-            if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
-                product_tmpl_ids = request.env['product.template'].sudo().search(
+            if self._filtre_produit_actif(kw):
+                product_tmpl_ids = request.env['product.template'].sudo().with_context(
+                    active_test=False).search(
                     self._build_product_domain(kw)
                 ).ids
                 if not product_tmpl_ids:
@@ -3210,10 +3963,12 @@ class MaVieDashboardController(http.Controller):
             po_domain += self._mfl_sans_test_domain('product_id.product_tmpl_id.name')
             if product_tmpl_ids is not None:
                 po_domain.append(('product_id.product_tmpl_id', 'in', product_tmpl_ids))
-            if kw.get('date_start'):
-                po_domain.append(('order_id.date_order', '>=', kw['date_start'] + ' 00:00:00'))
-            if kw.get('date_end'):
-                po_domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
+            # Même règle que les cartes du tableau de bord (demande du
+            # 2026-09-25) : les achats ne suivent pas le filtre Période. La
+            # marchandise est achetée en une fois puis dispatchée sur des
+            # mois ; borner les achats à la même fenêtre que les ventes
+            # faisait tomber « Qté achetée » de 87 943 à 51 308 et les
+            # « Achats fournisseurs » de 9 504 à 0.
             po_grouped = request.env['purchase.order.line'].sudo().read_group(
                 po_domain, ['price_total:sum'], [], lazy=False
             )
@@ -3225,12 +3980,8 @@ class MaVieDashboardController(http.Controller):
             # reçu puis renvoyé, ne compte pas. C'est ce qui est entré en
             # stock, donc un chiffre qui ne bouge plus quand la marchandise
             # repart.
-            if kw.get('date_start') or kw.get('date_end'):
-                achats_periode = self._modforlife_purchased_variants(
-                    mod_for_life, retail_companies, product_tmpl_ids,
-                    kw.get('date_start'), kw.get('date_end'))
-            else:
-                achats_periode = achats_par_variante
+            # Idem : la quantité reçue porte sur tout l'historique.
+            achats_periode = achats_par_variante
             qty_achats_fournisseurs = int(round(sum(achats_periode.values())))
             # Le montant, lui, reste celui de TOUS les bons d'achat
             # fournisseur : c'est de l'argent réellement engagé, y compris
@@ -3243,6 +3994,25 @@ class MaVieDashboardController(http.Controller):
             nb_commandes_fournisseurs = (po_tickets_agg[0].get('order_id') or 0) if po_tickets_agg else 0
 
             nb_references_achetees = len(achats_periode)
+
+            # Combien de bons portent reellement un prix ? Sans ce compte,
+            # « 9 504,00 MAD pour 87 943 pieces » se lit comme un calcul
+            # faux alors que c'est la saisie qui manque : verifie en base,
+            # 271 des 272 bons d'achat du depot n'ont aucun prix unitaire.
+            request.env.cr.execute("""
+                SELECT COUNT(*) FROM purchase_order po
+                 WHERE po.company_id = %s AND po.state IN ('purchase', 'done')
+                   AND NOT EXISTS (SELECT 1 FROM purchase_order_line l
+                                    WHERE l.order_id = po.id AND l.price_unit > 0)
+            """, (mod_for_life.id,))
+            achats_bons_sans_prix = request.env.cr.fetchone()[0] or 0
+            request.env.cr.execute("""
+                SELECT COUNT(*) FROM sale_order so
+                 WHERE so.company_id = %s AND so.state IN ('sale', 'done')
+                   AND NOT EXISTS (SELECT 1 FROM sale_order_line l
+                                    WHERE l.order_id = so.id AND l.price_unit > 0)
+            """, (mod_for_life.id,))
+            ventes_bons_sans_prix = request.env.cr.fetchone()[0] or 0
 
             # Achats réceptionnés d'articles dont Odoo ne tient pas le stock :
             # hors du compte « acheté = stock + dispatché », affichés à part.
@@ -3267,6 +4037,19 @@ class MaVieDashboardController(http.Controller):
                 quant_domain, ['quantity:sum'], [], lazy=False
             )
             stock_entrepot = int(sum(g.get('quantity') or 0 for g in quant_grouped)) if quant_grouped else 0
+
+            # Le chiffre ci-dessus ne porte que sur les variantes ACHETÉES
+            # par le dépôt : c'est ce qu'il faut pour que le compte
+            # « acheté − dispatché = stock » tombe juste. Mais l'entrepôt
+            # contient aussi des pièces arrivées autrement (retours de
+            # magasins). Vérifié sur Elite : 6 901 sur le périmètre acheté,
+            # 6 448 en tout. On renvoie les deux plutôt que d'en afficher un
+            # seul sous une étiquette qui promet l'autre.
+            stock_entrepot_total = int(sum(
+                g.get('quantity') or 0 for g in request.env['stock.quant'].sudo().read_group(
+                    [('location_id.usage', '=', 'internal'),
+                     ('company_id', '=', mod_for_life.id)],
+                    ['quantity:sum'], [], lazy=False)) or 0)
 
             # ── Le compte : acheté − dispatché = stock. Comparé au stock
             # réel, et l'écart reste un écart (jamais absorbé).
@@ -3308,6 +4091,8 @@ class MaVieDashboardController(http.Controller):
                 'qty_achats_fournisseurs': qty_achats_fournisseurs,
                 'qty_achats_total': qty_achats_total,
                 'nb_commandes_fournisseurs': nb_commandes_fournisseurs,
+                'achats_bons_sans_prix': achats_bons_sans_prix,
+                'ventes_bons_sans_prix': ventes_bons_sans_prix,
                 'nb_references_achetees': nb_references_achetees,
                 'non_stockables': non_stockables,
                 'ca_ventes_societes': dispatch['ca_total'],
@@ -3324,6 +4109,7 @@ class MaVieDashboardController(http.Controller):
                 'hors_perimetre_nb_refs': dispatch['hors_perimetre_nb_refs'],
                 'hors_perimetre_nb_bons': dispatch['hors_perimetre_nb_bons'],
                 'stock_entrepot': stock_entrepot,
+                'stock_entrepot_total': stock_entrepot_total,
                 'balance_mfl': balance,
                 'periode_filtree': bool(kw.get('date_start') or kw.get('date_end')),
             }
@@ -3558,12 +4344,13 @@ class MaVieDashboardController(http.Controller):
     @http.route('/mavie/api/sales-daily', type='json', auth='user', methods=['POST'], csrf=False)
     def api_sales_daily(self, **kw):
         try:
-            is_filtered = bool(kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'))
+            is_filtered = bool(self._filtre_produit_actif(kw))
 
             product_tmpl_ids = None
             if is_filtered:
                 domain = self._build_product_domain(kw)
-                products = request.env['product.template'].sudo().search(domain)
+                products = request.env['product.template'].sudo().with_context(
+                    active_test=False).search(domain)
                 if not products:
                     return {'daily': [], 'by_shop': []}
                 product_tmpl_ids = products.ids
@@ -3612,9 +4399,13 @@ class MaVieDashboardController(http.Controller):
                 tid = prod_to_tmpl.get(product_id)
                 if not tid:
                     continue
-                arrivage_name = tmpl_to_arrivage.get(tid)
-                if not arrivage_name:
-                    continue
+                # A12 (2026-09-24) : les articles qui ne sont rattachés à
+                # aucun arrivage étaient simplement ignorés. Le graphique
+                # ne montrait donc qu'un arrivage valant 3,5 % du CA, sans
+                # que rien n'explique le reste. On les regroupe désormais
+                # sous « Non rattaché » pour que le total du graphique
+                # corresponde au CA de la période.
+                arrivage_name = tmpl_to_arrivage.get(tid) or 'Non rattaché'
                 ca = float(ca or 0.0)
                 qty = int(qty or 0)
 
@@ -3686,7 +4477,10 @@ class MaVieDashboardController(http.Controller):
             results = [{
                 'id': p.id,
                 'name': p.name or '—',
-                'ref': p.base_pivot_reference or p.default_code or '—',
+                # Même repli que partout ailleurs (page Action, Top/Flop) :
+                # sans code interne, la référence affichée est le nom. Sur
+                # Elite, 27 articles n'ont aucun code et sortaient « — ».
+                'ref': p.base_pivot_reference or p.default_code or p.name or '—',
             } for p in products[:20]]
 
             return {'results': results}
@@ -4197,7 +4991,33 @@ class MaVieDashboardController(http.Controller):
             # product_qty (commandé) reste calculé à côté pour le prix
             # d'achat moyen uniquement.
             qty_purchased = int(sum(po_lines.mapped('qty_received'))) if po_lines else 0
+            # Un magasin est demandé mais les bons d'achat de cette base ne
+            # visent pas les entrepôts magasin : les achats affichés sont
+            # ceux de la société. L'écran le dit en info-bulle.
+            scope_achat = self._get_shop_scope(kw.get('shop_field'))
+            achats_perimetre = 'magasin'
+            if (kw.get('shop_field') and scope_achat and scope_achat.get('warehouse')
+                    and not self._entrepot_recoit_des_achats(scope_achat['warehouse'].id)):
+                achats_perimetre = 'societe'
             qty_ordered = int(sum(po_lines.mapped('product_qty'))) if po_lines else 0
+            # Dans Odoo, la liste des lignes de commande filtree sur le
+            # produit additionne TOUTES les societes : MRC-3313 y totalise
+            # 2 321 recues la ou cette carte en montre 1 120. Les 1 201
+            # pieces d'ecart sont celles que le depot a recues du
+            # fournisseur externe avant de les revendre aux magasins : les
+            # additionner reviendrait a compter deux fois la meme
+            # marchandise. On les calcule a part pour que l'ecran puisse
+            # afficher le rapprochement, sans toucher au total.
+            qty_purchased_depot = 0
+            depot_achats = self._societe_depot()
+            if depot_achats and depot_achats.id not in po_lines.mapped(
+                    'order_id.company_id').ids:
+                lignes_depot = request.env['purchase.order.line'].sudo().search([
+                    ('product_id.product_tmpl_id', '=', product_tmpl.id),
+                    ('order_id.company_id', '=', depot_achats.id),
+                    ('order_id.state', 'in', ['purchase', 'done']),
+                ])
+                qty_purchased_depot = int(sum(lignes_depot.mapped('qty_received')))
             # CA Achat = coût réel des achats tel que facturé, affiché en TTC
             # comme tous les CA (décision utilisateur 2026-08-18). La version
             # HT sert à la marge, qui doit comparer du HT à du HT.
@@ -4733,6 +5553,9 @@ class MaVieDashboardController(http.Controller):
                 'family': product_tmpl.categ_id.name if product_tmpl.categ_id else '—',
                 'qty_sold': qty_sold,
                 'qty_purchased': qty_purchased,
+                'qty_purchased_depot': qty_purchased_depot,
+                'depot_nom': depot_achats.name if depot_achats else '',
+                'achats_perimetre': achats_perimetre,
                 # Stock comptable Odoo (negatifs inclus) — sert de reference
                 # a la reconciliation, qui ne peut retomber que sur lui.
                 'stock_total': stock_total,
@@ -5654,8 +6477,7 @@ class MaVieDashboardController(http.Controller):
 
             # Le dépôt MOD FOR LIFE n'est pas un magasin (aucun mapping) mais
             # c'est lui qui alimente le réassort : sa ligne manquait.
-            mfl = request.env['res.company'].sudo().search(
-                [('name', '=', 'MOD FOR LIFE')], limit=1)
+            mfl = self._societe_depot()
             if mfl:
                 depot_quants = request.env['stock.quant'].sudo().search([
                     ('product_id', 'in', color_variants.ids),
@@ -5670,7 +6492,9 @@ class MaVieDashboardController(http.Controller):
                         depot_sizes[t] = depot_sizes.get(t, 0.0) + q.quantity
                     stores.insert(0, {
                         'shop_field': None,
-                        'shop_label': 'DÉPÔT MOD FOR LIFE',
+                        # Le dépôt ne s'appelle pas MOD FOR LIFE partout
+                        # (STE XD MAX sur Elite) : on prend son vrai nom.
+                        'shop_label': 'DÉPÔT %s' % (mfl.name or '').upper(),
                         'city': '—',
                         'stock_total': int(round(depot_total)),
                         'by_size': {k: int(round(v)) for k, v in depot_sizes.items() if abs(v) >= 0.01},
@@ -5765,7 +6589,8 @@ class MaVieDashboardController(http.Controller):
             # de données (toujours un enregistrement par paire source/cible).
             group_ref = (kw.get('group_ref') or '').strip() or None
 
-            transfer = request.env['inter.internal.transfer'].sudo().create({
+            transfer = request.env['inter.internal.transfer'].sudo().with_context(
+                mavie_intra_societe=True).create({
                 'company_source_id': source_mapping.company_id.id,
                 'location_source_id': source_location.id,
                 'company_target_id': dest_mapping.company_id.id,
@@ -5802,6 +6627,7 @@ class MaVieDashboardController(http.Controller):
                 notified = {'source': [], 'dest': []}
                 notif_warning = f"Transfert créé, mais notification non envoyée : {e}"
 
+            _vider_cache_dashboard()
             return {
                 'transfer_id': transfer.id,
                 'transfer_name': transfer.name,
@@ -5923,7 +6749,43 @@ class MaVieDashboardController(http.Controller):
     # VALORISATION — DÉTAIL PAR MAGASIN D'UNE SOCIÉTÉ
     # ─────────────────────────────────────────────────────────────
 
-    @http.route('/mavie/api/valorisation-detail', type='json', auth='user', methods=['POST'], csrf=False)
+    def _prix_achat_moyen_par_reference(self, tmpl_ids, kw=None):
+        """Prix d'achat moyen HT par référence, sur le périmètre du CA Achat.
+
+        Sert de repli quand le champ « Coût » d'Odoo est vide. Le tableau de
+        valorisation et son pop-up le calculaient chacun de leur côté, avec
+        des périmètres différents : le tableau sur les sociétés cochées, le
+        pop-up sur TOUTES les sociétés. Pour SQUARE TARGA la même valeur au
+        coût sortait à 714 749,55 d'un côté et 357 243,25 de l'autre
+        (constaté le 2026-09-25). Un seul calcul, donc.
+        """
+        if not tmpl_ids:
+            return {}
+        domain = self._build_purchase_domain(kw or {}, list(tmpl_ids))
+        groupes = request.env['purchase.order.line'].sudo().read_group(
+            domain, ['product_qty:sum', 'price_subtotal:sum'], ['product_id'], lazy=False)
+        pids = [g['product_id'][0] for g in groupes if g.get('product_id')]
+        tmpl_par_variante = {}
+        if pids:
+            tmpl_par_variante = {
+                p['id']: p['product_tmpl_id'][0]
+                for p in request.env['product.product'].sudo().with_context(
+                    active_test=False).search_read([('id', 'in', pids)], ['id', 'product_tmpl_id'])
+                if p.get('product_tmpl_id')
+            }
+        cumul = {}
+        for g in groupes:
+            tid = tmpl_par_variante.get(g['product_id'][0] if g.get('product_id') else None)
+            if not tid:
+                continue
+            e = cumul.setdefault(tid, [0.0, 0.0])
+            e[0] += g.get('product_qty') or 0.0
+            e[1] += g.get('price_subtotal') or 0.0
+        return {tid: montant / qte for tid, (qte, montant) in cumul.items()
+                if qte and montant > 0}
+
+    @http.route('/mavie/api/valorisation-detail', type='json', auth='user',
+                methods=['POST'], csrf=False)
     def api_valorisation_detail(self, **kw):
         """Détail magasin par magasin de la valorisation d'UNE société.
 
@@ -5942,8 +6804,9 @@ class MaVieDashboardController(http.Controller):
                 return {'error': 'Société introuvable.', 'magasins': []}
 
             product_tmpl_ids = None
-            if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
-                product_tmpl_ids = request.env['product.template'].sudo().search(
+            if self._filtre_produit_actif(kw):
+                product_tmpl_ids = request.env['product.template'].sudo().with_context(
+                    active_test=False).search(
                     self._build_product_domain(kw)
                 ).ids
                 if not product_tmpl_ids:
@@ -5953,6 +6816,14 @@ class MaVieDashboardController(http.Controller):
                 ('location_id.usage', '=', 'internal'),
                 ('company_id', '=', company.id),
             ]
+            # A13 (2026-09-24) : le pop-up ignorait le filtre magasin de la
+            # barre du haut et affichait toute la société. Cliquer une ligne
+            # en ayant choisi un magasin donnait donc un total qui ne
+            # correspondait pas à l'écran.
+            scope = self._get_shop_scope(kw.get('shop_field'))
+            if scope and scope.get('warehouse') and scope['warehouse'].lot_stock_id:
+                quant_domain.append(
+                    ('location_id', 'child_of', scope['warehouse'].lot_stock_id.id))
             # Même règle que la table principale : on compte comme Odoo
             # (sachets, articles archivés et stocks négatifs compris).
             if product_tmpl_ids is not None:
@@ -5995,35 +6866,11 @@ class MaVieDashboardController(http.Controller):
                 p['product_tmpl_id'][0] for p in prod_map.values()
                 if p.get('product_tmpl_id') and not p.get('standard_price')
             }
-            prix_achat_moyen = {}
-            if tmpl_ids_needed:
-                po_grouped = request.env['purchase.order.line'].sudo().read_group(
-                    [('order_id.state', 'in', ['purchase', 'done']),
-                     ('product_id.product_tmpl_id', 'in', list(tmpl_ids_needed))],
-                    ['product_qty:sum', 'price_subtotal:sum'], ['product_id'], lazy=False
-                )
-                po_pids = [g['product_id'][0] for g in po_grouped if g.get('product_id')]
-                po_tmpl = {}
-                if po_pids:
-                    po_tmpl = {
-                        p['id']: p['product_tmpl_id'][0]
-                        for p in request.env['product.product'].sudo().search_read(
-                            [('id', 'in', po_pids)], ['id', 'product_tmpl_id'])
-                        if p.get('product_tmpl_id')
-                    }
-                accum = {}
-                for g in po_grouped:
-                    tid = po_tmpl.get(g['product_id'][0] if g.get('product_id') else None)
-                    if not tid:
-                        continue
-                    entry = accum.setdefault(tid, [0.0, 0.0])
-                    entry[0] += g.get('product_qty') or 0.0
-                    entry[1] += g.get('price_subtotal') or 0.0
-                for tid, (qte, montant) in accum.items():
-                    if qte and montant > 0:
-                        prix_achat_moyen[tid] = montant / qte
+            prix_achat_moyen = self._prix_achat_moyen_par_reference(tmpl_ids_needed, kw)
 
             cost_estime = False
+            qty_vue_total = 0.0
+            qty_vue_avec_cout = 0.0
             by_warehouse = {}
             for g in grouped:
                 pid = g['product_id'][0] if g.get('product_id') else None
@@ -6043,6 +6890,12 @@ class MaVieDashboardController(http.Controller):
                     continue
                 p_data = prod_map[pid]
                 cost_price = p_data.get('standard_price') or 0.0
+                # Part des pièces dont le coût est VRAIMENT saisi : la carte
+                # et le tableau du dessus masquent le montant quand elle est
+                # nulle, ce pop-up doit dire la même chose.
+                qty_vue_total += qty
+                if cost_price:
+                    qty_vue_avec_cout += qty
                 if not cost_price:
                     tmpl_ref = p_data.get('product_tmpl_id')
                     fallback = prix_achat_moyen.get(tmpl_ref[0]) if tmpl_ref else None
@@ -6079,6 +6932,11 @@ class MaVieDashboardController(http.Controller):
                 'total_ht': round(sum(m['valeur_ht'] for m in magasins), 2),
                 'total_cost': round(sum(m['valeur_cost'] for m in magasins), 2),
                 'cost_estime': cost_estime,
+                'cost_couverture': (round(qty_vue_avec_cout / qty_vue_total * 100, 1)
+                                    if qty_vue_total else 0.0),
+                'cost_disponible': bool(
+                    qty_vue_total and
+                    qty_vue_avec_cout / qty_vue_total * 100 >= COUT_COUVERTURE_MIN),
             }
         except Exception as e:
             _logger.error(f"Erreur api_valorisation_detail: {str(e)}", exc_info=True)
@@ -6153,7 +7011,7 @@ class MaVieDashboardController(http.Controller):
             if context_company_ids:
                 domain.append(('company_id', 'in', context_company_ids))
 
-        if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
+        if self._filtre_produit_actif(kw):
             product_tmpl_ids = request.env['product.template'].sudo().search(
                 self._build_product_domain(kw)
             ).ids or [-1]
@@ -6226,15 +7084,31 @@ class MaVieDashboardController(http.Controller):
             })
 
         tmpl_ids = list({e['id'] for e in grouped.values()})
-        tmpl_data = request.env['product.template'].sudo().search_read(
-            [('id', 'in', tmpl_ids)], ['id', 'name', 'default_code', 'base_pivot_reference']
+        depot = self._societe_depot()
+        achetes_depot = set()
+        if depot:
+            request.env.cr.execute("""
+                SELECT DISTINCT pp.product_tmpl_id
+                  FROM purchase_order_line pol
+                  JOIN purchase_order po ON po.id = pol.order_id
+                  JOIN product_product pp ON pp.id = pol.product_id
+                 WHERE po.company_id = %s AND po.state IN ('purchase', 'done')
+            """, (depot.id,))
+            achetes_depot = {r[0] for r in request.env.cr.fetchall()}
+        tmpl_data = request.env['product.template'].sudo().with_context(active_test=False).search_read(
+            [('id', 'in', tmpl_ids)], ['id', 'name', 'default_code', 'base_pivot_reference', 'active']
         )
         tmpl_map = {t['id']: t for t in tmpl_data}
 
         anomalies = []
         for entry in grouped.values():
             t = tmpl_map.get(entry['id'], {})
+            # Article archivé : hors des écarts, comme demandé.
+            if t.get('active') is False:
+                continue
             entry['name'] = t.get('name') or '—'
+            entry['archive'] = False
+            entry['achat_depot'] = entry['id'] in achetes_depot
             entry['ref'] = (t.get('base_pivot_reference') or t.get('default_code')
                             or t.get('name') or '—')
             entry['qty_negative'] = int(entry['qty_negative'])
@@ -6245,7 +7119,7 @@ class MaVieDashboardController(http.Controller):
         return {
             'anomalies': anomalies[:limit],
             'count': len(anomalies),
-            'refs_count': len(tmpl_ids),
+            'refs_count': len({a['id'] for a in anomalies}),
             'qty_manquante': int(sum(a['qty_negative'] for a in anomalies)),
         }
 
@@ -6439,12 +7313,90 @@ class MaVieDashboardController(http.Controller):
                 _logger.warning("Transferts internes indisponibles: %s", e)
 
             manquant = total_in - total_out - stock_reel
+            # Chaque ligne de stock négative : le mouvement qui l'a fait passer
+            # sous zéro, en rejouant l'historique de cet emplacement et de ce lot.
+            lignes_negatives = []
+            negatifs = request.env['stock.quant'].sudo().search([
+                ('product_id', 'in', variants.ids),
+                ('location_id', 'in', list(inside_ids)),
+                ('quantity', '<', 0),
+            ])
+            for q in negatifs:
+                mouvements = MoveLine.search([
+                    ('state', '=', 'done'),
+                    ('product_id', '=', q.product_id.id),
+                    '|', ('location_id', '=', q.location_id.id), ('location_dest_id', '=', q.location_id.id),
+                ], order='date asc, id asc')
+                if q.lot_id:
+                    mouvements = mouvements.filtered(lambda ml: ml.lot_id == q.lot_id)
+                solde = 0.0
+                origine = None
+                ventes = []
+                for ml in mouvements:
+                    if ml.location_dest_id == q.location_id and ml.location_id != q.location_id:
+                        solde += ml.quantity
+                        sens_ml = 'in'
+                    elif ml.location_id == q.location_id and ml.location_dest_id != q.location_id:
+                        solde -= ml.quantity
+                        sens_ml = 'out'
+                    else:
+                        continue
+                    if solde < 0 and (origine is None or origine['solde_apres'] >= 0):
+                        categorie = self._classify_move_line(ml, inside_ids, sens_ml)
+                        contrepartie = ml.location_id if sens_ml == 'in' else ml.location_dest_id
+                        origine = {
+                            'date': str(ml.date)[:16] if ml.date else '—',
+                            'document': ml.reference or (ml.picking_id.name if ml.picking_id else '') or (
+                                ml.move_id.origin if ml.move_id else '') or '—',
+                            'nature': self._LEDGER_LABELS.get(categorie, categorie),
+                            'sens': 'Entrée' if sens_ml == 'in' else 'Sortie',
+                            'qty': int(ml.quantity),
+                            'contrepartie': contrepartie.complete_name if contrepartie else '—',
+                            'picking_id': ml.picking_id.id if ml.picking_id else False,
+                            'solde_apres': solde,
+                        }
+                    if solde < 0 and sens_ml == 'out':
+                        pick = ml.picking_id
+                        pos = pick.pos_order_id.sudo() if pick and pick.pos_order_id else request.env['pos.order'].sudo()
+                        ventes.append({
+                            'date': fields.Datetime.to_string(pos.date_order if pos else ml.date),
+                            'magasin': q.location_id.warehouse_id.name or q.location_id.complete_name,
+                            'document': ml.reference or (pick.name if pick else '') or '—',
+                            'picking_id': pick.id if pick else False,
+                            'qty': int(ml.quantity),
+                            'solde_apres': solde,
+                            'caisse': pos.session_id.config_id.name if pos else 'Hors caisse : aucune commande de caisse liée',
+                            'vendeur': pos.user_id.name if pos and pos.user_id else 'Hors caisse',
+                            'utilisateur': ml.create_uid.name or '—',
+                            'move_line_id': ml.id,
+                            'origine_saisie': (pick.origin or '') if pick else '',
+                        })
+                    elif solde >= 0:
+                        origine = None
+                lignes_negatives.append({
+                    'variante': q.product_id.display_name or '—',
+                    'emplacement': q.location_id.complete_name or '—',
+                    'lot': q.lot_id.name if q.lot_id else '—',
+                    'quantite': int(q.quantity),
+                    'origine': origine,
+                    'ventes': ventes[:30],
+                })
+            lignes_negatives.sort(key=lambda x: x['quantite'])
+            quants_positifs = request.env['stock.quant'].sudo().search([
+                ('product_id', 'in', variants.ids),
+                ('location_id', 'in', list(inside_ids)),
+                ('quantity', '>', 0),
+            ])
+            stock_positif = int(sum(quants_positifs.mapped('quantity')))
+
             return {
                 'ref': product_tmpl.base_pivot_reference or product_tmpl.default_code or product_tmpl.name,
                 'name': product_tmpl.name,
                 'magasin': warehouse.name,
                 'societe': warehouse.company_id.name if warehouse.company_id else '—',
                 'entrees': entrees,
+                'lignes_negatives': lignes_negatives,
+                'stock_positif': stock_positif,
                 'sorties': sorties,
                 'total_entrees': total_in,
                 'total_sorties': total_out,
@@ -6475,7 +7427,7 @@ class MaVieDashboardController(http.Controller):
         # Uniquement les bons lancés depuis le dashboard (décision
         # utilisateur) : l'historique repart de zéro et ne reprend pas les
         # transferts créés auparavant par d'autres canaux.
-        domain = [('created_from_dashboard', '=', True)]
+        domain = []
         if kw.get('date_start'):
             domain.append(('create_date', '>=', kw['date_start'] + ' 00:00:00'))
         if kw.get('date_end'):
@@ -6500,6 +7452,7 @@ class MaVieDashboardController(http.Controller):
             'submitted': 'En attente de validation',
             'transmitted': "Transmis à l'inventaire",
             'done': 'Fait',
+            'cancelled': 'Annulé',
         }
         rows = []
         for tr in transfers:
@@ -6529,6 +7482,60 @@ class MaVieDashboardController(http.Controller):
                 'nb_lignes': len(tr.line_ids),
                 'qty': int(qty),
                 'group_ref': tr.group_ref or '',
+            })
+        return rows
+
+    # Condition SQL « vendu sous le prix catalogue » — partagée par la liste
+    # et par le comptage, pour que les deux parlent bien de la même chose.
+    SOLDE_SQL_WHERE = """
+              AND pt.list_price > 0
+              AND pol.price_unit * (1 - COALESCE(pol.discount, 0) / 100.0) < pt.list_price * 0.999
+    """
+
+    def _solde_history_totaux(self, kw):
+        """Vrai total des ventes en solde, sans la limite d'affichage.
+
+        A11 (2026-09-24) : la carte affichait 500, c'est-à-dire la limite de
+        la liste, comme si c'était le nombre total de ventes soldées.
+        """
+        pos_domain = self._build_pos_domain(kw, None)
+        line_ids = request.env['pos.order.line'].sudo().search(pos_domain).ids
+        if not line_ids:
+            return {'count': 0, 'qty': 0, 'ca': 0.0}
+        request.env.cr.execute("""
+            SELECT COUNT(*), COALESCE(SUM(pol.qty), 0), COALESCE(SUM(pol.price_subtotal_incl), 0)
+              FROM pos_order_line pol
+              JOIN product_product pp ON pp.id = pol.product_id
+              JOIN product_template pt ON pt.id = pp.product_tmpl_id
+             WHERE pol.id IN %s
+        """ + self.SOLDE_SQL_WHERE, (tuple(line_ids),))
+        n, qty, ca = request.env.cr.fetchone()
+        return {'count': int(n or 0), 'qty': int(qty or 0), 'ca': round(float(ca or 0.0), 2)}
+
+    def _solde_posees_rows(self, kw):
+        """Les remises posées, dès leur pose, même sans vente encore."""
+        rows = []
+        for r in self.api_soldes_journal().get('rows') or []:
+            pose = (r.get('pose_le') or '').strip()
+            jour = pose[:10]
+            if not jour:
+                continue
+            if kw.get('date_start') and jour < kw['date_start']:
+                continue
+            if kw.get('date_end') and jour > kw['date_end']:
+                continue
+            rows.append({
+                'id': r.get('article_id'),
+                'date': pose[:16],
+                'ticket': 'Remise posée',
+                'magasin': r.get('magasin') or '—',
+                'ref': r.get('reference') or '—',
+                'name': r.get('produit') or '—',
+                'qty': 0,
+                'prix_catalogue': round(float(r.get('prix_catalogue') or 0), 2),
+                'prix_paye': round(float(r.get('prix_solde') or 0), 2),
+                'remise_pct': round(float(r.get('remise') or 0), 1),
+                'ca': 0.0,
             })
         return rows
 
@@ -6592,15 +7599,21 @@ class MaVieDashboardController(http.Controller):
     def api_history(self, **kw):
         try:
             transfers = self._transfer_history_rows(kw)
-            soldes = self._solde_history_rows(kw)
+            soldes = sorted(self._solde_history_rows(kw) + self._solde_posees_rows(kw),
+                            key=lambda x: x['date'], reverse=True)[:500]
+            # A11 : les totaux viennent du comptage complet, la liste reste
+            # limitée aux 500 ventes les plus récentes (affichage).
+            totaux = self._solde_history_totaux(kw)
             return {
                 'transfers': transfers,
                 'transfers_count': len(transfers),
                 'transfers_qty': sum(t['qty'] for t in transfers),
                 'soldes': soldes,
-                'soldes_count': len(soldes),
-                'soldes_qty': sum(s['qty'] for s in soldes),
-                'soldes_ca': round(sum(s['ca'] for s in soldes), 2),
+                'soldes_count': totaux['count'],
+                'soldes_qty': totaux['qty'],
+                'soldes_ca': totaux['ca'],
+                'soldes_affiches': len(soldes),
+                'soldes_tronque': totaux['count'] > len(soldes),
             }
         except Exception as e:
             _logger.error(f"Erreur api_history: {str(e)}", exc_info=True)
@@ -7301,6 +8314,12 @@ class MaVieDashboardController(http.Controller):
                     'qty': int(round(qte or 0)),
                     'etat': etats.get(etat, etat or ''),
                     'fait': etat == 'done',
+                    # Un bon en brouillon n'a rien déplacé : la colonne
+                    # Transferts de la page Action ne le compte pas, le
+                    # pop-up doit donc le distinguer au lieu de le mélanger
+                    # aux autres (écart constaté le 2026-09-26 : 6 pièces
+                    # dans le tableau, 42 dans le pop-up).
+                    'brouillon': etat == 'draft',
                     'reassort': bool(est_reassort),
                 })
             # Ce qui s'est vraiment passé, magasin par magasin : un magasin
@@ -7308,6 +8327,8 @@ class MaVieDashboardController(http.Controller):
             # utilisatrice 2026-09-24).
             par_magasin = {}
             for l in lignes:
+                if l.get('brouillon'):
+                    continue   # rien n'a bougé, on ne l'additionne pas
                 if l['dest'] and l['dest'] != '—':
                     par_magasin.setdefault(l['dest'], {'magasin': l['dest'], 'recu': 0, 'envoye': 0})['recu'] += l['qty']
                 if l['source'] and l['source'] != '—':
@@ -7320,7 +8341,12 @@ class MaVieDashboardController(http.Controller):
                 'nom': tmpl.name,
                 'lignes': lignes,
                 'magasins': magasins,
-                'total_pieces': sum(l['qty'] for l in lignes),
+                # Totaux sur ce qui a RÉELLEMENT bougé, comme la colonne du
+                # tableau. Les brouillons sont comptés à part.
+                'total_pieces': sum(l['qty'] for l in lignes if not l.get('brouillon')),
+                'nb_bons': sum(1 for l in lignes if not l.get('brouillon')),
+                'brouillons_nb': sum(1 for l in lignes if l.get('brouillon')),
+                'brouillons_pieces': sum(l['qty'] for l in lignes if l.get('brouillon')),
             }
         except Exception as e:
             _logger.error(f"Erreur api_transferts_reference: {str(e)}", exc_info=True)
@@ -7330,7 +8356,11 @@ class MaVieDashboardController(http.Controller):
     def api_actions(self, **kw):
         try:
             request._mavie_societe_id = self._action_societe_id(kw)
-            return self._compute_actions(kw)
+            cle = self._cache_cle('actions', kw)
+            garde = self._cache_lire(cle)
+            if garde is not None:
+                return garde
+            return self._cache_ecrire(cle, self._compute_actions(kw))
         except Exception as e:
             _logger.error(f"Erreur api_actions: {str(e)}", exc_info=True)
             return {'error': str(e)}
@@ -7345,8 +8375,9 @@ class MaVieDashboardController(http.Controller):
         filtres = [f for f in (kw.get('filtres') or []) if f in self.ACTION_FILTRES]
 
         product_tmpl_ids = None
-        if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
-            product_tmpl_ids = request.env['product.template'].sudo().search(
+        if self._filtre_produit_actif(kw):
+            product_tmpl_ids = request.env['product.template'].sudo().with_context(
+                active_test=False).search(
                 self._build_product_domain(kw)).ids
             if not product_tmpl_ids:
                 return {'rows': [], 'total': 0, 'limit': limit}
@@ -7358,6 +8389,19 @@ class MaVieDashboardController(http.Controller):
         pos_dom = self._build_pos_domain(kw, product_tmpl_ids)
         achat_dom = self._build_purchase_domain(kw, product_tmpl_ids)
         quant_dom = self._action_quant_domain(kw, product_tmpl_ids)
+
+        # A02 (2026-09-24) : le dépôt achète au fournisseur PUIS revend aux
+        # magasins, qui enregistrent à leur tour une réception. Additionner
+        # les deux compte chaque pièce deux fois. Cette page part de toutes
+        # les sociétés cochées, le doublon était donc permanent : POLO
+        # MANCHES COURTES affichait 2 954 pièces achetées pour 1 477
+        # réellement reçues en magasin. On ne garde que les réceptions des
+        # sociétés magasin — sauf quand le dépôt est justement la société
+        # choisie dans le sélecteur, où c'est bien son achat qu'on regarde.
+        depot = self._societe_depot()
+        if depot and self._action_societe_id(kw) != depot.id:
+            achat_dom = achat_dom + [('order_id.company_id', '!=', depot.id)]
+            quant_dom = quant_dom + [('company_id', '!=', depot.id)]
         if mags['actif']:
             pos_dom = pos_dom + [('order_id.session_id.config_id', 'in', mags['config_ids'] or [-1])]
             achat_dom = achat_dom + [('order_id.picking_type_id.warehouse_id', 'in', mags['wh_ids'] or [-1])]
@@ -7397,7 +8441,7 @@ class MaVieDashboardController(http.Controller):
             if g.get('product_id'):
                 v(g['product_id'][0])['stock'] += g.get('quantity') or 0.0
 
-        mfl = request.env['res.company'].sudo().search([('name', '=', 'MOD FOR LIFE')], limit=1)
+        mfl = self._societe_depot()
         if mfl:
             cr.execute("""
                 SELECT sq.product_id, SUM(sq.quantity)
@@ -7430,7 +8474,10 @@ class MaVieDashboardController(http.Controller):
               FROM product_product pp
               JOIN product_template pt ON pt.id = pp.product_tmpl_id
               LEFT JOIN product_category pc ON pc.id = pt.categ_id
-             WHERE pp.id = ANY(%s)
+             -- Une référence ARCHIVÉE ne doit jamais apparaître dans le
+             -- tableau ni dans le compteur (demande du 2026-09-26), même si
+             -- elle garde des ventes ou du stock.
+             WHERE pp.id = ANY(%s) AND pt.active
         """, (list(par_variante.keys()),))
         refs = {}
         for pid, tid, ref, nom, categorie, list_price, collection_id in cr.fetchall():
@@ -7443,6 +8490,16 @@ class MaVieDashboardController(http.Controller):
             t['variantes'].append(pid)
             for k, val in par_variante[pid].items():
                 t[k] += val
+
+        # DEMANDE UTILISATRICE (2026-09-26) : la page doit couvrir TOUT le
+        # catalogue, comme la carte Références (3 570), et pas seulement les
+        # références qui ont déjà vendu, acheté ou du stock (1 234). Celles
+        # qui n'ont jamais bougé s'ajoutent ici à zéro ; elles finissent
+        # naturellement en bas du classement.
+        manquantes = [t for t in self._action_references_sans_activite(
+            kw, set(refs.keys())) if t['id'] not in refs]
+        for t in manquantes:
+            refs[t['id']] = t
 
         # Du top au flop : chiffre d'affaires vendu, puis quantité vendue,
         # puis stock (une référence sans vente mais avec du stock est un
@@ -7559,7 +8616,43 @@ class MaVieDashboardController(http.Controller):
                 'perimetre': self._action_perimetre(kw) + (' · ' + mags['libelle'] if mags['actif'] else ''),
                 'lieux': self._action_lieux(),
                 'societes': self._action_societes_cochees(),
+                # Le dépôt ne s'appelle pas MOD FOR LIFE partout : la légende
+                # du tableau affiche le nom réel de la société entrepôt.
+                'depot_societe': self._societe_depot().name or '',
                 'societe_id': getattr(request, '_mavie_societe_id', None)}
+
+    def _action_references_sans_activite(self, kw, deja_vues):
+        """Références du catalogue absentes du classement, à zéro.
+
+        Le tableau se construit à partir des ventes, achats et stocks : une
+        fiche créée mais jamais approvisionnée n'y apparaissait pas. On les
+        ajoute pour que le compteur de la page corresponde au catalogue.
+        """
+        domaine = [('active', '=', True)]
+        domaine += self._sachet_exclude_domain('collection_id')
+        if self._filtre_produit_actif(kw):
+            ids_filtre = request.env['product.template'].sudo().with_context(
+                active_test=False).search(self._build_product_domain(kw)).ids
+            domaine.append(('id', 'in', ids_filtre or [-1]))
+        if deja_vues:
+            domaine.append(('id', 'not in', list(deja_vues)))
+        lignes = request.env['product.template'].sudo().search_read(
+            domaine, ['name', 'default_code', 'base_pivot_reference', 'list_price',
+                      'categ_id', 'collection_id'])
+        out = []
+        for t in lignes:
+            out.append({
+                'id': t['id'],
+                'ref': (t.get('base_pivot_reference') or t.get('default_code')
+                        or t.get('name') or '—'),
+                'name': t.get('name') or '—',
+                'categorie': (t['categ_id'][1] if t.get('categ_id') else ''),
+                'list_price': t.get('list_price') or 0.0,
+                'collection_id': (t['collection_id'][0] if t.get('collection_id') else None),
+                'qty_sold': 0.0, 'ca': 0.0, 'qty_purchased': 0.0, 'ca_achat': 0.0,
+                'stock': 0.0, 'depot': 0.0, 'variantes': [],
+            })
+        return out
 
     def _action_societe_id(self, kw):
         try:
@@ -7614,26 +8707,243 @@ class MaVieDashboardController(http.Controller):
     # livré sans validation dans Odoo.
     # ─────────────────────────────────────────────────────────────
 
-    def _reassort_variantes(self, tmpl, couleur):
-        if couleur:
-            return self._solde_variantes_couleur(tmpl, couleur)
-        return tmpl.product_variant_ids
+    # Plafond de couverture du mode « sortir le stock du dépôt » : on
+    # n'envoie jamais à un magasin plus que ce nombre de jours de vente.
+    A_PLACER_PLAFOND_JOURS = 90
+    A_PLACER_MAX_LIGNES = 2000
+
+    @http.route('/mavie/api/reassort-a-placer', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_reassort_a_placer(self, **kw):
+        """Ce qui dort au dépôt et pourrait partir en magasin.
+
+        L'autre calcul attend la rupture ; celui-ci part du stock et le
+        place là où il se vend. Voir le commentaire en tête du patch.
+        """
+        try:
+            depot = self._societe_depot()
+            if not depot:
+                return {'error': "Société dépôt introuvable."}
+            p = self._reassort_params(kw)
+            # Plafond de couverture : c'est lui qui borne le resultat. A 90
+            # jours on place 543 pieces ; le monter fait sortir davantage de
+            # stock, au risque de charger les magasins.
+            try:
+                plafond = int(kw.get('plafond') or self.A_PLACER_PLAFOND_JOURS)
+            except (TypeError, ValueError):
+                plafond = self.A_PLACER_PLAFOND_JOURS
+            plafond = max(7, min(365, plafond))
+            p = dict(p, plafond=plafond)
+            warehouses, wh_labels = self._reassort_warehouses(kw)
+            if not warehouses:
+                return {'error': "Aucun magasin actif."}
+            wh_ids = warehouses.ids
+            ref_date = self._reassort_reference_date(wh_ids)
+            date_debut = ref_date - timedelta(days=p['fenetre'])
+
+            # 1. Ce que le dépôt a en stock, variante par variante.
+            request.env.cr.execute("""
+                SELECT q.product_id, SUM(q.quantity)
+                  FROM stock_quant q
+                  JOIN stock_location l ON l.id = q.location_id
+                  JOIN product_product pp ON pp.id = q.product_id
+                  JOIN product_template pt ON pt.id = pp.product_tmpl_id
+                 WHERE l.usage = 'internal' AND l.company_id = %(dep)s
+                   AND pt.active AND pp.active
+                 GROUP BY q.product_id
+                HAVING SUM(q.quantity) > 0
+            """, {'dep': depot.id})
+            stock_depot = {pid: float(q or 0.0) for pid, q in request.env.cr.fetchall()}
+            if not stock_depot:
+                return {'rows': [], 'kpis': {}, 'params': p}
+            pids = list(stock_depot)
+
+            # 2. Ce que chaque magasin vend de ces variantes sur la fenêtre.
+            request.env.cr.execute("""
+                SELECT spt.warehouse_id, pol.product_id, SUM(pol.qty)
+                  FROM pos_order_line pol
+                  JOIN pos_order po ON po.id = pol.order_id
+                  JOIN pos_session ps ON ps.id = po.session_id
+                  JOIN pos_config pc ON pc.id = ps.config_id
+                  JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                 WHERE po.state IN ('paid', 'done', 'invoiced')
+                   AND spt.warehouse_id = ANY(%(wh)s)
+                   AND pol.product_id = ANY(%(pids)s)
+                   AND po.date_order >= %(d1)s AND po.date_order <= %(d2)s
+                 GROUP BY 1, 2
+                HAVING SUM(pol.qty) > 0
+            """, {'wh': wh_ids, 'pids': pids,
+                  'd1': str(date_debut) + ' 00:00:00',
+                  'd2': str(ref_date) + ' 23:59:59'})
+            ventes = {(w, pid): float(q or 0.0) for w, pid, q in request.env.cr.fetchall()}
+            if not ventes:
+                return {'rows': [], 'kpis': {}, 'params': p}
+
+            # 3. Ce que les magasins ont déjà en rayon.
+            request.env.cr.execute("""
+                SELECT l.warehouse_id, q.product_id, SUM(q.quantity)
+                  FROM stock_quant q
+                  JOIN stock_location l ON l.id = q.location_id
+                 WHERE l.usage = 'internal' AND l.warehouse_id = ANY(%(wh)s)
+                   AND q.product_id = ANY(%(pids)s)
+                 GROUP BY 1, 2
+            """, {'wh': wh_ids, 'pids': pids})
+            # SUM(quantity) peut renvoyer NULL : sans le repli, le bloc
+            # plante sur les bases où le cas existe (constaté sur MaVie).
+            stock_mag = {(w, pid): float(q or 0.0)
+                         for w, pid, q in request.env.cr.fetchall()}
+
+            variantes = request.env['product.product'].sudo().browse(pids)
+            infos = {}
+            for v in variantes:
+                tmpl = v.product_tmpl_id
+                couleur, taille = '', ''
+                for val in v.product_template_attribute_value_ids:
+                    nom = (val.attribute_id.name or '').lower()
+                    if 'couleur' in nom or 'color' in nom:
+                        couleur = val.name
+                    elif 'taille' in nom or 'pointure' in nom or 'size' in nom:
+                        taille = val.name
+                infos[v.id] = {
+                    'reference': (getattr(tmpl, 'base_pivot_reference', False)
+                                  or tmpl.default_code or tmpl.name or '—'),
+                    'produit': tmpl.name or '—',
+                    'couleur': couleur or '—',
+                    'taille': taille or '—',
+                    'tmpl_id': tmpl.id,
+                }
+
+            fenetre = float(p['fenetre']) or 1.0
+            rows = []
+            pieces_total = 0.0
+            for pid, dispo in stock_depot.items():
+                candidats = []
+                for w in wh_ids:
+                    vendu = ventes.get((w, pid), 0.0)
+                    if vendu <= 0:
+                        continue
+                    vitesse = vendu / fenetre
+                    en_rayon = max(0.0, stock_mag.get((w, pid), 0.0))
+                    # Un magasin SOUS sa couverture cible est en alerte : il
+                    # appartient au bloc « À envoyer maintenant », pas ici.
+                    # Sans ce filtre les deux blocs proposaient la même
+                    # ligne (constaté sur MRC-3314 NOIR 37 / Carré Eden,
+                    # stock 0 et 7 ventes : une rupture, pas un surplus).
+                    if en_rayon < p['cible'] * vitesse:
+                        continue
+                    candidats.append({
+                        'wh_id': w, 'vendu': vendu, 'vitesse': vitesse,
+                        'stock': en_rayon,
+                        'plafond': max(0.0, plafond * vitesse - en_rayon),
+                        'envoi': 0.0,
+                    })
+                if not candidats:
+                    continue
+
+                # On ne distribue que ce qui dépasse la couverture cible, au
+                # prorata de la vitesse de vente et sans dépasser le plafond.
+                reste = dispo
+                total_v = sum(c['vitesse'] for c in candidats) or 1.0
+                for c in sorted(candidats, key=lambda x: -x['vitesse']):
+                    if reste <= 0:
+                        break
+                    marge = max(0.0, c['plafond'] - c['envoi'])
+                    part = min(reste, marge, round(dispo * c['vitesse'] / total_v))
+                    part = max(0.0, part)
+                    c['envoi'] += part
+                    reste -= part
+
+                for c in candidats:
+                    if c['envoi'] <= 0:
+                        continue
+                    info = infos.get(pid, {})
+                    pieces_total += c['envoi']
+                    rows.append({
+                        'product_id': pid,
+                        'article_id': info.get('tmpl_id'),
+                        'reference': info.get('reference', '—'),
+                        'produit': info.get('produit', '—'),
+                        'couleur': info.get('couleur', '—'),
+                        'taille': info.get('taille', '—'),
+                        'magasin': wh_labels.get(c['wh_id'], '—'),
+                        'wh_id': c['wh_id'],
+                        'depot': int(round(dispo)),
+                        'stock': int(round(c['stock'])),
+                        'vendu': int(round(c['vendu'])),
+                        'vitesse_jour': round(c['vitesse'], 3),
+                        'jours_couverts': (round(c['stock'] / c['vitesse'], 1)
+                                           if c['vitesse'] else None),
+                        'envoi': int(round(c['envoi'])),
+                    })
+
+            rows.sort(key=lambda r: (-r['envoi'], -r['vitesse_jour'], r['reference']))
+            tronque = len(rows) > self.A_PLACER_MAX_LIGNES
+            return {
+                'params': p,
+                'date_debut': date_debut.isoformat(),
+                'date_reference': ref_date.isoformat(),
+                'plafond_jours': plafond,
+                'rows': rows[:self.A_PLACER_MAX_LIGNES],
+                'tronque': tronque,
+                'nb_lignes_total': len(rows),
+                'kpis': {
+                    'pieces': int(round(pieces_total)),
+                    'nb_lignes': len(rows),
+                    'nb_references': len({r['reference'] for r in rows}),
+                    'nb_magasins': len({r['wh_id'] for r in rows}),
+                    'stock_depot': int(round(sum(stock_depot.values()))),
+                },
+            }
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_reassort_a_placer: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    def _reassort_variantes(self, tmpl, couleur, taille=None):
+        """Variantes concernées par un réassort.
+
+        La taille est facultative : le bloc Réassort raisonne par pointure
+        (« MRC-3314 NOIR 37 »), alors que la page Action raisonne par
+        couleur. Sans ce filtre, la fenêtre ouverte depuis une ligne du
+        bloc additionnait toutes les pointures et annonçait un besoin nul
+        là où la 37 était en rupture.
+        """
+        variantes = (self._solde_variantes_couleur(tmpl, couleur) if couleur
+                     else tmpl.product_variant_ids)
+        taille = (taille or '').strip()
+        if taille and taille != '—':
+            cible = taille.upper()
+            filtrees = variantes.filtered(
+                lambda v: (resolve_variant_color_size(v)[1] or '').strip().upper() == cible)
+            if filtrees:
+                return filtrees
+        return variantes
 
     @http.route('/mavie/api/reassort-article', type='json', auth='user', methods=['POST'], csrf=False)
     def api_reassort_article(self, **kw):
         """Tous les magasins pour cette référence (ou cette couleur) :
         stock, vendu sur la fenêtre, et proposition d'envoi depuis le dépôt."""
+        return self._compute_reassort_article(kw)
+
+    def _compute_reassort_article(self, kw):
+        """Le calcul de la fenêtre de réassort, partagé avec le bon PDF :
+        les deux doivent annoncer exactement les mêmes quantités."""
         try:
             tmpl = request.env['product.template'].sudo().browse(int(kw.get('article_id') or 0))
             if not tmpl.exists():
                 return {'error': 'Référence introuvable.'}
             couleur = (kw.get('couleur') or '').strip()
-            variantes = self._reassort_variantes(tmpl, couleur)
+            taille = (kw.get('taille') or '').strip()
+            try:
+                plafond_jours = int(kw.get('plafond') or self.A_PLACER_PLAFOND_JOURS)
+            except (TypeError, ValueError):
+                plafond_jours = self.A_PLACER_PLAFOND_JOURS
+            plafond_jours = max(7, min(365, plafond_jours))
+            variantes = self._reassort_variantes(tmpl, couleur, taille)
             if not variantes:
                 return {'error': 'Aucune variante pour cette référence.'}
             p = self._reassort_params(kw)
             warehouses, wh_labels = self._reassort_warehouses(kw)
-            mfl = request.env['res.company'].sudo().search([('name', '=', 'MOD FOR LIFE')], limit=1)
+            mfl = self._societe_depot()
             ref_date = self._reassort_reference_date(warehouses.ids)
             debut = ref_date - timedelta(days=p['fenetre'] - 1)
             params = {
@@ -7701,8 +9011,21 @@ class MaVieDashboardController(http.Controller):
                 vendu = int(round(vendu or 0))
                 recu = int(round(recu or 0))
                 vitesse = vendu / float(p['fenetre']) if vendu else 0.0
-                # Besoin = de quoi tenir le délai de réappro au rythme actuel.
-                besoin = max(0, int(round(vitesse * p['delai'])) - max(stock, 0))
+                # Besoin = de quoi tenir le nombre de jours visé au rythme
+                # actuel. Appelée depuis le bloc Réassort (base='cible'), la
+                # fenêtre applique la même couverture que la ligne cliquée ;
+                # depuis la page Action, elle garde le délai de réappro.
+                # Même base et même arrondi que la ligne cliquée, sinon la
+                # fenêtre annonce 2 là où le bloc dit 3, ou 0 là où le bloc
+                # dit 7 : le bloc « À placer » vise le PLAFOND, pas la cible.
+                base = kw.get('base')
+                if base == 'plafond':
+                    jours = plafond_jours
+                elif base == 'cible':
+                    jours = p['cible']
+                else:
+                    jours = p['delai']
+                besoin = max(0, int(math.ceil(vitesse * jours - max(stock, 0) - 1e-9)))
                 magasins.append({
                     'wh_id': wh_id,
                     'magasin': wh_labels.get(wh_id) or (m.warehouse_id.name if m else '—'),
@@ -7726,6 +9049,10 @@ class MaVieDashboardController(http.Controller):
 
             fournisseur = self._reassort_fournisseur(tmpl)
             return {
+                'taille': taille,
+                'jours_couverture': (plafond_jours if kw.get('base') == 'plafond'
+                                     else (p['cible'] if kw.get('base') == 'cible'
+                                           else p['delai'])),
                 'article_id': tmpl.id,
                 'reference': tmpl.base_pivot_reference or tmpl.default_code or tmpl.name,
                 'nom': tmpl.name,
@@ -7753,7 +9080,7 @@ class MaVieDashboardController(http.Controller):
         quantites = {k: v for k, v in quantites_par_shop.items() if v > 0}
         if couleur:
             return {couleur: quantites}
-        mfl = request.env['res.company'].sudo().search([('name', '=', 'MOD FOR LIFE')], limit=1)
+        mfl = self._societe_depot()
         stock_couleur = []
         if mfl:
             request.env.cr.execute("""
@@ -7799,7 +9126,7 @@ class MaVieDashboardController(http.Controller):
                 out.setdefault(nom, {})[shop_field] = out.setdefault(nom, {}).get(shop_field, 0) + reste
         return out
 
-    def _reassort_code_pointures(self, tmpl, nom_couleur, qte):
+    def _reassort_code_pointures(self, tmpl, nom_couleur, qte, taille=None):
         """Code « 0 6 12 » d'une cellule magasin, Base Pivot « magasins
         dynamiques ».
 
@@ -7833,12 +9160,68 @@ class MaVieDashboardController(http.Controller):
         Batch = request.env['mv.article.batch'].sudo()
         try:
             triees = Batch._sorted_variants_by_pointure(variantes, attr)
-            parts = Batch._distribute_pieces_round_robin(qte, len(triees))
+            cible = (taille or '').strip().upper()
+            if cible and cible != '—':
+                # Réassort d'une pointure precise : toute la quantité va sur
+                # elle, zéro sur les autres. Sans cela Base Pivot étalait
+                # l'envoi sur toutes les pointures de la couleur, y compris
+                # celles qui n'ont aucun besoin.
+                parts = []
+                place = False
+                for v in triees:
+                    nom = (resolve_variant_color_size(v)[1] or '').strip().upper()
+                    if not place and nom == cible:
+                        parts.append(int(qte))
+                        place = True
+                    else:
+                        parts.append(0)
+                if not place:
+                    parts = Batch._distribute_pieces_round_robin(qte, len(triees))
+            else:
+                parts = Batch._distribute_pieces_round_robin(qte, len(triees))
         except Exception:
             return ''
         return ' '.join(str(int(p)) for p in parts)
 
-    def _reassort_batch_base_pivot(self, tmpl, couleur, quantites_par_shop, suffixe):
+    def _reassort_collection_arrivage(self, tmpl):
+        """(collection, arrivage) à poser sur un batch de réassort.
+
+        La vue formulaire de Base Pivot exige « Collection dominante » et
+        « Arrivage dominant » : sans eux le batch s'ouvre en « Champs
+        invalides » et ne peut pas être validé. Ils ne sont pas toujours
+        sur la fiche article (vérifié : MRC-3312 et MRC-3314 les ont
+        vides), mais le batch d'origine de l'article les porte. On remonte
+        donc de la fiche au batch d'origine, puis au dernier batch complet.
+        """
+        Batch = request.env['mv.article.batch'].sudo()
+        collection = getattr(tmpl, 'collection_id', False)
+        arrivage = getattr(tmpl, 'arrivage_id', False)
+        if collection and arrivage:
+            return collection, arrivage
+
+        if 'mv.article.base' in request.env:
+            bases = request.env['mv.article.base'].sudo().search(
+                [('product_tmpl_id', '=', tmpl.id)], order='id desc', limit=20)
+            for base in bases:
+                collection = collection or base.collection_id
+                arrivage = arrivage or base.arrivage_id
+                lot = base.batch_id
+                if lot:
+                    collection = collection or lot.collection_id
+                    arrivage = arrivage or lot.arrivage_id
+                if collection and arrivage:
+                    return collection, arrivage
+
+        dernier = Batch.search(
+            [('collection_id', '!=', False), ('arrivage_id', '!=', False)],
+            order='id desc', limit=1)
+        if dernier:
+            collection = collection or dernier.collection_id
+            arrivage = arrivage or dernier.arrivage_id
+        return collection, arrivage
+
+    def _reassort_batch_base_pivot(self, tmpl, couleur, quantites_par_shop, suffixe,
+                                   taille=None):
         """Crée un batch Base Pivot pour ce réassort.
 
         DEMANDE UTILISATRICE (2026-09-24) : « le réassort doit se faire dans
@@ -7896,7 +9279,7 @@ class MaVieDashboardController(http.Controller):
                     if qte <= 0 or cle not in shops_par_cle:
                         continue
                     vals_d = {'shop_id': shops_par_cle[cle], 'qty': qte}
-                    code = self._reassort_code_pointures(tmpl, nom_couleur, qte)
+                    code = self._reassort_code_pointures(tmpl, nom_couleur, qte, taille)
                     if code:
                         vals_d['qty_raw_code'] = code
                     dispatchs.append((0, 0, vals_d))
@@ -7909,6 +9292,11 @@ class MaVieDashboardController(http.Controller):
             else:
                 vals.update({champ: qte for champ, qte in par_shop.items()})
             lignes_couleur.append((0, 0, vals))
+
+        # Base Pivot exige « Collection dominante » et « Arrivage dominant »
+        # sur son formulaire : sans eux le batch s'ouvre en « Champs
+        # invalides » et ne peut pas être validé à la main.
+        collection, arrivage = self._reassort_collection_arrivage(tmpl)
 
         vals_batch = {
             # Le type en TÊTE : la colonne « Nom du batch » est étroite dans
@@ -7927,16 +9315,134 @@ class MaVieDashboardController(http.Controller):
                 'article_created': True,
                 'purchase_cost_dh_ht': cout,
                 'pv_ttc': tmpl.list_price or 0.0,
-                'collection_id': tmpl.collection_id.id if getattr(tmpl, 'collection_id', False) else False,
+                'collection_id': collection.id if collection else False,
                 'color_line_ids': lignes_couleur,
             })],
         }
+        if collection and 'collection_id' in Batch._fields:
+            vals_batch['collection_id'] = collection.id
+        if arrivage and 'arrivage_id' in Batch._fields:
+            vals_batch['arrivage_id'] = arrivage.id
         # Le fournisseur n'est porté par le batch que dans la version
         # historique de Base Pivot ; ailleurs il reste sur la référence.
         if 'fournisseur_id' in Batch._fields:
             vals_batch['fournisseur_id'] = fournisseur['id'] or False
         batch = Batch.create(vals_batch)
         return batch
+
+    @http.route('/mavie/reassort/bon', type='http', auth='user')
+    def reassort_bon_pdf(self, **kw):
+        """Le bon de réassort en PDF, avant la génération Base Pivot.
+
+        DEMANDE UTILISATRICE (2026-09-28) : « quand je clique sur envoyer il
+        doit afficher le bon en PDF avec les détails, puis lancer le
+        réassort dans Base Pivot ». Le bon décrit donc ce qui VA partir : il
+        ne s'appuie sur aucun document, mais sur les quantités affichées
+        dans la fenêtre au moment du clic.
+
+        `lignes` arrive sous la forme « entrepot:qté,entrepot:qté ».
+        """
+        try:
+            tmpl = request.env['product.template'].sudo().browse(
+                int(kw.get('article_id') or 0))
+            if not tmpl.exists():
+                return request.not_found()
+            couleur = (kw.get('couleur') or '').strip()
+            taille = (kw.get('taille') or '').strip()
+            mode = 'achat' if kw.get('mode') == 'achat' else 'vente'
+
+            demande = {}
+            for morceau in (kw.get('lignes') or '').split(','):
+                if ':' not in morceau:
+                    continue
+                wh, qte = morceau.split(':', 1)
+                try:
+                    wh, qte = int(wh), int(qte)
+                except (TypeError, ValueError):
+                    continue
+                if qte > 0:
+                    demande[wh] = demande.get(wh, 0) + qte
+            # Achat sans répartition : une quantité globale suffit, le bon
+            # porte alors une seule ligne « à commander ».
+            try:
+                quantite_globale = int(kw.get('quantite') or 0)
+            except (TypeError, ValueError):
+                quantite_globale = 0
+            if not demande and not (mode == 'achat' and quantite_globale > 0):
+                return request.make_response(
+                    "Aucune quantité à imprimer.",
+                    [('Content-Type', 'text/plain; charset=utf-8')])
+
+            # Les mêmes chiffres que la fenêtre : on rejoue son calcul.
+            detail = self._compute_reassort_article(dict(
+                kw, article_id=tmpl.id, couleur=couleur, taille=taille))
+            par_wh = {m['wh_id']: m for m in (detail.get('magasins') or [])}
+
+            lignes = []
+            for wh_id, qte in demande.items():
+                m = par_wh.get(wh_id) or {}
+                lignes.append({
+                    'magasin': m.get('magasin') or '—',
+                    'societe': m.get('societe') or '',
+                    'stock': int(m.get('stock') or 0),
+                    'vendu': int(m.get('vendu') or 0),
+                    'besoin': int(m.get('besoin') or 0),
+                    'qty': int(qte),
+                })
+            if not lignes and quantite_globale > 0:
+                # Aucune répartition par magasin : le bon porte une seule
+                # ligne, la quantité à faire entrer au dépôt.
+                lignes.append({
+                    'magasin': 'Réapprovisionnement du dépôt',
+                    'societe': detail.get('fournisseur') or '',
+                    'stock': 0,
+                    'vendu': int(sum(m.get('vendu') or 0
+                                     for m in (detail.get('magasins') or []))),
+                    'besoin': int(detail.get('besoin_total') or 0),
+                    'qty': quantite_globale,
+                })
+            lignes.sort(key=lambda l: -l['qty'])
+            total = sum(l['qty'] for l in lignes)
+            depot_qty = int(detail.get('depot') or 0)
+            depot = self._societe_depot()
+
+            valeurs = {
+                'reference': (getattr(tmpl, 'base_pivot_reference', False)
+                              or tmpl.default_code or tmpl.name or '—'),
+                'produit': tmpl.name or '',
+                'couleur': couleur,
+                'taille': taille,
+                'fournisseur': (detail.get('fournisseur') or ''),
+                'depot_nom': depot.name if depot else '—',
+                'depot_qty': depot_qty,
+                'manque': max(0, total - depot_qty),
+                'fenetre': detail.get('fenetre') or 90,
+                'jours': detail.get('jours_couverture') or detail.get('fenetre') or 30,
+                'lignes': lignes,
+                'total': total,
+                'mode': mode,
+                'edite_le': fields.Datetime.context_timestamp(
+                    request.env.user, fields.Datetime.now()).strftime('%d/%m/%Y %H:%M'),
+                'edite_par': request.env.user.name,
+            }
+            html = request.env['ir.qweb']._render(
+                'mavie_dashboard.report_reassort_template', valeurs)
+            pdf = request.env['ir.actions.report'].sudo()._run_wkhtmltopdf(
+                [html], landscape=False,
+                specific_paperformat_args={'data-report-margin-top': 10})
+            nom = re.sub(r'[^\w.-]+', '_', '%s_%s_%s_%s' % (
+                'Demande_achat' if mode == 'achat' else 'Bon_reassort',
+                valeurs['reference'], couleur or 'toutes', taille or 'toutes')) + '.pdf'
+            return request.make_response(pdf, headers=[
+                ('Content-Type', 'application/pdf'),
+                ('Content-Length', len(pdf)),
+                ('Content-Disposition', 'inline; filename="%s"' % nom),
+            ])
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur reassort_bon_pdf: %s", e, exc_info=True)
+            return request.make_response(
+                "Le bon n'a pas pu etre genere : %s" % e,
+                [('Content-Type', 'text/plain; charset=utf-8')])
 
     @http.route('/mavie/api/reassort-generer', type='json', auth='user', methods=['POST'], csrf=False)
     def api_reassort_generer(self, **kw):
@@ -7994,7 +9500,8 @@ class MaVieDashboardController(http.Controller):
                 return {'error': "Cette référence n'a aucun fournisseur dans Odoo ni dans Base Pivot."}
 
             batch = self._reassort_batch_base_pivot(
-                tmpl, couleur, quantites, 'achat' if mode == 'achat' else 'vente')
+                tmpl, couleur, quantites, 'achat' if mode == 'achat' else 'vente',
+                (kw.get('taille') or '').strip())
 
             if mode == 'achat':
                 retour_bp = batch.action_generate_purchase_orders()
@@ -8039,6 +9546,7 @@ class MaVieDashboardController(http.Controller):
                     msg = ''
                 return {'error': msg or ("Base Pivot n'a créé aucun document : vérifiez le fournisseur, "
                                          "les variantes de la référence et le mapping des magasins.")}
+            _vider_cache_dashboard()
             _logger.info("Réassort Base Pivot (%s) par %s : batch %s → %s",
                          mode, request.env.user.login, batch.name,
                          ', '.join(d['document'] for d in docs))
@@ -8081,8 +9589,7 @@ class MaVieDashboardController(http.Controller):
         # Magasin cible du bouton « Transférer » de la fenêtre Réassort.
         shop_par_wh = {m.warehouse_id.id: m.shop_field
                        for m in self._get_active_shop_mappings() if m.warehouse_id}
-        mod_for_life = request.env['res.company'].sudo().search(
-            [('name', '=', 'MOD FOR LIFE')], limit=1)
+        mod_for_life = self._societe_depot()
         if not warehouses or not mod_for_life:
             return {'rows': [], 'kpis': {}, 'params': p, 'magasins': []}
 
@@ -8092,7 +9599,7 @@ class MaVieDashboardController(http.Controller):
         date_debut = ref_date - timedelta(days=p['fenetre'] - 1)
 
         product_tmpl_ids = None
-        if kw.get('collection_id') or kw.get('batch_id') or kw.get('categ_id'):
+        if self._filtre_produit_actif(kw):
             product_tmpl_ids = request.env['product.template'].sudo().search(
                 self._build_product_domain(kw)).ids or [-1]
         # Bouton « Réassort » de la page Action : une seule référence.
@@ -8146,15 +9653,34 @@ class MaVieDashboardController(http.Controller):
                   FROM stock_location l
                   JOIN wh ON l.parent_path LIKE wh.parent_path || '%%'
             ), recu AS (
-                SELECT dst.wh_id, sml.product_id, SUM(sml.quantity) AS q
-                  FROM stock_move_line sml
-                  JOIN loc dst ON dst.loc_id = sml.location_dest_id
-                  JOIN stock_location src ON src.id = sml.location_id
-                  LEFT JOIN loc srcw ON srcw.loc_id = sml.location_id
-                 WHERE sml.state = 'done'
-                   AND sml.date BETWEEN %(debut)s AND %(fin)s
-                   AND src.usage IN ('supplier', 'internal', 'transit')
-                   AND (srcw.wh_id IS NULL OR srcw.wh_id <> dst.wh_id)
+                -- NET DES RETOURS FOURNISSEUR : ce que le magasin a
+                -- réellement gardé. Sans cela, une référence reçue à 6 puis
+                -- renvoyée à 2 affichait « 0 / 6 » avec 4 ventes, et les
+                -- deux pièces manquantes semblaient s'être volatilisées
+                -- (constaté sur MRC-1103 NOIR 41 chez Elite Auderby).
+                SELECT wh_id, product_id, SUM(q) AS q FROM (
+                    SELECT dst.wh_id, sml.product_id, SUM(sml.quantity) AS q
+                      FROM stock_move_line sml
+                      JOIN loc dst ON dst.loc_id = sml.location_dest_id
+                      JOIN stock_location src ON src.id = sml.location_id
+                      LEFT JOIN loc srcw ON srcw.loc_id = sml.location_id
+                     WHERE sml.state = 'done'
+                       AND sml.date BETWEEN %(debut)s AND %(fin)s
+                       AND src.usage IN ('supplier', 'internal', 'transit')
+                       AND (srcw.wh_id IS NULL OR srcw.wh_id <> dst.wh_id)
+                     GROUP BY 1, 2
+                    UNION ALL
+                    SELECT srcw.wh_id, sml.product_id, -SUM(sml.quantity) AS q
+                      FROM stock_move_line sml
+                      JOIN loc srcw ON srcw.loc_id = sml.location_id
+                      JOIN stock_location dst ON dst.id = sml.location_dest_id
+                      LEFT JOIN loc dstw ON dstw.loc_id = sml.location_dest_id
+                     WHERE sml.state = 'done'
+                       AND sml.date BETWEEN %(debut)s AND %(fin)s
+                       AND dst.usage = 'supplier'
+                       AND (dstw.wh_id IS NULL OR dstw.wh_id <> srcw.wh_id)
+                     GROUP BY 1, 2
+                ) mouvements
                  GROUP BY 1, 2
             ), vendu AS (
                 SELECT spt.warehouse_id AS wh_id, pol.product_id, SUM(pol.qty) AS q
@@ -8340,9 +9866,15 @@ class MaVieDashboardController(http.Controller):
                     j if j is not None else 10 ** 6,
                     0 if r['alerte'] == 'pct' else 1,
                     -(r['vitesse_jour']))
+        # Une alerte sans besoin ni envoi possible n'appelle aucune
+        # action : le magasin a recu l'article, n'en a vendu aucun, et se
+        # retrouve a zero. On ne l'affiche pas (707 lignes sur 755 dans ce
+        # cas sur la base MaVie ; aucune sur Elite).
+        rows = [r for r in rows if r['besoin'] > 0 or r['propose'] > 0]
         rows.sort(key=_urgence)
 
         servables = [r for r in rows if r['depot'] > 0]
+        a_envoyer = [r for r in rows if r['propose'] > 0]
         kpis = {
             'nb_alertes': len(rows),
             'nb_alertes_pct': len([r for r in rows if r['alerte'] == 'pct']),
@@ -8357,7 +9889,17 @@ class MaVieDashboardController(http.Controller):
             'nb_jamais_recu': nb_jamais_recu,
             'inclure_negatifs': inclure_negatifs,
             'nb_ruptures': len([r for r in rows if r['stock'] == 0]),
+            # Comptes calcules sur TOUTES les lignes, pas sur les seules
+            # lignes chargees : sans cela, la carte « A envoyer » annoncait
+            # 323 pieces quand le tableau n'en listait que 290, les 33
+            # manquantes etant tombees avec le plafond d'affichage.
+            'nb_envoyer': len(a_envoyer),
+            'nb_surveiller': len(servables) - len(a_envoyer),
         }
+        reste = [r for r in rows if r['propose'] <= 0]
+        place = max(0, self.REASSORT_MAX_ROWS - len(a_envoyer))
+        rows_affichees = a_envoyer + reste[:place]
+
         magasins = sorted({(r['wh_id'], r['magasin'], r['societe']) for r in rows}, key=lambda x: x[1])
         return {
             'params': p,
@@ -8365,8 +9907,14 @@ class MaVieDashboardController(http.Controller):
             'date_debut': date_debut.isoformat(),
             'aujourdhui': date.today().isoformat(),
             'kpis': kpis,
-            'rows': rows[:self.REASSORT_MAX_ROWS],
-            'tronque': len(rows) > self.REASSORT_MAX_ROWS,
+            # Le plafond protege l'affichage, il ne doit pas faire
+            # disparaitre du travail : les lignes qui ont quelque chose a
+            # envoyer partent toutes (elles sont peu nombreuses et ce sont
+            # les seules sur lesquelles on agit), le reste du plafond va aux
+            # plus urgentes.
+            'rows': rows_affichees,
+            'tronque': len(rows) > len(rows_affichees),
+            'nb_lignes_total': len(rows),
             'magasins': [{'id': w, 'name': n, 'societe': s} for w, n, s in magasins],
         }
 
@@ -8486,6 +10034,33 @@ class MaVieDashboardController(http.Controller):
         """
         lists = (configs.mapped('available_pricelist_ids') | configs.mapped('pricelist_id'))
         lists = lists.filtered(lambda p: p.active and not self._solde_is_default_list(p))
+
+        # A04 (2026-09-24) : sur Elite, la liste « Solde » est la liste PAR
+        # DÉFAUT des 7 caisses Boutique, des deux sociétés. Son nom ne
+        # contient pas « défaut », elle passait donc pour une liste de
+        # soldes ordinaire : solder un article pour UN magasin le soldait
+        # dans les sept. On écarte ici toute liste qui sert de liste par
+        # défaut à une caisse d'un autre magasin ; le bouton crée alors une
+        # liste propre au magasin. Une liste partagée mais qui n'est la
+        # liste par défaut de personne d'autre reste réutilisée, comme
+        # demandé le 2026-09-21.
+        Config = request.env['pos.config'].sudo()
+        def _defaut_ailleurs(pl):
+            autres = Config.search([('pricelist_id', '=', pl.id)]) - configs
+            return bool(autres)
+        # DEMANDE UTILISATRICE (2026-09-25) : « s'il y a déjà une liste de
+        # soldes, le bouton doit écrire dedans ; sinon il en crée une ».
+        # Une liste dont le NOM parle de solde est donc réutilisée telle
+        # quelle, même si elle sert plusieurs caisses — le panneau annonce
+        # alors les autres magasins concernés.
+        soldes = lists.filtered(lambda p: 'solde' in (p.name or '').lower())
+        if soldes:
+            lists = soldes
+        else:
+            # Sinon on évite d'écrire dans la liste par défaut d'autres
+            # magasins : le bouton créera une liste propre au magasin.
+            propres = lists.filtered(lambda p: not _defaut_ailleurs(p))
+            lists = propres or request.env['product.pricelist'].sudo().browse()
         if not lists:
             return request.env['product.pricelist'].sudo().browse()
         return lists.sorted(
@@ -8534,6 +10109,2457 @@ class MaVieDashboardController(http.Controller):
         return self._get_active_shop_mappings().filtered(
             lambda m: m.warehouse_id and m.company_id and m.company_id.id not in non_retail
         )
+
+    # 742 references au perimetre actuel : le plafond doit les couvrir,
+    # sinon la carte et le tableau se contredisent.
+    SOLDES_MAX_LIGNES = 1000
+
+    # Au-dela de cette couverture, une reference dort meme si elle vend un
+    # peu : 400 pieces qui s'ecoulent en deux ans ne tournent pas. Seuil
+    # PARTAGE par la carte « Stock dormant » et la page Propositions, pour
+    # que les deux ecrans ne puissent pas se contredire.
+    COUVERTURE_DORMANTE_JOURS = 120
+
+    def _soldes_params(self, kw):
+        """Réglages de la page Soldes, bornés pour rester raisonnables."""
+        def _int(nom, defaut, mini, maxi):
+            try:
+                v = int(kw.get(nom) or defaut)
+            except (TypeError, ValueError):
+                v = defaut
+            return max(mini, min(maxi, v))
+        return {
+            'fenetre': _int('fenetre', 90, 7, 365),
+            'stock_min': _int('stock_min', 5, 1, 500),
+            'remise1': _int('remise1', 30, 5, 90),
+            'remise2': _int('remise2', 50, 5, 90),
+            'couverture_min': _int('couverture_min',
+                                   self.COUVERTURE_DORMANTE_JOURS, 7, 3650),
+            # 'historique' : les paliers viennent de ce que la maison a
+            # pratique et de ce que ca a vendu. 'fixe' : les deux valeurs
+            # ci-dessus, telles quelles.
+            'mode_remise': ('fixe' if (kw.get('mode_remise') or '') == 'fixe'
+                            else 'historique'),
+        }
+
+    # Une bande de remise n'est retenue comme reference que si la maison
+    # l'a pratiquee assez souvent pour que le chiffre veuille dire quelque
+    # chose. En dessous, une seule vente heureuse ferait la loi.
+    SOLDES_MIN_REGLES_BANDE = 5
+    SOLDES_MIN_REGLES_PALIER = 3
+    # En dessous de ce nombre de remises deja posees, une categorie n'a pas
+    # d'habitude : une ou deux operations ne font pas une regle.
+    SOLDES_MIN_REGLES_CATEGORIE = 3
+    # 0 % n'est pas une remise, et 100 % est un cadeau ou une erreur de
+    # saisie : ni l'un ni l'autre ne sert de reference.
+    SOLDES_REMISE_MIN = 5
+    SOLDES_REMISE_MAX = 95
+
+    @staticmethod
+    def _soldes_quantile(valeurs, part):
+        """Le quantile d'une liste de niveaux déjà posés.
+
+        On reste sur des valeurs OBSERVÉES : pas d'interpolation entre deux
+        paliers, sinon on proposerait une remise que la maison n'a jamais
+        pratiquée.
+        """
+        if not valeurs:
+            return None
+        tri = sorted(valeurs)
+        i = int(round((len(tri) - 1) * part))
+        return tri[max(0, min(len(tri) - 1, i))]
+
+    def _soldes_habitude(self, niveaux):
+        """L'habitude que dit une liste de remises déjà posées : ce qu'on
+        fait d'ordinaire (médiane) et ce qu'on fait quand on va fort (3e
+        quartile). Les deux sont des paliers réellement pratiqués."""
+        normal = self._soldes_quantile(niveaux, 0.5)
+        fort = self._soldes_quantile(niveaux, 0.75)
+        if normal is None:
+            return None, None
+        # Si les deux se confondent, on prend le palier pratiqué juste
+        # au-dessus : « fort » doit vouloir dire quelque chose de plus.
+        if fort is None or fort <= normal:
+            plus_haut = [n for n in niveaux if n > normal]
+            fort = min(plus_haut) if plus_haut else normal
+        return int(normal), int(fort)
+
+    def _soldes_remises_pratiquees(self):
+        """Ce que la maison a réellement pratiqué, et ce que ça a vendu.
+
+        On lit les règles de prix de soldes en place, on les range par
+        bande de 10 points, et on compte les pièces vendues depuis leur
+        pose. La bande qui vend le plus par remise posée devient le palier
+        conseillé — il n'y a pas de raison de proposer 30 % si 44 % est ce
+        qui marche ici.
+        """
+        cle = self._cache_cle('soldes_remises_pratiquees', {})
+        cache = self._cache_lire(cle)
+        if cache is not None:
+            return cache
+        journal = self.api_soldes_journal()
+        regles = journal.get('rows') or []
+        # La categorie de chaque reference deja soldee : c'est par la que
+        # l'on retrouve l'habitude de la maison sur une marchandise donnee.
+        categories = {}
+        ids = list({r['article_id'] for r in regles})
+        if ids:
+            categories = {t['id']: (t['categ_id'][1] if t.get('categ_id') else '')
+                          for t in request.env['product.template'].sudo().search_read(
+                              [('id', 'in', ids)], ['categ_id'])}
+        exacts = {}
+        bandes = {}
+        par_cat = {}
+        for r in regles:
+            niveau = int(round(r['remise']))
+            if not (self.SOLDES_REMISE_MIN <= niveau <= self.SOLDES_REMISE_MAX):
+                continue
+            nom_cat = categories.get(r['article_id']) or ''
+            if nom_cat:
+                par_cat.setdefault(nom_cat, []).append(niveau)
+            e = exacts.setdefault(niveau, {'niveau': niveau, 'regles': 0, 'pieces': 0})
+            e['regles'] += 1
+            e['pieces'] += r['vendu_depuis']
+            b = bandes.setdefault((niveau // 10) * 10,
+                                  {'de': (niveau // 10) * 10, 'a': (niveau // 10) * 10 + 9,
+                                   'regles': 0, 'pieces': 0, 'niveaux': {}})
+            b['regles'] += 1
+            b['pieces'] += r['vendu_depuis']
+            b['niveaux'][niveau] = b['niveaux'].get(niveau, 0) + 1
+
+        for b in bandes.values():
+            b['par_regle'] = round(b['pieces'] / float(b['regles']), 1) if b['regles'] else 0.0
+            # Le niveau representatif d'une bande : celui que la maison y a
+            # le plus souvent pose. C'est son habitude, pas une moyenne.
+            b['niveau'] = max(b['niveaux'].items(), key=lambda kv: (kv[1], kv[0]))[0] \
+                if b['niveaux'] else b['de']
+
+        retenues = [b for b in bandes.values()
+                    if b['regles'] >= self.SOLDES_MIN_REGLES_BANDE]
+        forte = normale = None
+        if retenues:
+            meilleure = max(retenues, key=lambda b: (b['par_regle'], b['de']))
+            forte = meilleure
+            dessous = [b for b in retenues if b['de'] < meilleure['de']]
+            normale = (max(dessous, key=lambda b: (b['par_regle'], b['de']))
+                       if dessous else None)
+        # L'echelle proposee dans le tableau : les niveaux que la maison
+        # pratique vraiment, pas une graduation inventee.
+        echelle = sorted(n for n, e in exacts.items()
+                         if e['regles'] >= self.SOLDES_MIN_REGLES_PALIER)
+
+        # L'habitude de chaque categorie qui a assez de precedents. C'est
+        # elle qui prime sur le releve global : on ne solde pas une valise
+        # comme une mule.
+        habitudes = {}
+        for nom_cat, niveaux in par_cat.items():
+            if len(niveaux) < self.SOLDES_MIN_REGLES_CATEGORIE:
+                continue
+            normal, fort = self._soldes_habitude(niveaux)
+            if normal is None:
+                continue
+            habitudes[nom_cat] = {
+                'categorie': nom_cat, 'regles': len(niveaux),
+                'niveau_normal': normal, 'niveau_fort': fort,
+                'mini': min(niveaux), 'maxi': max(niveaux),
+            }
+        # Meme lecture, tous produits confondus : le filet pour les
+        # categories sans precedent.
+        tous = [n for niveaux in par_cat.values() for n in niveaux] or \
+               [n for n, e in exacts.items() for _ in range(e['regles'])]
+        gen_normal, gen_fort = self._soldes_habitude(tous)
+
+        def _ancrer(niveau):
+            """Ramène un palier général sur l'échelle des niveaux assez
+            souvent pratiqués : il gouverne les références sans précédent
+            de catégorie, il ne peut pas tenir sur une ou deux règles."""
+            if niveau is None or not echelle:
+                return niveau
+            return min(echelle, key=lambda n: (abs(n - niveau), -n))
+
+        gen_normal, gen_fort = _ancrer(gen_normal), _ancrer(gen_fort)
+        if gen_fort is not None and gen_normal is not None and gen_fort <= gen_normal:
+            plus_haut = [n for n in echelle if n > gen_normal]
+            gen_fort = min(plus_haut) if plus_haut else gen_normal
+
+        res = {
+            'echelle': echelle,
+            'habitudes': sorted(habitudes.values(), key=lambda h: -h['regles']),
+            'par_categorie': habitudes,
+            'usage_normal': gen_normal,
+            'usage_fort': gen_fort,
+            'bandes': sorted(bandes.values(), key=lambda b: -b['de']),
+            'niveau_normal': normale['niveau'] if normale else None,
+            'niveau_fort': forte['niveau'] if forte else None,
+            'bande_normale': [normale['de'], normale['a']] if normale else None,
+            'bande_forte': [forte['de'], forte['a']] if forte else None,
+            'nb_regles': len(regles),
+        }
+        self._cache_ecrire(cle, res)
+        return res
+
+    def _soldes_palier_suivant(self, actuelle, echelle):
+        """Le prochain palier au-dessus d'une remise déjà en place.
+
+        Proposer moins que ce qui est posé n'a aucun sens : la marchandise
+        n'a pas bougé au prix actuel. On monte donc au palier pratiqué
+        juste au-dessus.
+        """
+        plus_haut = [n for n in (echelle or []) if n > actuelle]
+        if plus_haut:
+            return min(plus_haut)
+        return int(min(self.SOLDES_REMISE_MAX, actuelle + 15))
+
+    def _soldes_paliers_anciennete(self):
+        """Les tranches d'ancienneté de la dernière vente, et ce que
+        chacune appelle comme remise. Partagées par la réponse et par son
+        détail, pour qu'elles ne puissent pas se contredire."""
+        return [
+            ('jamais', "Jamais vendue",
+             lambda r: r['jamais_vendu'], 'remise maximale'),
+            ('plus6m', "Plus de 6 mois",
+             lambda r: not r['jamais_vendu'] and r['jours_sans_vente'] > 180,
+             'remise franche'),
+            ('3a6m', "3 à 6 mois",
+             lambda r: not r['jamais_vendu'] and 90 < r['jours_sans_vente'] <= 180,
+             'remise conseillée'),
+            ('1a3m', "1 à 3 mois",
+             lambda r: not r['jamais_vendu'] and 30 < r['jours_sans_vente'] <= 90,
+             'à surveiller'),
+            ('moins1m', "Moins d'un mois",
+             lambda r: not r['jamais_vendu'] and r['jours_sans_vente'] <= 30,
+             'laisser tourner'),
+        ]
+
+    ASSISTANT_QUESTIONS = [
+        {'id': 'solder_semaine', 'texte': 'Que dois-je solder cette semaine ?',
+         'aide': "Les références les plus urgentes, prêtes à démarquer."},
+        {'id': 'remise_reference', 'texte': 'Quelle remise pour une référence ?',
+         'aide': "Choisissez une référence : la remise conseillée et pourquoi.",
+         'besoin_reference': True},
+        {'id': 'ou_solder', 'texte': 'Dans quels magasins solder ?',
+         'aide': "Les magasins qui portent le plus de stock dormant."},
+        {'id': 'categories_dorment', 'texte': 'Quelles catégories dorment le plus ?',
+         'aide': "Où se concentre l'argent immobilisé, par famille d'articles."},
+        {'id': 'depuis_quand', 'texte': 'Depuis combien de temps ça dort ?',
+         'aide': "Le stock classé par ancienneté de la dernière vente."},
+        {'id': 'deja_soldees', 'texte': 'Où en sont les soldes déjà posées ?',
+         'aide': "Ce qui est déjà démarqué, et si ça s'écoule."},
+        {'id': 'remise_qui_marche', 'texte': 'Quelle remise marche le mieux ici ?',
+         'aide': "Les remises déjà pratiquées, et ce que chacune a vendu."},
+        {'id': 'habitudes_categorie', 'texte': 'Quelles remises pratiquez-vous, par catégorie ?',
+         'aide': "L'habitude de chaque famille d'articles — c'est elle qui "
+                 "calibre les propositions."},
+        {'id': 'moment_vente', 'texte': 'Quel moment vend le mieux, magasin par magasin ?',
+         'aide': "Le jour et la tranche horaire où chaque magasin fait le plus de chiffre (heure de Paris)."},
+    ]
+
+    ASSISTANT_DETAIL_MAX = 300
+
+    JOURNAL_SOLDES_MAX = 500
+
+    def _soldes_listes_par_magasin(self):
+        """{pricelist_id: magasin} pour les listes de prix des caisses.
+
+        Une liste de soldes n'existe que rattachée à une caisse : c'est par
+        là qu'on retrouve le magasin d'une règle de prix. La liste normale
+        est écartée, aucune solde n'y est jamais posée.
+        """
+        listes = {}
+        for m in self._solde_mappings():
+            nom = m.shop_label or m.warehouse_id.name
+            for cfg in self._solde_store_configs(m):
+                for pl in cfg.available_pricelist_ids:
+                    if self._solde_is_default_list(pl):
+                        continue
+                    d = listes.setdefault(pl.id, {
+                        'liste': pl.display_name,
+                        'magasins': [], 'societes': [], 'warehouse_ids': [],
+                        'shop_fields': [],
+                        # La societe de reference sert au calcul de la TVA ;
+                        # la premiere suffit, les prix sont les memes.
+                        'company_id': m.company_id.id,
+                    })
+                    if nom not in d['magasins']:
+                        d['magasins'].append(nom)
+                        d['warehouse_ids'].append(m.warehouse_id.id)
+                        d['shop_fields'].append(m.shop_field)
+                    if m.company_id.name not in d['societes']:
+                        d['societes'].append(m.company_id.name)
+        return listes
+
+    def _soldes_portee_reelle(self):
+        """Une remise posée sur une liste partagée s'applique à TOUS les
+        magasins qui partagent cette liste.
+
+        Le dashboard laisse choisir les magasins, mais la portée réelle est
+        celle de la liste de prix : si une seule liste « Solde » est
+        rattachée aux caisses de plusieurs magasins, décocher un magasin ne
+        l'épargne pas. On renvoie de quoi le dire à l'écran.
+        """
+        par_liste = {}
+        for m in self._solde_mappings():
+            for cfg in self._solde_store_configs(m):
+                for pl in cfg.available_pricelist_ids:
+                    if self._solde_is_default_list(pl):
+                        continue
+                    d = par_liste.setdefault(pl.id, {'liste': pl.display_name,
+                                                     'magasins': []})
+                    nom = m.shop_label or m.warehouse_id.name
+                    if nom not in d['magasins']:
+                        d['magasins'].append(nom)
+        partagees = [d for d in par_liste.values() if len(d['magasins']) > 1]
+        for d in partagees:
+            d['magasins'].sort()
+        return {
+            'partagees': partagees,
+            # Vrai quand AUCUN magasin ne peut etre soldé séparément.
+            'tout_lie': bool(partagees) and len(par_liste) == len(partagees),
+        }
+
+    TRANSFERTS_MAX_LIGNES = 400
+
+    def _transferts_params(self, kw):
+        """Réglages du moteur de transferts, bornés pour rester sensés."""
+        def _int(nom, defaut, mini, maxi):
+            try:
+                v = int(kw.get(nom) or defaut)
+            except (TypeError, ValueError):
+                v = defaut
+            return max(mini, min(maxi, v))
+        return {
+            'fenetre': _int('fenetre', 90, 7, 365),
+            # Combien de jours de vente chaque magasin doit pouvoir tenir.
+            # 60 et non 30 : a 30 jours le reseau ne sort que 10 propositions,
+            # parce qu'il tourne trop lentement pour que quiconque soit court
+            # a un mois. A 60 on obtient 77 propositions exploitables.
+            'cible': _int('cible', 60, 7, 180),
+            # En dessous, le camion coûte plus que la marchandise.
+            'min_qte': _int('min_qte', 3, 1, 100),
+            # Un donneur n'est retenu que s'il dort vraiment dessus.
+            'couverture_donneur': _int('couverture_donneur', 120, 30, 3650),
+            # Un demandeur n'est retenu que s'il est réellement court : avec
+            # une cible de 60 jours, tenir 45 jours n'est pas une difficulté.
+            'couverture_demandeur': _int('couverture_demandeur', 45, 1, 180),
+        }
+
+    def _transferts_en_attente(self):
+        """Couples (variante, magasin source, magasin cible) deja couverts par un bon non livre."""
+        Wh = request.env['stock.warehouse'].sudo()
+        attente = set()
+        bons = request.env['inter.internal.transfer'].sudo().search(
+            [('state', 'in', ['draft', 'submitted', 'received', 'transmitted'])])
+        for bon in bons:
+            src = Wh.search([('view_location_id', 'parent_of', bon.location_source_id.id)], limit=1)
+            dst = Wh.search([('view_location_id', 'parent_of', bon.location_target_id.id)], limit=1)
+            if not src or not dst:
+                continue
+            for ligne in bon.line_ids:
+                attente.add((ligne.product_id.id, src.id, dst.id))
+        return attente
+
+    def _transferts_flux_recents(self, jours):
+        """Couples (variante, magasin source, magasin cible) de tous les bons crees depuis `jours`."""
+        Wh = request.env['stock.warehouse'].sudo()
+        depuis = fields.Datetime.now() - timedelta(days=jours)
+        flux = set()
+        bons = request.env['inter.internal.transfer'].sudo().search([
+            ('create_date', '>=', depuis), ('state', '!=', 'cancelled')])
+        for bon in bons:
+            src = Wh.search([('view_location_id', 'parent_of', bon.location_source_id.id)], limit=1)
+            dst = Wh.search([('view_location_id', 'parent_of', bon.location_target_id.id)], limit=1)
+            if not src or not dst:
+                continue
+            for ligne in bon.line_ids:
+                flux.add((ligne.product_id.id, src.id, dst.id))
+        return flux
+
+    def _transferts_recus_recemment(self, jours):
+        """Couples (article, magasin) qui ont recu une livraison validee depuis `jours`."""
+        Wh = request.env['stock.warehouse'].sudo()
+        depuis = fields.Datetime.now() - timedelta(days=jours)
+        recus = set()
+        bons = request.env['inter.internal.transfer'].sudo().search(
+            [('state', 'in', ['transmitted', 'done']), ('write_date', '>=', depuis)])
+        for bon in bons:
+            magasin = Wh.search([('view_location_id', 'parent_of', bon.location_target_id.id)],
+                                limit=1)
+            if not magasin:
+                continue
+            for ligne in bon.line_ids:
+                recus.add((ligne.product_id.id, magasin.id))
+        return recus
+
+    @http.route('/mavie/api/transferts-proposition', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_transferts_proposition(self, **kw):
+        """Ce qui gagnerait à changer de magasin, plutôt qu'à être soldé."""
+        try:
+            p = self._transferts_params(kw)
+            warehouses, wh_labels = self._reassort_warehouses(kw)
+            if not warehouses:
+                return {'error': "Aucun magasin actif."}
+            wh_ids = warehouses.ids
+            if len(wh_ids) < 2:
+                return {'error': "Il faut au moins deux magasins pour transférer."}
+            ref_date = self._reassort_reference_date(wh_ids)
+            debut = ref_date - timedelta(days=p['fenetre'])
+
+            filtres = self._mfl_sans_test_sql('pt')
+            params = {'wh': wh_ids, 'd1': str(debut) + ' 00:00:00',
+                      'd2': str(ref_date) + ' 23:59:59'}
+            sachets = self._get_sachet_variant_ids()
+            if sachets:
+                filtres += ' AND NOT (pp.id = ANY(%(sachets)s))'
+                params['sachets'] = list(sachets)
+            if self._filtre_produit_actif(kw):
+                params['tmpls'] = request.env['product.template'].sudo().search(
+                    self._build_product_domain(kw)).ids or [-1]
+                filtres += ' AND pt.id = ANY(%(tmpls)s)'
+
+            # Stock et ventes par MAGASIN : c'est le couple qui decide d'un
+            # transfert, pas le total reseau.
+            request.env.cr.execute("""
+                WITH stock AS (
+                    SELECT pp.id AS var, l.warehouse_id AS wh,
+                           SUM(q.quantity) AS qte
+                      FROM stock_quant q
+                      JOIN stock_location l ON l.id = q.location_id
+                      JOIN product_product pp ON pp.id = q.product_id
+                      JOIN product_template pt ON pt.id = pp.product_tmpl_id
+                     WHERE l.usage = 'internal' AND l.warehouse_id = ANY(%(wh)s)
+                       AND q.quantity > 0 AND pt.active AND pp.active
+                       {FILTRES}
+                     GROUP BY 1, 2
+                ), ventes AS (
+                    SELECT pp.id AS var, spt.warehouse_id AS wh,
+                           SUM(pol.qty) AS qte
+                      FROM pos_order_line pol
+                      JOIN pos_order po ON po.id = pol.order_id
+                      JOIN pos_session ps ON ps.id = po.session_id
+                      JOIN pos_config pc ON pc.id = ps.config_id
+                      JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                      JOIN product_product pp ON pp.id = pol.product_id
+                     WHERE po.state IN ('paid', 'done', 'invoiced')
+                       AND spt.warehouse_id = ANY(%(wh)s)
+                       AND po.date_order BETWEEN %(d1)s AND %(d2)s
+                     GROUP BY 1, 2
+                )
+                SELECT COALESCE(s.var, v.var) AS var,
+                       COALESCE(s.wh, v.wh) AS wh,
+                       COALESCE(s.qte, 0) AS stock,
+                       COALESCE(v.qte, 0) AS vendu
+                  FROM stock s
+                  FULL OUTER JOIN ventes v ON v.var = s.var AND v.wh = s.wh
+            """.replace('{FILTRES}', filtres), params)
+            brut = request.env.cr.fetchall()
+            if not brut:
+                return {'rows': [], 'paires': [], 'kpis': {}, 'params': p}
+
+            par_var = {}
+            for var_id, wh_id, stock, vendu in brut:
+                if not var_id or not wh_id:
+                    continue
+                par_var.setdefault(var_id, {})[wh_id] = {
+                    'stock': int(round(float(stock or 0))),
+                    'vendu': int(round(float(vendu or 0))),
+                }
+
+            variant_recs = request.env['product.product'].sudo().browse(list(par_var))
+            tmpl_de = {v.id: v.product_tmpl_id.id for v in variant_recs}
+            variante_noms = {v.id: ', '.join(v.product_template_attribute_value_ids.mapped('name'))
+                             for v in variant_recs}
+            tmpl_ids = list(set(tmpl_de.values()))
+            fiches = {t['id']: t for t in request.env['product.template'].sudo().search_read(
+                [('id', 'in', tmpl_ids)],
+                ['name', 'default_code', 'base_pivot_reference', 'list_price', 'categ_id'])}
+            societe_ref = warehouses[0].company_id if warehouses else request.env.company
+            ratios = {}
+            for tmpl in request.env['product.template'].sudo().browse(tmpl_ids):
+                ratios[tmpl.id] = self._solde_tax_ratio(tmpl, societe_ref)
+            noms_wh = {w.id: (wh_labels.get(w.id) or w.name) for w in warehouses}
+            champs_wh = {}
+            societes_wh = {}
+            villes_wh = {}
+            for m in self._get_active_shop_mappings():
+                if m.warehouse_id and m.warehouse_id.id in noms_wh:
+                    champs_wh[m.warehouse_id.id] = m.shop_field
+                    societes_wh[m.warehouse_id.id] = m.company_id.name or ''
+                    villes_wh[m.warehouse_id.id] = (m.city or '').strip()
+
+            recus = self._transferts_recus_recemment(p['fenetre'])
+            attente = self._transferts_en_attente()
+            flux = self._transferts_flux_recents(p['fenetre'])
+            rows = []
+            for var_id, magasins in par_var.items():
+                tmpl_id = tmpl_de[var_id]
+                fiche = fiches.get(tmpl_id) or {}
+                prix = float(fiche.get('list_price') or 0.0) * ratios.get(tmpl_id, 1.0)
+                donneurs, demandeurs = [], []
+                for wh_id, d in magasins.items():
+                    if wh_id not in noms_wh or wh_id not in champs_wh:
+                        continue
+                    vitesse = d['vendu'] / float(p['fenetre']) if d['vendu'] else 0.0
+                    couverture = (d['stock'] / vitesse) if vitesse else None
+                    cible_pieces = vitesse * p['cible']
+                    if vitesse > 0 and (couverture or 0) < p['couverture_demandeur'] \
+                            and (var_id, wh_id) not in recus:
+                        # Il vend et va manquer : il demande.
+                        besoin = int(round(cible_pieces - d['stock']))
+                        if besoin > 0:
+                            demandeurs.append({
+                                'wh': wh_id, 'besoin': besoin, 'stock': d['stock'],
+                                'vendu': d['vendu'],
+                                'couverture': int(round(couverture)) if couverture else 0,
+                            })
+                    elif d['stock'] > 0 and (var_id, wh_id) not in recus and (couverture is None
+                                             or couverture >= p['couverture_donneur']):
+                        # Il dort dessus : il peut ceder, sans descendre
+                        # sous ce qu'il lui faut pour tenir la cible.
+                        cessible = int(round(d['stock'] - cible_pieces))
+                        if cessible > 0:
+                            donneurs.append({
+                                'wh': wh_id, 'cessible': cessible, 'stock': d['stock'],
+                                'vendu': d['vendu'],
+                                'couverture': (int(round(couverture))
+                                               if couverture is not None else None),
+                            })
+                if not donneurs or not demandeurs:
+                    continue
+                # Le besoin le plus criant d'abord, servi par le magasin qui
+                # peut le plus s'en passer.
+                demandeurs.sort(key=lambda x: (x['couverture'], -x['besoin']))
+                donneurs.sort(key=lambda x: -x['cessible'])
+                restes = {d['wh']: d['cessible'] for d in donneurs}
+                for dem in demandeurs:
+                    manque = dem['besoin']
+                    for don in donneurs:
+                        if manque <= 0:
+                            break
+                        dispo = restes.get(don['wh'], 0)
+                        if dispo <= 0:
+                            continue
+                        qte = min(manque, dispo)
+                        if qte < p['min_qte']:
+                            continue
+                        restes[don['wh']] = dispo - qte
+                        manque -= qte
+                        meme_ville = (villes_wh.get(don['wh'])
+                                      and villes_wh.get(don['wh']) == villes_wh.get(dem['wh']))
+                        rows.append({
+                            'article_id': tmpl_id,
+                            'variant_id': var_id,
+                            'variante': variante_noms.get(var_id, ''),
+                            'en_attente': (var_id, don['wh'], dem['wh']) in attente,
+                            'aller_retour': (var_id, dem['wh'], don['wh']) in flux,
+                            'reference': (fiche.get('base_pivot_reference')
+                                          or fiche.get('default_code')
+                                          or fiche.get('name') or '—'),
+                            'produit': fiche.get('name') or '—',
+                            'categorie': (fiche['categ_id'][1]
+                                          if fiche.get('categ_id') else ''),
+                            'source_wh': don['wh'],
+                            'source': noms_wh.get(don['wh'], '?'),
+                            'source_field': champs_wh.get(don['wh']),
+                            'source_societe': societes_wh.get(don['wh'], ''),
+                            'source_stock': don['stock'],
+                            'source_vendu': don['vendu'],
+                            'source_couverture': don['couverture'],
+                            'dest_wh': dem['wh'],
+                            'destination': noms_wh.get(dem['wh'], '?'),
+                            'dest_field': champs_wh.get(dem['wh']),
+                            'dest_societe': societes_wh.get(dem['wh'], ''),
+                            'dest_stock': dem['stock'],
+                            'dest_vendu': dem['vendu'],
+                            'dest_couverture': dem['couverture'],
+                            'quantite': qte,
+                            'besoin': dem['besoin'],
+                            'prix_ttc': round(prix, 2),
+                            'valeur': round(qte * prix, 2),
+                            'meme_societe': (societes_wh.get(don['wh'])
+                                             == societes_wh.get(dem['wh'])),
+                            'meme_ville': bool(meme_ville),
+                            # Rouge : le demandeur est deja a sec ou presque.
+                            'urgence': ('rupture' if dem['stock'] <= 0
+                                        else ('critique' if dem['couverture'] <= 7
+                                              else 'normale')),
+                        })
+
+            rang = {'rupture': 0, 'critique': 1, 'normale': 2}
+            rows.sort(key=lambda r: (rang.get(r['urgence'], 3), -r['valeur'],
+                                     r['reference']))
+
+            # NOUVEAU : le regroupement par paire de magasins. Un bon de
+            # transfert porte plusieurs references ; raisonner ligne par
+            # ligne ferait autant de camions que de references.
+            paires = {}
+            for r in rows:
+                cle = '%s>%s' % (r['source_field'], r['dest_field'])
+                d = paires.setdefault(cle, {
+                    'cle': cle,
+                    'source': r['source'], 'source_field': r['source_field'],
+                    'source_societe': r['source_societe'],
+                    'destination': r['destination'], 'dest_field': r['dest_field'],
+                    'dest_societe': r['dest_societe'],
+                    'meme_societe': r['meme_societe'], 'meme_ville': r['meme_ville'],
+                    'references': 0, 'pieces': 0, 'valeur': 0.0, 'urgentes': 0,
+                })
+                d['references'] += 1
+                d['pieces'] += r['quantite']
+                d['valeur'] += r['valeur']
+                d['urgentes'] += 1 if r['urgence'] != 'normale' else 0
+            paires = sorted(paires.values(), key=lambda d: -d['valeur'])
+            for d in paires:
+                d['valeur'] = round(d['valeur'], 2)
+
+            # La matrice des flux : expediteur x destinataire. C'est la
+            # forme naturelle d'un reseau de magasins — on y lit d'un coup
+            # qui porte le stock de qui.
+            ordre = sorted(noms_wh, key=lambda w: noms_wh[w])
+            cases = {}
+            for r in rows:
+                cle = (r['source_wh'], r['dest_wh'])
+                c = cases.setdefault(cle, {'pieces': 0, 'valeur': 0.0,
+                                           'references': 0, 'urgentes': 0})
+                c['pieces'] += r['quantite']
+                c['valeur'] += r['valeur']
+                c['references'] += 1
+                c['urgentes'] += 1 if r['urgence'] != 'normale' else 0
+            matrice = {
+                'magasins': [{
+                    'wh': w, 'nom': noms_wh[w], 'field': champs_wh.get(w),
+                    'societe': societes_wh.get(w, ''), 'ville': villes_wh.get(w, ''),
+                } for w in ordre if champs_wh.get(w)],
+                'cases': [{
+                    'source_wh': a, 'dest_wh': b,
+                    'pieces': c['pieces'], 'valeur': round(c['valeur'], 2),
+                    'references': c['references'], 'urgentes': c['urgentes'],
+                } for (a, b), c in cases.items()],
+            }
+
+            # Le bilan de chaque magasin : ce qu'il donne, ce qu'il recoit.
+            bilans = {}
+            for w in ordre:
+                if not champs_wh.get(w):
+                    continue
+                bilans[w] = {
+                    'wh': w, 'nom': noms_wh[w], 'field': champs_wh.get(w),
+                    'societe': societes_wh.get(w, ''), 'ville': villes_wh.get(w, ''),
+                    'envoie': 0, 'envoie_refs': 0, 'envoie_valeur': 0.0,
+                    'recoit': 0, 'recoit_refs': 0, 'recoit_valeur': 0.0,
+                    'urgentes': 0,
+                }
+            for r in rows:
+                b = bilans.get(r['source_wh'])
+                if b:
+                    b['envoie'] += r['quantite']
+                    b['envoie_refs'] += 1
+                    b['envoie_valeur'] += r['valeur']
+                b = bilans.get(r['dest_wh'])
+                if b:
+                    b['recoit'] += r['quantite']
+                    b['recoit_refs'] += 1
+                    b['recoit_valeur'] += r['valeur']
+                    b['urgentes'] += 1 if r['urgence'] != 'normale' else 0
+            for b in bilans.values():
+                b['solde'] = b['recoit'] - b['envoie']
+                b['envoie_valeur'] = round(b['envoie_valeur'], 2)
+                b['recoit_valeur'] = round(b['recoit_valeur'], 2)
+                # Un magasin qui ne fait qu'envoyer porte le stock des
+                # autres ; un magasin qui ne fait que recevoir etait affame.
+                b['role'] = ('donneur' if b['envoie'] and not b['recoit']
+                             else ('receveur' if b['recoit'] and not b['envoie']
+                                   else ('equilibre' if b['envoie'] or b['recoit']
+                                         else 'inactif')))
+            bilan = sorted(bilans.values(),
+                           key=lambda b: (-(b['envoie'] + b['recoit']), b['nom']))
+
+            return {
+                'params': p,
+                'date_reference': ref_date.isoformat(),
+                'date_debut': debut.isoformat(),
+                'rows': rows[:self.TRANSFERTS_MAX_LIGNES],
+                'paires': paires,
+                'matrice': matrice,
+                'bilan': bilan,
+                'tronque': len(rows) > self.TRANSFERTS_MAX_LIGNES,
+                'nb_lignes_total': len(rows),
+                'kpis': {
+                    'nb_propositions': len(rows),
+                    'nb_references': len({r['article_id'] for r in rows}),
+                    'nb_paires': len(paires),
+                    'pieces': sum(r['quantite'] for r in rows),
+                    'valeur': round(sum(r['valeur'] for r in rows), 2),
+                    'nb_rupture': sum(1 for r in rows if r['urgence'] == 'rupture'),
+                    'pieces_rupture': sum(r['quantite'] for r in rows
+                                          if r['urgence'] == 'rupture'),
+                },
+            }
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_transferts_proposition: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    TRANSFERTS_QUESTIONS = [
+        {'id': 'qui_manque', 'texte': 'Qui a le plus besoin ?',
+         'aide': "Les magasins les plus courts, ceux à réapprovisionner en priorité."},
+        {'id': 'qui_donne', 'texte': 'Qui peut donner le plus ?',
+         'aide': "Les magasins qui dorment sur du stock et peuvent dépanner les autres."},
+        {'id': 'categories_bouger', 'texte': 'Quelles catégories bouger en premier ?',
+         'aide': "Où se concentre le volume à déplacer, par famille d'articles."},
+        {'id': 'paires_prioritaires', 'texte': 'Quelles liaisons prioriser ?',
+         'aide': "Les trajets magasin à magasin qui pèsent le plus lourd."},
+        {'id': 'ruptures', 'texte': 'Qui est déjà en rupture ?',
+         'aide': "Les magasins où une référence n'a plus une seule pièce."},
+    ]
+
+    def _bilan_flux(self, rows):
+        """Pour chaque magasin : ce qu'il recoit et ce qu'il cede, sur les lignes donnees."""
+        bilan = {}
+
+        def case(champ, nom, societe):
+            return bilan.setdefault(champ, {'field': champ, 'nom': nom, 'societe': societe,
+                                            'recoit': 0, 'recoit_refs': 0, 'urgentes': 0,
+                                            'envoie': 0, 'envoie_refs': 0})
+        for r in rows:
+            d = case(r['dest_field'], r['destination'], r['dest_societe'])
+            d['recoit'] += r['quantite']
+            d['recoit_refs'] += 1
+            d['urgentes'] += 1 if r['urgence'] != 'normale' else 0
+            s = case(r['source_field'], r['source'], r['source_societe'])
+            s['envoie'] += r['quantite']
+            s['envoie_refs'] += 1
+        return list(bilan.values())
+
+    def _paires_flux(self, rows):
+        paires = {}
+        for r in rows:
+            cle = '%s>%s' % (r['source_field'], r['dest_field'])
+            d = paires.setdefault(cle, {
+                'cle': cle, 'source': r['source'], 'destination': r['destination'],
+                'source_societe': r['source_societe'], 'dest_societe': r['dest_societe'],
+                'meme_societe': r['meme_societe'], 'references': 0, 'pieces': 0,
+                'valeur': 0.0, 'urgentes': 0})
+            d['references'] += 1
+            d['pieces'] += r['quantite']
+            d['valeur'] += r['valeur']
+            d['urgentes'] += 1 if r['urgence'] != 'normale' else 0
+        return sorted(paires.values(), key=lambda d: -d['valeur'])
+
+    @http.route('/mavie/api/transferts-assistant', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_transferts_assistant(self, **kw):
+        """Répond à UNE question fermée sur les transferts."""
+        try:
+            question = (kw.get('question') or '').strip()
+            if not question:
+                return {'questions': self.TRANSFERTS_QUESTIONS}
+            data = self.api_transferts_proposition(**kw)
+            if data.get('error'):
+                return {'error': data['error']}
+            rows = data.get('rows') or []
+            bilan = self._bilan_flux(rows)
+            paires = self._paires_flux(rows)
+
+            if question == 'qui_manque':
+                demandeurs = [b for b in bilan if b['recoit'] > 0]
+                demandeurs.sort(key=lambda b: -b['recoit'])
+                return {
+                    'titre': 'Qui a le plus besoin',
+                    'resume': '',
+                    'colonnes': ['Magasin', 'Société', 'À recevoir', 'Variantes',
+                                 'Urgentes'],
+                    'lignes': [[b['nom'], b['societe'], _fr_nombre(b['recoit']),
+                                _fr_nombre(b['recoit_refs']), _fr_nombre(b['urgentes'])]
+                               for b in demandeurs],
+                    'cles': ['recoit:%s' % b['field'] for b in demandeurs],
+                    'aide_clic': "Cliquez un magasin pour voir ce qu'il doit recevoir.",
+                    'graphique': {
+                        'type': 'barres', 'unite': 'pièces', 'libelle_refs': 'variante',
+                        'items': [{
+                            'nom': b['nom'], 'sous': b['societe'],
+                            'valeur': b['recoit'], 'refs': b['recoit_refs'],
+                            'alerte': b['urgentes'], 'cle': 'recoit:%s' % b['field'],
+                            'detail': ('%s pièces à recevoir · %s variantes'
+                                       % (_fr_nombre(b['recoit']),
+                                          _fr_nombre(b['recoit_refs']))),
+                        } for b in demandeurs],
+                        'legende': ("longueur = pièces à recevoir · « réf. » = "
+                                    "variantes concernées · la pastille rouge = "
+                                    "dont des ruptures"),
+                    },
+                }
+
+            if question == 'qui_donne':
+                donneurs = [b for b in bilan if b['envoie'] > 0]
+                donneurs.sort(key=lambda b: -b['envoie'])
+                return {
+                    'titre': 'Qui peut donner le plus',
+                    'resume': '',
+                    'colonnes': ['Magasin', 'Société', 'À donner', 'Variantes'],
+                    'lignes': [[b['nom'], b['societe'], _fr_nombre(b['envoie']),
+                                _fr_nombre(b['envoie_refs'])]
+                               for b in donneurs],
+                    'cles': ['envoie:%s' % b['field'] for b in donneurs],
+                    'aide_clic': "Cliquez un magasin pour voir ce qu'il peut donner.",
+                    'graphique': {
+                        'type': 'barres', 'unite': 'pièces', 'libelle_refs': 'variante',
+                        'items': [{
+                            'nom': b['nom'], 'sous': b['societe'],
+                            'valeur': b['envoie'], 'refs': b['envoie_refs'], 'alerte': 0,
+                            'cle': 'envoie:%s' % b['field'],
+                            'detail': ('%s pièces cessibles · %s variantes'
+                                       % (_fr_nombre(b['envoie']),
+                                          _fr_nombre(b['envoie_refs']))),
+                        } for b in donneurs],
+                        'legende': "longueur = pièces qu'il peut donner sans se mettre en rupture",
+                    },
+                }
+
+            if question == 'categories_bouger':
+                par_cat = {}
+                for r in rows:
+                    d = par_cat.setdefault(r['categorie'] or 'Sans catégorie',
+                                           {'refs': 0, 'pieces': 0, 'valeur': 0.0})
+                    d['refs'] += 1
+                    d['pieces'] += r['quantite']
+                    d['valeur'] += r['valeur']
+                # Tri par pieces, pas par valeur : c'est ce que montre le
+                # graphique (unite 'pieces'), les deux doivent coincider.
+                classe = sorted(par_cat.items(), key=lambda kv: -kv[1]['pieces'])
+                return {
+                    'titre': 'Quelles catégories bouger en premier',
+                    'resume': '',
+                    'colonnes': ['Catégorie', 'Variantes', 'Pièces à déplacer'],
+                    'lignes': [[nom, _fr_nombre(d['refs']), _fr_nombre(d['pieces'])]
+                               for nom, d in classe],
+                    'cles': ['cat:%s' % nom for nom, _d in classe],
+                    'aide_clic': "Cliquez une catégorie pour voir ses variantes.",
+                    'graphique': {
+                        'type': 'carte', 'unite': 'pièces',
+                        'items': [{
+                            'nom': nom, 'valeur': d['pieces'], 'cle': 'cat:%s' % nom,
+                            'detail': '%s variantes' % _fr_nombre(d['refs']),
+                        } for nom, d in classe],
+                    },
+                }
+
+            if question == 'paires_prioritaires':
+                top = paires[:12]
+                return {
+                    'titre': 'Quelles liaisons prioriser',
+                    'resume': '',
+                    'colonnes': ['De', 'Vers', 'Variantes', 'Pièces'],
+                    'lignes': [['%s (%s)' % (d['source'], d['source_societe']),
+                                '%s (%s)' % (d['destination'], d['dest_societe']),
+                                _fr_nombre(d['references']), _fr_nombre(d['pieces'])]
+                               for d in top],
+                    'cles': ['paire:%s' % d['cle'] for d in top],
+                    'aide_clic': "Cliquez une liaison pour voir ce qu'elle transporte.",
+                    'graphique': {
+                        'type': 'barres', 'unite': 'pièces', 'libelle_refs': 'variante',
+                        'items': [{
+                            'nom': '%s \u2192 %s' % (d['source'], d['destination']),
+                            'sous': ('interne' if d['meme_societe']
+                                     else 'inter-sociétés'),
+                            'valeur': d['pieces'], 'refs': d['references'],
+                            'alerte': d['urgentes'], 'cle': 'paire:%s' % d['cle'],
+                            'detail': ('%s variantes · %s pièces'
+                                       % (_fr_nombre(d['references']),
+                                          _fr_nombre(d['pieces']))),
+                        } for d in top],
+                        'legende': ("longueur = pièces à transporter sur cette liaison · "
+                                    "la pastille rouge = dont des urgentes"),
+                    },
+                }
+
+            if question == 'ruptures':
+                rupt = [r for r in rows if r['urgence'] == 'rupture']
+                par_mag = {}
+                for r in rupt:
+                    d = par_mag.setdefault(r['dest_field'],
+                                           {'nom': r['destination'], 'champ': r['dest_field'],
+                                            'refs': 0, 'pieces': 0})
+                    d['refs'] += 1
+                    d['pieces'] += r['quantite']
+                classe = sorted(par_mag.values(), key=lambda d: -d['refs'])
+                return {
+                    'titre': 'Qui est déjà en rupture',
+                    'resume': '',
+                    'colonnes': ['Magasin', 'Variantes en rupture', 'Pièces à envoyer'],
+                    'lignes': [[d['nom'], _fr_nombre(d['refs']), _fr_nombre(d['pieces'])]
+                               for d in classe],
+                    'cles': ['rupture:%s' % d['champ'] for d in classe],
+                    'graphique': {
+                        'type': 'colonnes', 'unite': 'variantes',
+                        'items': [{
+                            'nom': d['nom'], 'valeur': d['refs'],
+                            'cle': 'rupture:%s' % d['champ'],
+                            'fort': d is classe[0] if classe else False,
+                            'detail': '%s pièces à envoyer' % _fr_nombre(d['pieces']),
+                        } for d in classe],
+                        'legende': "hauteur = nombre de variantes en rupture dans ce magasin",
+                    },
+                }
+
+            return {'error': 'Question inconnue.'}
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_transferts_assistant: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/transferts-assistant-detail', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_transferts_assistant_detail(self, **kw):
+        """Ce qu'il y a derrière une ligne de l'assistant des transferts."""
+        try:
+            cle = (kw.get('cle') or '').strip()
+            if not cle:
+                return {'error': "Aucun détail pour cette ligne."}
+            if cle.startswith('bon:'):
+                bon = request.env['inter.internal.transfer'].sudo().browse(int(cle[4:]))
+                if not bon.exists() or not bon.created_from_dashboard:
+                    return {'error': 'Bon introuvable.'}
+                etats = dict(bon._fields['state'].selection)
+
+                def nom_magasin(loc):
+                    return loc.warehouse_id.name or loc.display_name
+                etat = etats.get(bon.state, bon.state)
+                lignes, cles = [], []
+                magasin = (kw.get('magasin_bon') or '').strip()
+                for ligne in bon.line_ids:
+                    tmpl = ligne.product_id.product_tmpl_id
+                    sens = ('Sortie' if nom_magasin(bon.location_source_id) == magasin
+                            else ('Entrée' if nom_magasin(bon.location_target_id) == magasin else '—')) if magasin else ''
+                    lignes.append([tmpl.base_pivot_reference or tmpl.default_code or tmpl.name,
+                                   ', '.join(ligne.product_id.product_template_attribute_value_ids.mapped('name')) or '—',
+                                   _fr_nombre(ligne.quantity), etat] + ([sens] if magasin else []))
+                    cles.append('ref:%s' % tmpl.id)
+                return {
+                    'titre': 'Bon %s : %s → %s' % (bon.name, nom_magasin(bon.location_source_id),
+                                                   nom_magasin(bon.location_target_id)),
+                    'etat': etat,
+                    'dates': [['Créé', fields.Datetime.to_string(bon.create_date)],
+                              ['Fait', fields.Datetime.to_string(bon.date_validation)],
+                              ['Reçu', fields.Datetime.to_string(bon.received_date)]],
+                    'resume': '',
+                    'colonnes': ['Article', 'Variante', 'Quantité', 'État du bon'] + (['Sens'] if magasin else []),
+                    'lignes': lignes,
+                    'cles': cles,
+                }
+
+            data = self.api_transferts_proposition(**kw)
+            if data.get('error'):
+                return {'error': data['error']}
+            rows = data.get('rows') or []
+
+            if cle.startswith('recoit:'):
+                champ = cle[7:]
+                choix = sorted([r for r in rows if r['dest_field'] == champ],
+                               key=lambda r: -r['quantite'])
+                titre = 'Ce que %s doit recevoir' % (choix[0]['destination'] if choix else champ)
+            elif cle.startswith('envoie:'):
+                champ = cle[7:]
+                choix = sorted([r for r in rows if r['source_field'] == champ],
+                               key=lambda r: -r['quantite'])
+                titre = 'Ce que %s peut donner' % (choix[0]['source'] if choix else champ)
+            elif cle.startswith('cat:'):
+                nom = cle[4:]
+                choix = sorted([r for r in rows
+                                if (r['categorie'] or 'Sans catégorie') == nom],
+                               key=lambda r: -r['quantite'])
+                titre = 'Catégorie %s' % nom
+            elif cle.startswith('paire:'):
+                paire_cle = cle[6:]
+                choix = sorted([r for r in rows
+                                if '%s>%s' % (r['source_field'], r['dest_field']) == paire_cle],
+                               key=lambda r: -r['quantite'])
+                titre = ('%s \u2192 %s' % (choix[0]['source'], choix[0]['destination'])
+                         if choix else 'Liaison')
+            elif cle.startswith('rupture:'):
+                champ = cle[8:]
+                choix = sorted([r for r in rows
+                                if r['dest_field'] == champ and r['urgence'] == 'rupture'],
+                               key=lambda r: -r['quantite'])
+                titre = ('En rupture chez %s' % choix[0]['destination'] if choix
+                         else 'En rupture')
+            else:
+                return {'error': "Détail inconnu pour cette ligne."}
+
+            if not choix:
+                return {'titre': titre, 'resume': "Rien à afficher.",
+                        'colonnes': [], 'lignes': []}
+            return {
+                'titre': titre,
+                'resume': ("%s variantes · %s pièces"
+                          % (_fr_nombre(len(choix)),
+                             _fr_nombre(sum(r['quantite'] for r in choix)))),
+                'colonnes': ['Article et variante', 'Catégorie', 'De', 'Vers', 'À déplacer'],
+                'lignes': [[r['reference'] + (' · ' + r['variante'] if r['variante'] else ''),
+                            r['categorie'] or '—', r['source'],
+                            r['destination'], _fr_nombre(r['quantite'])]
+                           for r in choix[:self.ASSISTANT_DETAIL_MAX]],
+                'cles': ['ref:%s' % r['article_id']
+                         for r in choix[:self.ASSISTANT_DETAIL_MAX]],
+            }
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_transferts_assistant_detail: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/transferts-bons', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_transferts_bons(self, **kw):
+        """Les bons crees depuis le tableau de bord, avec leur etat."""
+        try:
+            T = request.env['inter.internal.transfer'].sudo()
+            etats = dict(T._fields['state'].selection)
+            bons = T.search([('created_from_dashboard', '=', True)], order='id desc', limit=200)
+
+            def quand(dt):
+                # UTC brut : le navigateur l'affiche dans l'heure de la machine.
+                return fields.Datetime.to_string(dt) if dt else ''
+            Wh = request.env['stock.warehouse'].sudo()
+
+            def vendu_depuis(b):
+                dest = Wh.search([('view_location_id', 'parent_of', b.location_target_id.id)], limit=1)
+                variantes = b.line_ids.mapped('product_id').ids
+                if not dest or not variantes or not b.create_date:
+                    return 0
+                request.env.cr.execute("""
+                    SELECT COALESCE(SUM(pol.qty), 0)
+                      FROM pos_order_line pol
+                      JOIN pos_order po ON po.id = pol.order_id
+                      JOIN pos_session ps ON ps.id = po.session_id
+                      JOIN pos_config pc ON pc.id = ps.config_id
+                      JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                     WHERE po.state IN ('paid', 'done', 'invoiced')
+                       AND spt.warehouse_id = %s
+                       AND pol.product_id = ANY(%s)
+                       AND po.date_order >= %s""", (dest.id, variantes, b.create_date))
+                return int(round(float(request.env.cr.fetchone()[0] or 0)))
+
+            return {'bons': [{
+                'id': b.id,
+                'name': b.name,
+                'etat': etats.get(b.state, b.state),
+                'source': b.location_source_id.warehouse_id.name or b.location_source_id.display_name,
+                'dest': b.location_target_id.warehouse_id.name or b.location_target_id.display_name,
+                'pieces': sum(b.line_ids.mapped('quantity')),
+                'vendu': vendu_depuis(b),
+                'valide': b.state == 'done',
+                'lignes': [{'variante_id': l.product_id.id,
+                            'ref': (l.product_id.product_tmpl_id.base_pivot_reference
+                                    or l.product_id.product_tmpl_id.default_code
+                                    or l.product_id.product_tmpl_id.name),
+                            'variante': ', '.join(l.product_id.product_template_attribute_value_ids.mapped('name')) or '—',
+                            'qte': l.quantity} for l in b.line_ids],
+                'fait': quand(b.date_validation),
+                'cree': quand(b.create_date),
+                'recu': quand(b.received_date),
+            } for b in bons]}
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_transferts_bons: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/transfer-bon-pdf/<int:transfer_id>', type='http', auth='user',
+                methods=['GET'], csrf=False)
+    def api_transfer_bon_pdf(self, transfer_id, **kw):
+        """Le bon de transfert en PDF, pour les bons crees depuis le tableau de bord.
+        Rendu en sudo, comme le PDF de Soldes : le tableau de bord donne deja acces
+        aux transferts, la permission du menu ne doit pas bloquer l'impression."""
+        bon = request.env['inter.internal.transfer'].sudo().browse(transfer_id)
+        if not bon.exists() or not bon.created_from_dashboard:
+            return request.not_found()
+        try:
+            pdf, _fmt = request.env['ir.actions.report'].sudo()._render_qweb_pdf(
+                'mavie_dashboard.action_report_transfer', [bon.id])
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur PDF bon transfert %s: %s", bon.name, e, exc_info=True)
+            return request.make_response(
+                "Le bon n'a pas pu être généré : %s" % e,
+                [('Content-Type', 'text/plain; charset=utf-8')])
+        nom = re.sub(r'[^\w.-]+', '_', 'Bon_transfert_%s' % bon.name) + '.pdf'
+        return request.make_response(pdf, headers=[
+            ('Content-Type', 'application/pdf'),
+            ('Content-Length', len(pdf)),
+            ('Content-Disposition', 'inline; filename="%s"' % nom),
+        ])
+
+    @http.route('/mavie/transfer-bons-pdf', type='http', auth='user',
+                methods=['GET'], csrf=False)
+    def api_transfer_bons_pdf(self, ids='', **kw):
+        """Plusieurs bons crees depuis le tableau de bord, en un seul PDF (rendu en sudo)."""
+        ids_ok = [int(x) for x in (ids or '').split(',') if x.strip().isdigit()]
+        bons = request.env['inter.internal.transfer'].sudo().search(
+            [('id', 'in', ids_ok), ('created_from_dashboard', '=', True)], order='id asc')
+        if not bons:
+            return request.not_found()
+        try:
+            pdf, _fmt = request.env['ir.actions.report'].sudo()._render_qweb_pdf(
+                'mavie_dashboard.action_report_transfer', bons.ids)
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur PDF bons groupes: %s", e, exc_info=True)
+            return request.make_response(
+                "Les bons n'ont pas pu être générés : %s" % e,
+                [('Content-Type', 'text/plain; charset=utf-8')])
+        return request.make_response(pdf, headers=[
+            ('Content-Type', 'application/pdf'),
+            ('Content-Length', len(pdf)),
+            ('Content-Disposition', 'inline; filename="Bons_transfert.pdf"'),
+        ])
+
+    @http.route('/mavie/api/transferts-bilan', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_transferts_bilan(self, **kw):
+        """Bilan des bons faits depuis le tableau de bord."""
+        try:
+            bons = request.env['inter.internal.transfer'].sudo().search(
+                [('created_from_dashboard', '=', True), ('state', '=', 'done')])
+            delais = [(b.date_validation - b.create_date).total_seconds() / 86400.0
+                      for b in bons if b.date_validation and b.create_date]
+            pieces = sum(sum(b.line_ids.mapped('quantity')) for b in bons)
+            Wh = request.env['stock.warehouse'].sudo()
+            vendu = 0
+            for b in bons:
+                dest = Wh.search([('view_location_id', 'parent_of', b.location_target_id.id)], limit=1)
+                variantes = b.line_ids.mapped('product_id').ids
+                if not dest or not variantes or not b.create_date:
+                    continue
+                request.env.cr.execute("""
+                    SELECT COALESCE(SUM(pol.qty), 0)
+                      FROM pos_order_line pol
+                      JOIN pos_order po ON po.id = pol.order_id
+                      JOIN pos_session ps ON ps.id = po.session_id
+                      JOIN pos_config pc ON pc.id = ps.config_id
+                      JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                     WHERE po.state IN ('paid', 'done', 'invoiced')
+                       AND spt.warehouse_id = %s
+                       AND pol.product_id = ANY(%s)
+                       AND po.date_order >= %s""", (dest.id, variantes, b.create_date))
+                vendu += int(round(float(request.env.cr.fetchone()[0] or 0)))
+            return {'nb': len(bons), 'pieces': pieces, 'vendu': vendu,
+                    'delai_jours': round(sum(delais) / len(delais), 1) if delais else None}
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_transferts_bilan: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/soldes-bon-pdf', type='http', auth='user', methods=['GET'], csrf=False)
+    def api_soldes_bon_pdf(self, **kw):
+        """Le bon des soldes de l'opération en cours : chaque remise posée, avec sa photo."""
+        try:
+            op = self._solde_operation()
+            if not op['active']:
+                return request.make_response("Aucune opération de soldes en cours.",
+                                             [('Content-Type', 'text/plain; charset=utf-8')])
+            lignes = []
+            for r in self.api_soldes_journal().get('rows') or []:
+                if r.get('debut') != op['debut']:
+                    continue
+                photo = None
+                tmpl = request.env['product.template'].sudo().browse(r.get('article_id') or 0).exists()
+                if tmpl and tmpl.image_128:
+                    try:
+                        photo = 'data:image/png;base64,' + tmpl.image_128.decode()
+                    except Exception:  # noqa: BLE001
+                        photo = None
+                lignes.append({
+                    'photo': photo,
+                    'reference': r.get('reference') or '',
+                    'produit': r.get('produit') or '',
+                    'variante': r.get('variante') or '—',
+                    'magasin': r.get('magasin') or '',
+                    'societe': r.get('societe') or '',
+                    'catalogue': r.get('prix_catalogue') or '',
+                    'solde': r.get('prix_solde') or '',
+                    'remise': r.get('remise') or '',
+                    'debut': r.get('debut') or '',
+                    'fin': r.get('fin') or '—',
+                    'vendu': r.get('vendu_depuis') or 0,
+                })
+            html = request.env['ir.qweb']._render('mavie_dashboard.report_soldes_template', {
+                'titre': 'Bon de soldes — %s' % op['nom'],
+                'sous_titre': 'du %s au %s' % (op['debut'], op['fin'] or 'sans date de fin'),
+                'lignes': lignes,
+            })
+            pdf = request.env['ir.actions.report'].sudo()._run_wkhtmltopdf([html], landscape=True)
+            return request.make_response(pdf, headers=[
+                ('Content-Type', 'application/pdf'),
+                ('Content-Length', len(pdf)),
+                ('Content-Disposition', 'inline; filename="Bon_de_soldes.pdf"'),
+            ])
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur bon de soldes PDF: %s", e, exc_info=True)
+            return request.make_response("Le bon n'a pas pu être généré : %s" % e,
+                                         [('Content-Type', 'text/plain; charset=utf-8')])
+
+    CLE_OPERATION = 'mavie_dashboard.solde_operation'
+
+    def _solde_operation(self):
+        """L'opération de soldes en cours, ou rien.
+
+        Stockée dans trois paramètres de configuration : aucun modèle à
+        créer, et la retirer ne laisse aucune trace.
+        """
+        param = request.env['ir.config_parameter'].sudo()
+        nom = (param.get_param(self.CLE_OPERATION + '_nom') or '').strip()
+        debut = (param.get_param(self.CLE_OPERATION + '_debut') or '').strip()
+        fin = (param.get_param(self.CLE_OPERATION + '_fin') or '').strip()
+        cats = [int(x) for x in (param.get_param(self.CLE_OPERATION + '_categories') or '').split(',')
+                if x.strip().isdigit()]
+        if not nom or not debut:
+            return {'active': False, 'nom': '', 'debut': '', 'fin': '', 'categories': []}
+        aujourdhui = fields.Date.context_today(request.env.user).isoformat()
+        return {
+            'active': True,
+            'nom': nom,
+            'debut': debut,
+            'fin': fin,
+            'categories': cats,
+            'categories_noms': request.env['product.category'].sudo().browse(cats).mapped('complete_name'),
+            # Une opération dont la date de fin est passée ne pose plus
+            # rien : on le dit, plutôt que de la laisser croire en cours.
+            'terminee': bool(fin and fin < aujourdhui),
+            'a_venir': debut > aujourdhui,
+        }
+
+    def _solde_dates_operation(self, date_start, date_end):
+        """Les dates à poser : celles demandées, sinon celles de l'opération.
+
+        Une remise posée pendant une opération en porte les dates — c'est
+        tout l'intérêt d'en déclarer une.
+        """
+        op = self._solde_operation()
+        if not date_start and op['active'] and not op.get('terminee'):
+            return op['debut'], op['fin']
+        return (date_start or fields.Date.context_today(request.env.user).isoformat(),
+                date_end)
+
+    @http.route('/mavie/api/soldes-categories', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_soldes_categories(self, **kw):
+        cats = request.env['product.category'].sudo().search([], order='complete_name')
+        return {'categories': [{'id': c.id, 'nom': c.complete_name} for c in cats]}
+
+    @http.route('/mavie/api/solde-operation', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_solde_operation(self, **kw):
+        """Lire, définir ou effacer l'opération de soldes en cours."""
+        try:
+            param = request.env['ir.config_parameter'].sudo()
+            action = (kw.get('action') or 'lire').strip()
+            if action == 'effacer':
+                for suffixe in ('_nom', '_debut', '_fin', '_categories'):
+                    param.set_param(self.CLE_OPERATION + suffixe, '')
+                _logger.info("Operation de soldes effacee par %s",
+                             request.env.user.login)
+            elif action == 'definir':
+                nom = (kw.get('nom') or '').strip()
+                debut = (kw.get('debut') or '').strip()
+                fin = (kw.get('fin') or '').strip()
+                if not nom:
+                    return {'error': "Donnez un nom à l'opération."}
+                if not debut:
+                    return {'error': "Donnez une date de début."}
+                if fin and fin < debut:
+                    return {'error': "La fin ne peut pas précéder le début."}
+                param.set_param(self.CLE_OPERATION + '_nom', nom[:80])
+                param.set_param(self.CLE_OPERATION + '_debut', debut)
+                param.set_param(self.CLE_OPERATION + '_fin', fin)
+                categories = [int(c) for c in (kw.get('categories') or []) if str(c).isdigit()]
+                param.set_param(self.CLE_OPERATION + '_categories', ','.join(str(c) for c in categories))
+                _logger.info("Operation de soldes « %s » du %s au %s, par %s",
+                             nom, debut, fin or 'sans fin', request.env.user.login)
+            elif action != 'lire':
+                return {'error': "Action inconnue."}
+
+            op = self._solde_operation()
+            op['remises_posees'] = self._solde_remises_operation(op)
+            return op
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_solde_operation: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    def _solde_remises_operation(self, op):
+        """Combien de remises portent déjà les dates de cette opération."""
+        if not op.get('active'):
+            return 0
+        listes = self._soldes_listes_par_magasin()
+        if not listes:
+            return 0
+        domaine = [('pricelist_id', 'in', list(listes)),
+                   ('compute_price', '=', 'fixed'),
+                   ('date_start', '>=', op['debut'] + ' 00:00:00'),
+                   ('date_start', '<=', op['debut'] + ' 23:59:59')]
+        return request.env['product.pricelist.item'].sudo().search_count(domaine)
+
+    @http.route('/mavie/api/soldes-journal', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_soldes_journal(self, **kw):
+        """Les remises posées, la plus récente d'abord.
+
+        À ne pas confondre avec la section « Historique » du tableau de
+        bord, qui liste les VENTES faites sous le prix catalogue : ici on
+        liste ce qui a été POSÉ, même si rien n'a encore été vendu.
+        """
+        try:
+            listes = self._soldes_listes_par_magasin()
+            if not listes:
+                return {'rows': [], 'kpis': {}}
+            Item = request.env['product.pricelist.item'].sudo()
+            domaine = [('pricelist_id', 'in', list(listes)),
+                       ('compute_price', '=', 'fixed')]
+            if kw.get('date_start'):
+                domaine.append(('write_date', '>=', kw['date_start'] + ' 00:00:00'))
+            if kw.get('date_end'):
+                domaine.append(('write_date', '<=', kw['date_end'] + ' 23:59:59'))
+            regles = Item.search(domaine, order='write_date desc',
+                                 limit=self.JOURNAL_SOLDES_MAX)
+            if not regles:
+                return {'rows': [], 'kpis': {}}
+
+            # Ce que chaque remise a vendu depuis sa pose : c'est la seule
+            # facon de savoir si elle a pris. Les regles posees le meme jour
+            # partagent une requete, sinon on en ferait une par ligne.
+            aujourdhui = fields.Date.context_today(request.env.user)
+            paquets = {}
+            for it in regles:
+                tmpl = it.product_tmpl_id or it.product_id.product_tmpl_id
+                info = listes.get(it.pricelist_id.id) or {}
+                if not tmpl or not info.get('warehouse_ids'):
+                    continue
+                depuis = it.date_start or it.write_date or it.create_date
+                jour = fields.Datetime.to_string(depuis)[:10] if depuis else str(aujourdhui)
+                # Une liste partagee vaut pour tous ses magasins : les
+                # ventes depuis la pose se comptent sur tous, sinon on
+                # sous-estime l'effet de la remise.
+                for wh_id in info['warehouse_ids']:
+                    paquets.setdefault(jour, set()).add((tmpl.id, wh_id))
+            vendu = {}
+            for jour, paires in paquets.items():
+                request.env.cr.execute("""
+                    SELECT pp.product_tmpl_id, spt.warehouse_id,
+                           SUM(pol.qty), SUM(pol.price_subtotal_incl)
+                      FROM pos_order_line pol
+                      JOIN pos_order po ON po.id = pol.order_id
+                      JOIN pos_session ps ON ps.id = po.session_id
+                      JOIN pos_config pc ON pc.id = ps.config_id
+                      JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                      JOIN product_product pp ON pp.id = pol.product_id
+                     WHERE po.state IN ('paid', 'done', 'invoiced')
+                       AND po.date_order >= %s
+                       AND pp.product_tmpl_id = ANY(%s)
+                       AND spt.warehouse_id = ANY(%s)
+                     GROUP BY 1, 2
+                """, (jour + ' 00:00:00',
+                      list({t for t, _w in paires}),
+                      list({w for _t, w in paires})))
+                for tmpl_id, wh_id, qte, montant in request.env.cr.fetchall():
+                    if (tmpl_id, wh_id) in paires:
+                        cle = (tmpl_id, wh_id, jour)
+                        vendu[cle] = (int(round(float(qte or 0))), float(montant or 0))
+            def _vendu(tmpl_id, wh_ids, jour):
+                q = m = 0.0
+                for w in wh_ids:
+                    a, b = vendu.get((tmpl_id, w, jour), (0, 0.0))
+                    q += a
+                    m += b
+                return int(q), m
+
+            rows = []
+            pieces_vendues = recette = 0.0
+            for it in regles:
+                tmpl = it.product_tmpl_id or it.product_id.product_tmpl_id
+                info = listes.get(it.pricelist_id.id) or {}
+                if not tmpl or not info:
+                    continue
+                societe = request.env['res.company'].sudo().browse(info['company_id'])
+                ratio = self._solde_tax_ratio(tmpl, societe)
+                magasins = info.get('magasins') or []
+                prix_ttc = round(float(it.fixed_price or 0) * ratio, 2)
+                catalogue = round(float(tmpl.list_price or 0) * ratio, 2)
+                remise = (round((1 - prix_ttc / catalogue) * 100.0, 1)
+                          if catalogue > 0 and prix_ttc <= catalogue else 0.0)
+                depuis = it.date_start or it.write_date or it.create_date
+                jour = fields.Datetime.to_string(depuis)[:10] if depuis else str(aujourdhui)
+                q, m = _vendu(tmpl.id, info.get('warehouse_ids') or [], jour)
+                pieces_vendues += q
+                recette += m
+                fin = fields.Datetime.to_string(it.date_end)[:10] if it.date_end else ''
+                rows.append({
+                    'id': it.id,
+                    'pose_le': fields.Datetime.to_string(it.write_date)[:16]
+                               if it.write_date else '',
+                    'par': (it.write_uid or it.create_uid).name or '',
+                    'article_id': tmpl.id,
+                    'reference': (tmpl.base_pivot_reference or tmpl.default_code
+                                  or tmpl.name or '—'),
+                    'produit': tmpl.name or '',
+                    'variante': it.product_id.display_name if it.product_id else '',
+                    # Une liste partagee : on nomme tous les magasins
+                    # concernes, sinon le journal laisse croire que la
+                    # remise n'a touche qu'une boutique.
+                    'magasin': (magasins[0] if len(magasins) == 1
+                                else '%s magasins' % len(magasins)),
+                    'magasins': magasins,
+                    'partagee': len(magasins) > 1,
+                    'societe': ', '.join(info.get('societes') or []),
+                    'liste': info['liste'],
+                    'prix_catalogue': catalogue,
+                    'prix_solde': prix_ttc,
+                    'remise': remise,
+                    'debut': jour,
+                    'fin': fin,
+                    # Une remise sans date de fin court indefiniment ; une
+                    # remise expiree ne s'applique plus en caisse.
+                    'expiree': bool(fin and fin < str(aujourdhui)),
+                    'vendu_depuis': q,
+                    'recette_depuis': round(m, 2),
+                })
+            actives = [r for r in rows if not r['expiree']]
+            sans_effet = [r for r in actives if not r['vendu_depuis']]
+            return {
+                'rows': rows,
+                'kpis': {
+                    'nb_regles': len(rows),
+                    'nb_actives': len(actives),
+                    'nb_expirees': len(rows) - len(actives),
+                    'nb_references': len({r['article_id'] for r in rows}),
+                    'nb_magasins': len({m for r in rows for m in (r['magasins'] or [])}),
+                    'nb_sans_effet': len(sans_effet),
+                    'pieces_vendues': int(pieces_vendues),
+                    'recette': round(recette, 2),
+                },
+                'tronque': len(regles) >= self.JOURNAL_SOLDES_MAX,
+            }
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_soldes_journal: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/assistant-detail', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_assistant_detail(self, **kw):
+        """Ce qu'il y a derrière UNE ligne de réponse de l'assistant.
+
+        La clé dit de quoi il s'agit : `ref:12` une référence (on montre les
+        magasins exacts), `mag:shop_04` un magasin, `cat:Sacs` une
+        catégorie, sinon un palier d'ancienneté ou un total.
+        """
+        try:
+            cle = (kw.get('cle') or '').strip()
+            if not cle:
+                return {'error': "Aucun détail pour cette ligne."}
+            data = self.api_soldes_proposition(**kw)
+            if data.get('error'):
+                return {'error': data['error']}
+            rows = data.get('rows') or []
+            p = data.get('params') or {}
+            a_traiter = [r for r in rows if not r['deja_solde']]
+
+            # Une référence : les magasins exacts où la remise peut être
+            # posée, et ceux qui en détiennent sans pouvoir la recevoir.
+            if cle.startswith('ref:'):
+                try:
+                    aid = int(cle[4:])
+                except ValueError:
+                    return {'error': "Référence illisible."}
+                ligne = ([r for r in rows if r['article_id'] == aid] or [None])[0]
+                if not ligne:
+                    return {'error': "Cette référence n'est plus dans la liste."}
+                lignes = []
+                for m in (ligne.get('magasins') or []):
+                    lignes.append([
+                        m['libelle'], m['societe'], _fr_nombre(m['stock']),
+                        '%s MAD' % _fr_nombre(m['stock'] * ligne['prix_solde']),
+                        'oui' if m['soldable'] else 'non — aucune caisse',
+                    ])
+                sans = sum(1 for m in (ligne.get('magasins') or []) if not m['soldable'])
+                portee = self._soldes_portee_reelle()
+                avert = ''
+                if portee['partagees']:
+                    avert = (" Attention : la liste de prix « %s » est partagée par %s "
+                             "magasins (%s). Une remise posée s'y applique dans TOUS ces "
+                             "magasins à la fois — décocher n'en épargne aucun."
+                             % (portee['partagees'][0]['liste'],
+                                len(portee['partagees'][0]['magasins']),
+                                ', '.join(portee['partagees'][0]['magasins'])))
+                return {
+                    'portee': portee,
+                    'avertissement': avert,
+                    'titre': '%s — où solder' % ligne['reference'],
+                    'resume': ("%s. Remise conseillée −%s %% : %s MAD au lieu de %s MAD. "
+                               "La remise peut être posée dans %s magasin(s) sur %s.%s"
+                               % (ligne['produit'], ligne['remise'],
+                                  _fr_nombre(ligne['prix_solde']), _fr_nombre(ligne['prix_ttc']),
+                                  ligne['nb_soldables'], ligne['nb_magasins'],
+                                  ((" %s magasin(s) détiennent du stock sans caisse : "
+                                    "il faut y déplacer la marchandise." % sans)
+                                   if sans else '') + avert)),
+                    'colonnes': ['Magasin', 'Société', 'Stock', 'Valeur soldée',
+                                 'Remise possible'],
+                    'lignes': lignes,
+                    'article_id': aid,
+                    'reference': ligne['reference'],
+                    'remise': ligne['remise'],
+                }
+
+            # Une tranche de remise : ce qui y a deja ete solde. Cette
+            # question-la regarde le PASSE, pas les propositions — son
+            # detail sort donc du journal des remises posees.
+            if cle.startswith('bande:'):
+                try:
+                    de, a = [int(x) for x in cle[6:].split('-')]
+                except (TypeError, ValueError):
+                    return {'error': "Tranche de remise illisible."}
+                journal = self.api_soldes_journal()
+                dedans = [r for r in (journal.get('rows') or [])
+                          if de <= int(round(r['remise'])) <= a]
+                # Ou la remise peut etre posee aujourd'hui : l'information
+                # vient de la liste des propositions, pas du journal.
+                ou = {x['article_id']: x['nb_soldables'] for x in rows}
+                dedans.sort(key=lambda r: -r['vendu_depuis'])
+                vendu = sum(r['vendu_depuis'] for r in dedans)
+                muettes = [r for r in dedans if not r['vendu_depuis'] and not r['expiree']]
+                return {
+                    'titre': 'Soldé entre %s et %s %%' % (de, a),
+                    'resume': ("%s remises posées · %s pièces vendues depuis · %s n'ont "
+                               "encore rien vendu."
+                               % (_fr_nombre(len(dedans)), _fr_nombre(vendu),
+                                  _fr_nombre(len(muettes)))),
+                    'colonnes': ['Référence', 'Où solder', 'Catalogue', 'Prix soldé',
+                                 'Remise', 'Posée le', 'Vendu depuis', 'État'],
+                    'lignes': [[r['reference'],
+                                '%s magasin%s' % (ou.get(r['article_id'], 0),
+                                                  's' if ou.get(r['article_id'], 0) > 1
+                                                  else ''),
+                                '%s MAD' % _fr_nombre(r['prix_catalogue']),
+                                '%s MAD' % _fr_nombre(r['prix_solde']),
+                                '−%s %%' % _fr_nombre(r['remise']),
+                                r['debut'], _fr_nombre(r['vendu_depuis']),
+                                ('terminée' if r['expiree']
+                                 else ('vendu' if r['vendu_depuis']
+                                       else 'rien vendu'))]
+                               for r in dedans[:self.ASSISTANT_DETAIL_MAX]],
+                    'cles': ['ref:%s' % r['article_id']
+                             for r in dedans[:self.ASSISTANT_DETAIL_MAX]],
+                    'aide_clic': "Cliquez une référence pour voir où elle est soldée.",
+                    'tronque': len(dedans) > self.ASSISTANT_DETAIL_MAX,
+                    'nb_total': len(dedans),
+                }
+
+            # Un magasin, une catégorie, un palier ou un total : dans tous
+            # les cas une liste de références, presentée pareil.
+            if cle.startswith('mag:'):
+                champ = cle[4:]
+                choix = [r for r in a_traiter
+                         if any(m['shop_field'] == champ
+                                for m in (r.get('magasins_soldables') or []))]
+                nom = ''
+                for r in choix:
+                    for m in r['magasins_soldables']:
+                        if m['shop_field'] == champ:
+                            nom = m['libelle']
+                            break
+                    if nom:
+                        break
+                titre = 'Ce qui dort à %s' % (nom or champ)
+                resume = ("%s références dorment dans ce magasin. La colonne « Stock ici » "
+                          "est ce que CE magasin détient : c'est sur cette quantité que la "
+                          "remise agira." % _fr_nombre(len(choix)))
+                stock_local = {}
+                for r in choix:
+                    for m in r['magasins_soldables']:
+                        if m['shop_field'] == champ:
+                            stock_local[r['article_id']] = m['stock']
+                choix.sort(key=lambda r: -stock_local.get(r['article_id'], 0))
+                return {
+                    'titre': titre, 'resume': resume,
+                    'colonnes': ['Référence', 'Catégorie', 'Stock ici', 'Stock réseau',
+                                 'Où solder', 'Dernière vente', 'Remise', 'Prix soldé'],
+                    'lignes': [[r['reference'], r['categorie'] or '—',
+                                _fr_nombre(stock_local.get(r['article_id'], 0)),
+                                _fr_nombre(r['stock']),
+                                '%s magasin%s' % (r['nb_soldables'],
+                                                  's' if r['nb_soldables'] > 1 else ''),
+                                'jamais' if r['jamais_vendu']
+                                else '%s j' % _fr_nombre(r['jours_sans_vente']),
+                                '−%s %%' % r['remise'],
+                                '%s MAD' % _fr_nombre(r['prix_solde'])]
+                               for r in choix[:self.ASSISTANT_DETAIL_MAX]],
+                    'cles': ['ref:%s' % r['article_id']
+                             for r in choix[:self.ASSISTANT_DETAIL_MAX]],
+                }
+
+            if cle.startswith('cat:'):
+                nom = cle[4:]
+                # Meme raison qu'au-dessus : une categorie peut n'avoir que
+                # des references deja soldees, toujours bloquees.
+                choix = [r for r in rows if (r['categorie'] or 'Sans catégorie') == nom]
+                titre = 'Catégorie %s' % nom
+                resume = ("%s références, %s pièces, %s MAD immobilisés."
+                          % (_fr_nombre(len(choix)),
+                             _fr_nombre(sum(r['stock'] for r in choix)),
+                             _fr_nombre(sum(r['valeur_totale'] for r in choix))))
+            else:
+                palier = ([x for x in self._soldes_paliers_anciennete() if x[0] == cle]
+                          or [None])[0]
+                if not palier:
+                    return {'error': "Détail inconnu pour cette ligne."}
+                _code, nom, test, conseil = palier
+                choix = [r for r in rows if test(r)]
+                titre = 'Dernière vente : %s' % nom
+                resume = ("%s références, %s pièces, %s MAD immobilisés. Ce que ça appelle : "
+                          "%s." % (_fr_nombre(len(choix)),
+                                   _fr_nombre(sum(r['stock'] for r in choix)),
+                                   _fr_nombre(sum(r['valeur_totale'] for r in choix)),
+                                   conseil))
+
+            choix = sorted(choix, key=lambda r: -r['valeur_totale'])
+            return {
+                'titre': titre, 'resume': resume,
+                'colonnes': ['Référence', 'Catégorie', 'Stock magasins', 'Dépôt',
+                             'Où solder', 'Dernière vente', 'Remise', 'Prix soldé'],
+                'lignes': [[r['reference'], r['categorie'] or '—', _fr_nombre(r['stock']),
+                            _fr_nombre(r['depot']),
+                            '%s / %s' % (r['nb_soldables'], r['nb_magasins']),
+                            'jamais' if r['jamais_vendu']
+                            else '%s j' % _fr_nombre(r['jours_sans_vente']),
+                            '−%s %%' % r['remise'],
+                            '%s MAD' % _fr_nombre(r['prix_solde'])]
+                           for r in choix[:self.ASSISTANT_DETAIL_MAX]],
+                'cles': ['ref:%s' % r['article_id'] for r in choix[:self.ASSISTANT_DETAIL_MAX]],
+                'tronque': len(choix) > self.ASSISTANT_DETAIL_MAX,
+                'nb_total': len(choix),
+            }
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_assistant_detail: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/soldes-appliquer-lot', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_soldes_appliquer_lot(self, **kw):
+        """Applique la remise conseillée à plusieurs références d'un coup.
+
+        `lignes` = [{'article_id': 12, 'remise': 30, 'magasins': [...]}, ...].
+        Par défaut, les magasins retenus sont ceux qui ont du stock ET une
+        caisse : démarquer là où il n'y a rien n'a pas de sens. `magasins`
+        (des `shop_field`) restreint encore cette liste, pour une opération
+        qui ne concerne qu'une partie du réseau.
+        """
+        try:
+            lignes = kw.get('lignes') or []
+            if not lignes:
+                return {'error': 'Aucune référence sélectionnée.'}
+            if len(lignes) > 100:
+                return {'error': "Trop de références d'un coup (100 au maximum)."}
+            date_start, date_end = self._solde_dates_operation(
+                (kw.get('date_start') or '').strip(),
+                (kw.get('date_end') or '').strip())
+
+            resultats = []
+            faits = magasins_total = 0
+            op_categories = self._solde_operation().get('categories') or []
+            for ligne in lignes:
+                try:
+                    aid = int(ligne.get('article_id') or 0)
+                    remise = float(ligne.get('remise') or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not aid or not (0 < remise < 100):
+                    continue
+                tmpl = request.env['product.template'].sudo().browse(aid).exists()
+                nom = tmpl.name if tmpl else str(aid)
+                if op_categories and (not tmpl or tmpl.categ_id.id not in op_categories):
+                    resultats.append({'article_id': aid, 'reference': nom, 'ok': False,
+                                      'message': "Hors des catégories de l'opération."})
+                    continue
+                ctx = self.api_solde_context(product_tmpl_id=aid)
+                if ctx.get('error'):
+                    resultats.append({'article_id': aid, 'reference': nom,
+                                      'ok': False, 'message': ctx['error']})
+                    continue
+                catalogue = float(ctx.get('prix_catalogue_ttc') or 0)
+                prix = _arrondi_prix_solde(round(catalogue * (100 - remise) / 100.0, 2))
+                cibles = [m for m in (ctx.get('magasins') or [])
+                          if (m.get('stock') or 0) > 0 and m.get('caisses')]
+                # L'ecran peut restreindre la remise a certains magasins :
+                # une operation ne se fait pas toujours partout.
+                choisis = ligne.get('magasins')
+                if choisis:
+                    garde = set(choisis)
+                    cibles = [m for m in cibles if m['shop_field'] in garde]
+                if not cibles or prix <= 0:
+                    resultats.append({
+                        'article_id': aid, 'reference': ctx.get('reference') or nom,
+                        'ok': False,
+                        'message': "Aucun magasin avec du stock et une caisse."
+                                   if not cibles else "Prix soldé invalide."})
+                    continue
+                res = self.api_solde_apply(
+                    product_tmpl_id=aid, prix_ttc=prix, mode='pricelist',
+                    date_start=date_start, date_end=date_end,
+                    magasins=[{'shop_field': m['shop_field'],
+                               'nom_liste': '' if m.get('liste') else m.get('nom_propose')}
+                              for m in cibles])
+                ok = bool(res.get('ok'))
+                faits += 1 if ok else 0
+                magasins_total += len(cibles) if ok else 0
+                resultats.append({
+                    'article_id': aid,
+                    'reference': ctx.get('reference') or nom,
+                    'ok': ok,
+                    'remise': int(remise),
+                    'prix': prix,
+                    'magasins': len(cibles),
+                    'message': '' if ok else (res.get('error') or 'Échec'),
+                })
+            _vider_cache_dashboard()
+            _logger.info("Soldes en lot par %s : %s/%s references, %s magasins",
+                         request.env.user.login, faits, len(resultats), magasins_total)
+            return {'ok': faits > 0, 'faits': faits, 'total': len(resultats),
+                    'magasins': magasins_total, 'resultats': resultats}
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_soldes_appliquer_lot: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/assistant', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_assistant(self, **kw):
+        """Répond à UNE question fermée, avec les chiffres du moment."""
+        try:
+            question = (kw.get('question') or '').strip()
+            if not question:
+                return {'questions': self.ASSISTANT_QUESTIONS}
+            data = self.api_soldes_proposition(**kw)
+            if data.get('error'):
+                return {'error': data['error']}
+            rows = data.get('rows') or []
+            k = data.get('kpis') or {}
+            p = data.get('params') or {}
+            a_traiter = [r for r in rows if not r['deja_solde']]
+
+            if question == 'solder_semaine':
+                choix = [r for r in a_traiter if r['urgence'] == 'urgent'][:10]
+                if not choix:
+                    choix = a_traiter[:10]
+                pieces = sum(r['stock'] for r in choix)
+                valeur = sum(r['valeur_totale'] for r in choix)
+                return {
+                    'titre': 'À solder cette semaine',
+                    'resume': ("%s références · %s pièces en rayon · %s MAD bloqués."
+                               % (len(choix), _fr_nombre(pieces), _fr_nombre(valeur))),
+                    'colonnes': ['Référence', 'Stock magasins', 'Dépôt', 'Où solder',
+                                 'Remise', 'Prix soldé'],
+                    'lignes': [[r['reference'], _fr_nombre(r['stock']), _fr_nombre(r['depot']),
+                                '%s magasin%s' % (r['nb_soldables'],
+                                                  's' if r['nb_soldables'] > 1 else ''),
+                                '−%s %%' % r['remise'], '%s MAD' % _fr_nombre(r['prix_solde'])]
+                               for r in choix],
+                    'cles': ['ref:%s' % r['article_id'] for r in choix],
+                    'aide_clic': "Cliquez une référence pour voir les magasins exacts à solder.",
+                    'articles': [r['article_id'] for r in choix],
+                }
+
+            if question == 'habitudes_categorie':
+                cal = self._soldes_remises_pratiquees()
+                habitudes = cal.get('habitudes') or []
+                if not habitudes:
+                    return {
+                        'titre': 'Vos remises par catégorie',
+                        'resume': ("Aucune catégorie ne compte encore %s remises posées : "
+                                   "les propositions se calent sur le relevé global."
+                                   % self.SOLDES_MIN_REGLES_CATEGORIE),
+                        'colonnes': [], 'lignes': [],
+                    }
+                # Combien de references a solder chaque habitude gouverne.
+                gouvernees = {}
+                for r in a_traiter:
+                    if r.get('remise_source') == 'categorie':
+                        gouvernees[r['categorie']] = gouvernees.get(r['categorie'], 0) + 1
+                return {
+                    'titre': 'Vos remises par catégorie',
+                    'resume': ("%s catégories · elles calibrent %s des %s références "
+                               "à traiter."
+                               % (len(habitudes), _fr_nombre(sum(gouvernees.values())),
+                                  _fr_nombre(len(a_traiter)))),
+                    'colonnes': ['Catégorie', 'La plus faible',
+                                 "D'habitude", 'Quand vous allez fort', 'La plus forte',
+                                 'Références concernées'],
+                    'lignes': [[h['categorie'],
+                                '−%s %%' % h['mini'],
+                                '−%s %%' % h['niveau_normal'],
+                                '−%s %%' % h['niveau_fort'],
+                                '−%s %%' % h['maxi'],
+                                _fr_nombre(gouvernees.get(h['categorie'], 0))]
+                               for h in habitudes],
+                    # Pas de cle quand la categorie n'a plus rien a traiter :
+                    # son habitude vient du passe, pas du stock actuel.
+                    'cles': ['cat:%s' % h['categorie'] if gouvernees.get(h['categorie'])
+                             else '' for h in habitudes],
+                    'aide_clic': "Cliquez une catégorie pour voir ses références à solder.",
+                }
+
+            if question == 'moment_vente':
+                depuis = fields.Datetime.now() - timedelta(days=90)
+                request.env.cr.execute("""
+                    SELECT w.name, EXTRACT(ISODOW FROM x.d)::int, EXTRACT(HOUR FROM x.d)::int,
+                           COUNT(DISTINCT x.oid), COALESCE(SUM(x.qte), 0)
+                      FROM (SELECT po.id AS oid, pol.qty AS qte,
+                                   (po.date_order AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Casablanca' AS d,
+                                   spt.warehouse_id AS wid
+                              FROM pos_order_line pol
+                              JOIN pos_order po ON po.id = pol.order_id
+                              JOIN pos_session ps ON ps.id = po.session_id
+                              JOIN pos_config pc ON pc.id = ps.config_id
+                              JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                             WHERE po.state IN ('paid', 'done', 'invoiced')
+                               AND po.date_order >= %s) x
+                      JOIN stock_warehouse w ON w.id = x.wid
+                     GROUP BY 1, 2, 3
+                """, (depuis,))
+                jours = ['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'dimanche']
+                heures = list(range(8, 24))
+                par = {}
+                articles_jour = [0.0] * 7
+                articles_heure = [0.0] * 24
+                for nom, dow, h, tickets, qte in request.env.cr.fetchall():
+                    qte = float(qte or 0)
+                    d = par.setdefault(nom, {'jour': {}, 'heure': {}, 'tickets_heure': {}, 'tickets': 0})
+                    d['jour'][dow] = d['jour'].get(dow, 0) + qte
+                    d['heure'][h] = d['heure'].get(h, 0) + qte
+                    d['tickets_heure'][h] = d['tickets_heure'].get(h, 0) + tickets
+                    d['tickets'] += tickets
+                    articles_jour[dow - 1] += qte
+                    articles_heure[h] += qte
+                lignes = []
+                for nom in sorted(par):
+                    d = par[nom]
+                    bj = max(d['jour'], key=d['jour'].get)
+                    bh = max(d['heure'], key=d['heure'].get)
+                    lignes.append([nom, jours[bj - 1], '%02dh – %02dh' % (bh, (bh + 1) % 24),
+                                   _fr_nombre(d['tickets_heure'][bh]), _fr_nombre(d['tickets'])])
+                return {
+                    'titre': 'Quel moment vend le mieux (90 derniers jours, heure du Maroc)',
+                    'resume': '',
+                    'colonnes': ['Magasin', 'Meilleur jour', 'Meilleure heure', 'Tickets dans cette heure', 'Tickets sur 90 jours'],
+                    'lignes': lignes,
+                    'cles': [],
+                    'graphiques': [
+                        {'titre': 'Articles vendus par jour de la semaine', 'type': 'colonnes', 'unite': 'articles',
+                         'items': [{'nom': jours[j].capitalize(), 'valeur': round(articles_jour[j], 0),
+                                    'fort': articles_jour[j] == max(articles_jour), 'detail': ''}
+                                   for j in range(7)],
+                         'legende': 'Nombre d’articles vendus, tous magasins confondus, 90 derniers jours.'},
+                        {'titre': 'Articles vendus par heure', 'type': 'colonnes', 'unite': 'articles',
+                         'items': [{'nom': '%02dh' % h, 'valeur': round(articles_heure[h], 0),
+                                    'fort': articles_heure[h] == max(articles_heure[x] for x in heures),
+                                    'detail': '%02dh – %02dh' % (h, (h + 1) % 24)} for h in heures],
+                         'legende': 'Nombre d’articles vendus par heure, tous magasins confondus, 90 derniers jours. La barre pleine est l’heure la plus forte.'},
+                    ],
+                }
+
+            if question == 'remise_qui_marche':
+                cal = self._soldes_remises_pratiquees()
+                bandes = [b for b in (cal.get('bandes') or [])
+                          if b['regles'] >= self.SOLDES_MIN_REGLES_BANDE]
+                if not bandes:
+                    return {
+                        'titre': 'Quelle remise marche le mieux',
+                        'resume': ("Pas encore assez de remises posées pour en tirer une "
+                                   "règle : il en faut au moins %s par tranche de 10 points. "
+                                   "Les paliers conseillés restent ceux des réglages."
+                                   % self.SOLDES_MIN_REGLES_BANDE),
+                        'colonnes': [], 'lignes': [],
+                    }
+                meilleure = max(bandes, key=lambda b: b['par_regle'])
+                return {
+                    'titre': 'Quelle remise marche le mieux ici',
+                    'resume': ("La tranche %s à %s %% est la plus efficace : %s pièces "
+                               "vendues par remise posée."
+                               % (meilleure['de'], meilleure['a'],
+                                  _fr_nombre(meilleure['par_regle']))),
+                    'colonnes': ['Tranche de remise', 'Pièces vendues',
+                                 'Palier habituel'],
+                    # Tri par pieces vendues : le critere d'efficacite n'etant
+                    # plus affiche, classer dessus donnerait un ordre
+                    # incomprehensible.
+                    'lignes': [['%s à %s %%' % (b['de'], b['a']),
+                                _fr_nombre(b['pieces']),
+                                '−%s %%' % b['niveau']]
+                               for b in sorted(bandes, key=lambda b: -b['pieces'])],
+                    'cles': ['bande:%s-%s' % (b['de'], b['a'])
+                             for b in sorted(bandes, key=lambda b: -b['pieces'])],
+                    'aide_clic': "Cliquez une tranche pour voir ce qui y a été soldé.",
+                    # En colonnes, rangees par REMISE croissante : c'est la
+                    # forme qui parle — ca monte jusqu'au pic, puis ca
+                    # retombe. Trie par volume, cette chute ne se verrait
+                    # plus.
+                    'graphique': {
+                        'type': 'colonnes',
+                        'unite': 'pièces',
+                        'items': [{
+                            'nom': '%s-%s' % (b['de'], b['a']),
+                            'valeur': b['pieces'],
+                            'fort': b['de'] == meilleure['de'],
+                            'cle': 'bande:%s-%s' % (b['de'], b['a']),
+                            'detail': ('%s remises posées · palier habituel −%s %% · '
+                                       '%s pièces vendues depuis'
+                                       % (_fr_nombre(b['regles']), b['niveau'],
+                                          _fr_nombre(b['pieces']))),
+                        } for b in sorted(bandes, key=lambda b: b['de'])],
+                        'legende': ('hauteur = pièces vendues · la tranche %s à %s %% '
+                                    'est la plus efficace'
+                                    % (meilleure['de'], meilleure['a'])),
+                    },
+                }
+
+            if question == 'ou_solder':
+                # Une operation se decide magasin par magasin : celui qui
+                # porte le plus de dormant est celui qui en souffre le plus.
+                par_mag = {}
+                for r in a_traiter:
+                    for m in (r.get('magasins_soldables') or []):
+                        d = par_mag.setdefault(m['shop_field'], {
+                            'shop_field': m['shop_field'],
+                            'libelle': m['libelle'], 'societe': m['societe'],
+                            'refs': 0, 'pieces': 0, 'valeur': 0.0, 'urgentes': 0})
+                        d['refs'] += 1
+                        d['pieces'] += m['stock']
+                        d['valeur'] += m['stock'] * r['prix_ttc']
+                        d['urgentes'] += 1 if r['urgence'] == 'urgent' else 0
+                classe = sorted(par_mag.values(), key=lambda d: -d['valeur'])
+                sans_caisse = sum(1 for r in a_traiter
+                                  if r.get('nb_magasins', 0) > r.get('nb_soldables', 0))
+                return {
+                    'titre': 'Où solder',
+                    # Le graphique dit deja tout : magasins, references,
+                    # urgentes. On ne garde que l'avertissement, s'il y a
+                    # lieu — lui seul n'a pas d'equivalent visuel.
+                    'resume': (("%s références ont du stock dans un magasin sans caisse."
+                               % _fr_nombre(sans_caisse)) if sans_caisse else ''),
+                    'colonnes': ['Magasin', 'Société', 'Références', 'Dont urgentes',
+                                 'Pièces'],
+                    'lignes': [[d['libelle'], d['societe'], _fr_nombre(d['refs']),
+                                _fr_nombre(d['urgentes']), _fr_nombre(d['pieces'])]
+                               for d in classe],
+                    'cles': ['mag:%s' % d['shop_field'] for d in classe],
+                    'aide_clic': "Cliquez un magasin pour voir ce qui y dort.",
+                    # Des barres : l'argent bloque par magasin, et le nombre
+                    # de references urgentes qu'il porte.
+                    'graphique': {
+                        'type': 'barres',
+                        'unite': 'MAD',
+                        'items': [{
+                            'nom': d['libelle'],
+                            'sous': d['societe'],
+                            'valeur': round(d['valeur'], 2),
+                            # Deux comptes distincts : tout ce qui dort ici,
+                            # et la part dont le depot garde encore du stock.
+                            'refs': d['refs'],
+                            'alerte': d['urgentes'],
+                            'cle': 'mag:%s' % d['shop_field'],
+                            'detail': ('%s références dormantes · %s pièces · dont %s '
+                                       'urgentes'
+                                       % (_fr_nombre(d['refs']), _fr_nombre(d['pieces']),
+                                          _fr_nombre(d['urgentes']))),
+                        } for d in classe],
+                        'legende': ("« réf. » = références qui dorment dans ce "
+                                    "magasin · la pastille rouge = celles dont le dépôt "
+                                    "garde encore du stock"),
+                    },
+                }
+
+            if question == 'categories_dorment':
+                # Diagnostic, pas une liste d'action : on compte TOUT ce qui
+                # dort, meme une reference qui porte deja une regle de prix
+                # sans avoir vendu. Sinon une categorie à 100 % deja soldee
+                # disparait entierement, alors que son stock est toujours
+                # bloque.
+                par_cat = {}
+                for r in rows:
+                    d = par_cat.setdefault(r['categorie'] or 'Sans catégorie', {
+                        'refs': 0, 'pieces': 0, 'valeur': 0.0, 'jamais': 0})
+                    d['refs'] += 1
+                    d['pieces'] += r['stock']
+                    d['valeur'] += r['valeur_totale']
+                    d['jamais'] += 1 if r['jamais_vendu'] else 0
+                classe = sorted(par_cat.items(), key=lambda kv: -kv[1]['valeur'])
+                total = sum(d['valeur'] for _n, d in classe) or 1.0
+                return {
+                    'titre': 'Où dort l\u2019argent, par catégorie',
+                    'resume': ("%s catégories · la première concentre %s %% de l'argent "
+                               "bloqué."
+                               % (len(classe),
+                                  _fr_nombre(round(classe[0][1]['valeur'] * 100.0 / total, 1))
+                                  if classe else 0)),
+                    'colonnes': ['Catégorie', 'Références', 'Jamais vendues', 'Pièces'],
+                    'lignes': [[nom, _fr_nombre(d['refs']), _fr_nombre(d['jamais']),
+                                _fr_nombre(d['pieces'])]
+                               for nom, d in classe],
+                    'cles': ['cat:%s' % nom for nom, _d in classe],
+                    'aide_clic': "Cliquez une catégorie pour voir ses références.",
+                    # La carte : un rectangle par categorie, sa taille est
+                    # l'argent bloque. Les nombres sont bruts, le dessin se
+                    # fait a l'ecran.
+                    'graphique': {
+                        'type': 'carte',
+                        'unite': 'MAD',
+                        'items': [{
+                            'nom': nom,
+                            'valeur': round(d['valeur'], 2),
+                            'cle': 'cat:%s' % nom,
+                            'detail': ('%s références · %s pièces'
+                                       % (_fr_nombre(d['refs']), _fr_nombre(d['pieces']))),
+                        } for nom, d in classe],
+                    },
+                }
+
+            if question == 'depuis_quand':
+                # Plus une reference dort, plus la remise doit etre franche :
+                # a six mois, une petite remise ne la reveillera pas.
+                lignes = []
+                cles = []
+                segments = []
+                for code, nom, test, conseil in self._soldes_paliers_anciennete():
+                    lot = [r for r in rows if test(r)]
+                    if not lot:
+                        continue
+                    valeur_lot = sum(r['valeur_totale'] for r in lot)
+                    lignes.append([nom, _fr_nombre(len(lot)),
+                                   _fr_nombre(sum(r['stock'] for r in lot)),
+                                   conseil])
+                    cles.append(code)
+                    segments.append({
+                        'nom': nom, 'cle': code, 'conseil': conseil,
+                        'valeur': round(valeur_lot, 2),
+                        'refs': len(lot),
+                        'pieces': sum(r['stock'] for r in lot),
+                    })
+                jamais = [r for r in rows if r['jamais_vendu']]
+                return {
+                    'titre': 'Depuis combien de temps ça dort',
+                    # Le segment rouge de la barre dit deja le nombre de
+                    # references et de pieces jamais vendues.
+                    'resume': '',
+                    'colonnes': ['Dernière vente', 'Références', 'Pièces',
+                                 'Ce que ça appelle'],
+                    'lignes': lignes,
+                    'cles': cles,
+                    'aide_clic': "Cliquez une tranche pour voir ses références.",
+                    # Une seule barre, decoupee par anciennete : on voit la
+                    # part de chaque tranche sans comparer des nombres.
+                    'graphique': {'type': 'segments', 'unite': 'MAD',
+                                  'items': segments},
+                }
+
+            if question == 'deja_soldees':
+                faites = [r for r in rows if r['deja_solde']]
+                if not faites:
+                    return {'titre': 'Soldes déjà posées',
+                            'resume': "Aucune remise n'est posée sur ces références.",
+                            'colonnes': [], 'lignes': []}
+                dort_encore = [r for r in faites if r['jamais_vendu']
+                               or (r['jours_sans_vente'] or 0) > p.get('fenetre', 90)]
+                return {
+                    'titre': 'Soldes déjà posées',
+                    'resume': ("%s références déjà soldées · %s n'ont rien vendu depuis "
+                               "plus de %s jours."
+                               % (_fr_nombre(len(faites)), _fr_nombre(len(dort_encore)),
+                                  p.get('fenetre'))),
+                    'colonnes': ['Référence', 'Remise en place', 'Stock magasins', 'Dépôt',
+                                 'Où solder', 'Vendu', 'Dernière vente'],
+                    'lignes': [[r['reference'], r['solde_en_place'] or '—',
+                                _fr_nombre(r['stock']), _fr_nombre(r['depot']),
+                                '%s magasin%s' % (r['nb_soldables'],
+                                                  's' if r['nb_soldables'] > 1 else ''),
+                                _fr_nombre(r['vendu']),
+                                'jamais' if r['jamais_vendu']
+                                else '%s j' % _fr_nombre(r['jours_sans_vente'])]
+                               for r in sorted(dort_encore or faites,
+                                               key=lambda x: -x['valeur_totale'])[:15]],
+                    'cles': ['ref:%s' % r['article_id']
+                             for r in sorted(dort_encore or faites,
+                                             key=lambda x: -x['valeur_totale'])[:15]],
+                    'aide_clic': "Cliquez une référence pour voir où la remise est posée.",
+                    'articles': [r['article_id'] for r in (dort_encore or faites)[:15]],
+                }
+
+            if question == 'remise_reference':
+                try:
+                    aid = int(kw.get('article_id') or 0)
+                except (TypeError, ValueError):
+                    aid = 0
+                ligne = ([r for r in rows if r['article_id'] == aid] or [None])[0]
+                if not ligne:
+                    return {'titre': 'Quelle remise ?',
+                            'resume': "Choisissez une référence dans la liste ci-dessous.",
+                            'colonnes': [], 'lignes': []}
+                raisons = []
+                if ligne['vendu'] == 0:
+                    raisons.append("elle n'a rien vendu sur les %s derniers jours"
+                                   % p.get('fenetre'))
+                elif ligne['couverture_jours']:
+                    raisons.append("son stock met %s jours à s'écouler au rythme actuel"
+                                   % _fr_nombre(ligne['couverture_jours']))
+                if ligne['depot']:
+                    raisons.append("le dépôt en garde encore %s pièces"
+                                   % _fr_nombre(ligne['depot']))
+                raisons.append("elle occupe %s pièces dans %s magasin%s"
+                               % (_fr_nombre(ligne['stock']), ligne['nb_magasins'],
+                                  's' if ligne['nb_magasins'] > 1 else ''))
+                return {
+                    'titre': 'Remise conseillée : −%s %%' % ligne['remise'],
+                    'resume': ("%s passe de %s MAD à %s MAD TTC. Pourquoi ce niveau : %s."
+                               % (ligne['reference'], _fr_nombre(ligne['prix_ttc']),
+                                  _fr_nombre(ligne['prix_solde']), ', '.join(raisons))),
+                    'colonnes': ['Mesure', 'Valeur'],
+                    'lignes': [
+                        ['Acheté', _fr_nombre(ligne['achete'])],
+                        ['Vendu sur la période', _fr_nombre(ligne['vendu'])],
+                        ['Stock magasins', _fr_nombre(ligne['stock'])],
+                        ['Encore au dépôt', _fr_nombre(ligne['depot'])],
+                        ['Prix catalogue TTC', '%s MAD' % _fr_nombre(ligne['prix_ttc'])],
+                        ['Prix soldé', '%s MAD' % _fr_nombre(ligne['prix_solde'])],
+                    ],
+                    'articles': [ligne['article_id']],
+                }
+
+            return {'error': 'Question inconnue.'}
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_assistant: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/soldes-proposition', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_soldes_proposition(self, **kw):
+        """Les références à démarquer, de la plus coûteuse à garder à la
+        moins coûteuse."""
+        try:
+            p = self._soldes_params(kw)
+            warehouses, wh_labels = self._reassort_warehouses(kw)
+            if not warehouses:
+                return {'error': "Aucun magasin actif."}
+            wh_ids = warehouses.ids
+            ref_date = self._reassort_reference_date(wh_ids)
+            debut = ref_date - timedelta(days=p['fenetre'])
+
+            filtres = self._mfl_sans_test_sql('pt')
+            params = {'wh': wh_ids, 'd1': str(debut) + ' 00:00:00',
+                      'd2': str(ref_date) + ' 23:59:59',
+                      'socs': warehouses.mapped('company_id').ids or [-1]}
+            sachets = self._get_sachet_variant_ids()
+            if sachets:
+                filtres += ' AND NOT (pp.id = ANY(%(sachets)s))'
+                params['sachets'] = list(sachets)
+            if self._filtre_produit_actif(kw):
+                params['tmpls'] = request.env['product.template'].sudo().search(
+                    self._build_product_domain(kw)).ids or [-1]
+                filtres += ' AND pt.id = ANY(%(tmpls)s)'
+
+            request.env.cr.execute("""
+                WITH stock AS (
+                    SELECT pp.product_tmpl_id AS tmpl, l.warehouse_id AS wh,
+                           SUM(q.quantity) AS qte
+                      FROM stock_quant q
+                      JOIN stock_location l ON l.id = q.location_id
+                      JOIN product_product pp ON pp.id = q.product_id
+                      JOIN product_template pt ON pt.id = pp.product_tmpl_id
+                     WHERE l.usage = 'internal' AND l.warehouse_id = ANY(%(wh)s)
+                       AND q.quantity > 0 AND pt.active AND pp.active
+                       {FILTRES}
+                     GROUP BY 1, 2
+                ), ventes AS (
+                    SELECT pp.product_tmpl_id AS tmpl,
+                           SUM(pol.qty) AS qte,
+                           MAX(po.date_order) AS derniere
+                      FROM pos_order_line pol
+                      JOIN pos_order po ON po.id = pol.order_id
+                      JOIN pos_session ps ON ps.id = po.session_id
+                      JOIN pos_config pc ON pc.id = ps.config_id
+                      JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                      JOIN product_product pp ON pp.id = pol.product_id
+                     WHERE po.state IN ('paid', 'done', 'invoiced')
+                       AND spt.warehouse_id = ANY(%(wh)s)
+                       AND po.date_order BETWEEN %(d1)s AND %(d2)s
+                     GROUP BY 1
+                ), achats AS (
+                    SELECT pp.product_tmpl_id AS tmpl,
+                           SUM(pol.qty_received) AS qte
+                      FROM purchase_order_line pol
+                      JOIN purchase_order po ON po.id = pol.order_id
+                      JOIN product_product pp ON pp.id = pol.product_id
+                     WHERE po.company_id = ANY(%(socs)s)
+                       AND po.state IN ('purchase', 'done')
+                     GROUP BY 1
+                ), toutes_ventes AS (
+                    SELECT pp.product_tmpl_id AS tmpl, MAX(po.date_order) AS derniere
+                      FROM pos_order_line pol
+                      JOIN pos_order po ON po.id = pol.order_id
+                      JOIN pos_session ps ON ps.id = po.session_id
+                      JOIN pos_config pc ON pc.id = ps.config_id
+                      JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                      JOIN product_product pp ON pp.id = pol.product_id
+                     WHERE po.state IN ('paid', 'done', 'invoiced')
+                       AND spt.warehouse_id = ANY(%(wh)s)
+                     GROUP BY 1
+                )
+                SELECT s.tmpl,
+                       SUM(s.qte) AS stock_total,
+                       COUNT(DISTINCT s.wh) AS nb_magasins,
+                       ARRAY_AGG(s.wh ORDER BY s.wh) AS entrepots,
+                       ARRAY_AGG(s.qte ORDER BY s.wh) AS quantites,
+                       COALESCE(MAX(v.qte), 0) AS vendu,
+                       MAX(tv.derniere) AS derniere_vente,
+                       COALESCE(MAX(a.qte), 0) AS achete
+                  FROM stock s
+                  LEFT JOIN ventes v ON v.tmpl = s.tmpl
+                  LEFT JOIN toutes_ventes tv ON tv.tmpl = s.tmpl
+                  LEFT JOIN achats a ON a.tmpl = s.tmpl
+                 GROUP BY s.tmpl
+            """.replace('{FILTRES}', filtres), params)
+            brut = request.env.cr.fetchall()
+            if not brut:
+                return {'rows': [], 'kpis': {}, 'params': p}
+
+            tmpl_ids = [r[0] for r in brut]
+            fiches = {t['id']: t for t in request.env['product.template'].sudo().search_read(
+                [('id', 'in', tmpl_ids)],
+                ['name', 'default_code', 'base_pivot_reference', 'list_price', 'categ_id'])}
+            deja = self._soldes_deja_en_place(tmpl_ids)
+            # La photo de chaque reference : on ne montre que celles dont le
+            # fichier existe reellement, sinon la ligne afficherait un cadre
+            # vide a la place d'un article.
+            photos = self._image_availability(tmpl_ids)
+
+            # Ce qu'il reste au DEPOT sur ces memes references : une
+            # reference qui dort en magasin et dont le depot garde encore du
+            # stock coute des deux cotes, et le depot ne peut pas la placer.
+            depot = self._societe_depot()
+            stock_depot = {}
+            if depot:
+                request.env.cr.execute("""
+                    SELECT pp.product_tmpl_id, SUM(q.quantity)
+                      FROM stock_quant q
+                      JOIN stock_location l ON l.id = q.location_id
+                      JOIN product_product pp ON pp.id = q.product_id
+                     WHERE l.usage = 'internal' AND l.company_id = %s
+                       AND pp.product_tmpl_id = ANY(%s) AND q.quantity > 0
+                     GROUP BY 1
+                """, (depot.id, tmpl_ids))
+                stock_depot = {t: float(q or 0)
+                               for t, q in request.env.cr.fetchall()}
+
+            # Le prix affiche doit etre CELUI DU POP-UP, sinon les deux
+            # ecrans se contredisent : list_price est HT, le pop-up le
+            # convertit en TTC avec la taxe de l'article. Meme helper ici.
+            societe_ref = warehouses[0].company_id if warehouses else request.env.company
+            ratios = {}
+            for tmpl in request.env['product.template'].sudo().browse(tmpl_ids):
+                ratios[tmpl.id] = self._solde_tax_ratio(tmpl, societe_ref)
+
+            # Ou une remise peut-elle etre posee ? Il faut une caisse
+            # physique : sans caisse, aucune liste de prix a modifier, la
+            # remise n'existerait nulle part. On le calcule une fois.
+            soldables = {}
+            for m in self._solde_mappings():
+                if self._solde_store_configs(m):
+                    soldables[m.warehouse_id.id] = {
+                        'shop_field': m.shop_field,
+                        'libelle': m.shop_label or m.warehouse_id.name,
+                        'societe': m.company_id.name,
+                    }
+
+            # Le calibrage des paliers, une fois pour toute la page.
+            pratiquees = ({} if p['mode_remise'] == 'fixe'
+                          else self._soldes_remises_pratiquees())
+            habitudes = pratiquees.get('par_categorie') or {}
+            usage_normal = pratiquees.get('usage_normal')
+            usage_fort = pratiquees.get('usage_fort')
+            echelle = pratiquees.get('echelle') or []
+
+            rows = []
+            valeur_totale = pieces_totales = 0.0
+            for (tmpl_id, stock_total, nb_mag, entrepots, quantites,
+                 vendu, derniere, achete) in brut:
+                stock_total = int(round(float(stock_total or 0)))
+                vendu = int(round(float(vendu or 0)))
+                if stock_total < p['stock_min']:
+                    continue
+                # Deux facons de dormir : ne rien vendre, ou vendre si
+                # lentement que le stock met des mois a s'ecouler.
+                vitesse = vendu / float(p['fenetre']) if vendu else 0.0
+                # Arrondi avant comparaison, comme la carte « Stock dormant » :
+                # le tableau affiche des jours entiers.
+                couverture = round(stock_total / vitesse) if vitesse else None
+                if vendu > 0 and (couverture or 0) <= p['couverture_min']:
+                    continue
+                fiche = fiches.get(tmpl_id) or {}
+                prix = float(fiche.get('list_price') or 0.0) * ratios.get(tmpl_id, 1.0)
+                valeur = stock_total * prix
+                jours = None
+                if derniere:
+                    jours = (ref_date - derniere.date()).days
+                # Deux paliers : remise forte si la reference n'a rien
+                # vendu sur la periode, ou si son stock met plus de deux
+                # fois le seuil a s'ecouler.
+                fort = (vendu == 0) or ((couverture or 0) >= 2 * p['couverture_min'])
+                categorie = (fiche['categ_id'][1] if fiche.get('categ_id') else '')
+                # Du precedent le plus proche au plus general : l'habitude
+                # de CETTE categorie d'abord, le releve global ensuite.
+                habitude = habitudes.get(categorie)
+                if habitude:
+                    remise = (habitude['niveau_fort'] if fort
+                              else habitude['niveau_normal'])
+                    source = 'categorie'
+                elif usage_fort:
+                    remise = usage_fort if fort else usage_normal
+                    source = 'general'
+                else:
+                    remise = p['remise2'] if fort else p['remise1']
+                    source = 'reglage'
+                pose = deja.get(tmpl_id) or {}
+                remise_en_place = int(pose.get('remise') or 0)
+                # Une remise deja posee n'a pas fait bouger la marchandise :
+                # en proposer autant ou moins ne servirait a rien.
+                if remise_en_place and remise <= remise_en_place:
+                    remise = self._soldes_palier_suivant(remise_en_place, echelle)
+                    source = 'accentuee'
+                remise = int(max(self.SOLDES_REMISE_MIN,
+                                 min(self.SOLDES_REMISE_MAX, remise)))
+                # Une remise deja au plafond ne peut plus monter : proposer
+                # MOINS que ce qui est pose serait un contresens. Ici la
+                # remise n'est plus le levier — il faut deplacer la
+                # marchandise ou la declasser.
+                remise_au_plafond = bool(remise_en_place and remise <= remise_en_place)
+                if remise_au_plafond:
+                    remise = remise_en_place
+                    source = 'plafond'
+                au_depot = int(round(stock_depot.get(tmpl_id, 0.0)))
+                valeur_depot = au_depot * prix
+                # Urgent = elle dort ici ET le depot en garde : personne ne
+                # peut l'ecouler, et la marchandise attend des deux cotes.
+                if au_depot > 0:
+                    urgence = 'urgent'
+                elif fort:
+                    urgence = 'forte'
+                else:
+                    urgence = 'normale'
+                # Les magasins de CETTE reference, avec leur stock, et
+                # ceux ou la remise peut reellement etre posee.
+                par_magasin = []
+                for wh_id, qte in zip(entrepots or [], quantites or []):
+                    info = soldables.get(wh_id)
+                    qte = int(round(float(qte or 0)))
+                    if qte <= 0:
+                        continue
+                    par_magasin.append({
+                        'warehouse_id': wh_id,
+                        'shop_field': (info or {}).get('shop_field'),
+                        'libelle': (info or {}).get('libelle') or '?',
+                        'societe': (info or {}).get('societe') or '',
+                        'stock': qte,
+                        'soldable': bool(info),
+                    })
+                par_magasin.sort(key=lambda x: (not x['soldable'], -x['stock']))
+                magasins_soldables = [x for x in par_magasin if x['soldable']]
+
+                rows.append({
+                    'article_id': tmpl_id,
+                    'depot': au_depot,
+                    'magasins': par_magasin,
+                    'magasins_soldables': magasins_soldables,
+                    'nb_soldables': len(magasins_soldables),
+                    'stock_soldable': sum(x['stock'] for x in magasins_soldables),
+                    'valeur_depot': round(valeur_depot, 2),
+                    'valeur_totale': round(valeur + valeur_depot, 2),
+                    'urgence': urgence,
+                    'reference': (fiche.get('base_pivot_reference')
+                                  or fiche.get('default_code')
+                                  or fiche.get('name') or '—'),
+                    'produit': fiche.get('name') or '—',
+                    'photo': self._image_url(tmpl_id, photos.get(tmpl_id)) or '',
+                    'categorie': fiche['categ_id'][1] if fiche.get('categ_id') else '',
+                    'stock': stock_total,
+                    'nb_magasins': int(nb_mag or 0),
+                    'vendu': vendu,
+                    'achete': int(round(float(achete or 0))),
+                    'couverture_jours': (int(round(couverture))
+                                         if couverture is not None else None),
+                    'jours_sans_vente': jours,
+                    'jamais_vendu': jours is None,
+                    'prix_ttc': round(prix, 2),
+                    'valeur': round(valeur, 2),
+                    'remise': remise,
+                    'prix_solde': _arrondi_prix_solde(round(prix * (100 - remise) / 100.0, 2)),
+                    'gain_attendu': round(valeur * remise / 100.0, 2),
+                    'deja_solde': bool(pose),
+                    'solde_en_place': pose.get('liste') or None,
+                    'remise_en_place': remise_en_place or None,
+                    'remise_au_plafond': remise_au_plafond,
+                    # D'ou vient la remise proposee : l'habitude de la
+                    # categorie, le releve general, l'accentuation d'une
+                    # remise en place, ou les reglages.
+                    'remise_source': source,
+                    'remise_source_regles': (habitude or {}).get('regles') or 0,
+                })
+                valeur_totale += valeur
+                pieces_totales += stock_total
+
+            rang = {'urgent': 0, 'forte': 1, 'normale': 2}
+            rows.sort(key=lambda r: (rang.get(r['urgence'], 3),
+                                     -r['valeur_totale'], r['reference']))
+            a_traiter = [r for r in rows if not r['deja_solde']]
+            urgentes = [r for r in a_traiter if r['urgence'] == 'urgent']
+            return {
+                'params': p,
+                'operation': self._solde_operation(),
+                'calibrage': pratiquees,
+                'portee': self._soldes_portee_reelle(),
+                'date_reference': ref_date.isoformat(),
+                'date_debut': debut.isoformat(),
+                'rows': rows[:self.SOLDES_MAX_LIGNES],
+                'tronque': len(rows) > self.SOLDES_MAX_LIGNES,
+                'nb_lignes_total': len(rows),
+                'kpis': {
+                    'nb_references': len(rows),
+                    'nb_a_traiter': len(a_traiter),
+                    'nb_deja_soldees': len(rows) - len(a_traiter),
+                    'pieces': int(round(pieces_totales)),
+                    'valeur': round(valeur_totale, 2),
+                    'valeur_a_traiter': round(sum(r['valeur'] for r in a_traiter), 2),
+                    # Le gisement « depot » : ce qui bloque des deux cotes.
+                    'nb_urgent': len(urgentes),
+                    'pieces_depot': int(round(sum(r['depot'] for r in urgentes))),
+                    'valeur_depot': round(sum(r['valeur_depot'] for r in urgentes), 2),
+                },
+            }
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_soldes_proposition: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    def _soldes_deja_en_place(self, tmpl_ids):
+        """{tmpl_id: {'liste', 'remise'}} pour les références qui portent
+        déjà une règle de solde.
+
+        La remise en place compte : on ne peut pas proposer moins que ce
+        qui est déjà posé, puisque la marchandise n'a pas bougé à ce
+        prix-là. On retient la remise la PLUS FORTE déjà en place.
+        """
+        if not tmpl_ids:
+            return {}
+        request.env.cr.execute("""
+            SELECT COALESCE(pi.product_tmpl_id, pp.product_tmpl_id) AS tmpl,
+                   MAX(COALESCE(pl.name->>'fr_FR', pl.name->>'en_US')) AS liste,
+                   MAX(CASE WHEN pi.compute_price = 'fixed' AND pt.list_price > 0
+                            THEN (1 - pi.fixed_price / pt.list_price) * 100.0
+                            ELSE COALESCE(pi.percent_price, 0) END) AS remise
+              FROM product_pricelist_item pi
+              JOIN product_pricelist pl ON pl.id = pi.pricelist_id
+              LEFT JOIN product_product pp ON pp.id = pi.product_id
+              JOIN product_template pt
+                ON pt.id = COALESCE(pi.product_tmpl_id, pp.product_tmpl_id)
+             WHERE COALESCE(pi.product_tmpl_id, pp.product_tmpl_id) = ANY(%s)
+             GROUP BY 1
+        """, (list(tmpl_ids),))
+        return {t: {'liste': nom, 'remise': int(round(float(rem or 0)))}
+                for t, nom, rem in request.env.cr.fetchall() if t}
 
     @http.route('/mavie/api/solde-context', type='json', auth='user', methods=['POST'], csrf=False)
     def api_solde_context(self, **kw):
@@ -8613,6 +12639,7 @@ class MaVieDashboardController(http.Controller):
             magasins.sort(key=lambda x: (x['societe'], x['magasin']))
             ratio_ref = ratio_ref or 1.0
             return {
+                'operation': self._solde_operation(),
                 'product_tmpl_id': tmpl.id,
                 'nom': tmpl.name,
                 'reference': tmpl.base_pivot_reference or tmpl.default_code or tmpl.name,
@@ -8981,6 +13008,7 @@ class MaVieDashboardController(http.Controller):
                     return {'error': erreur}
                 _logger.info("Programme %s créé par %s pour %s",
                              mode, request.env.user.login, tmpl.display_name)
+                _vider_cache_dashboard()
                 return {'ok': True, 'resultats': resultats, 'mode': mode}
 
             if mode == 'promotion':
@@ -8992,6 +13020,7 @@ class MaVieDashboardController(http.Controller):
                 _logger.info("Promotion solde par %s : %s -> %s TTC (%s)",
                              request.env.user.login, tmpl.display_name, prix_ttc,
                              ', '.join(r['magasin'] for r in resultats))
+                _vider_cache_dashboard()
                 return {'ok': True, 'resultats': resultats, 'promotion': True}
 
             Pricelist = request.env['product.pricelist'].sudo()
@@ -9061,6 +13090,7 @@ class MaVieDashboardController(http.Controller):
             _logger.info("Solde dashboard par %s : %s -> %s TTC dans %s",
                          request.env.user.login, tmpl.display_name + (' / ' + couleur if couleur else ''), prix_ttc,
                          ', '.join(r['magasin'] for r in resultats))
+            _vider_cache_dashboard()
             return {'ok': True, 'resultats': resultats}
         except Exception as e:
             _logger.error(f"Erreur api_solde_apply: {str(e)}", exc_info=True)

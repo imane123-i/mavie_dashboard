@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- ── Bon de réassort ──
+         DEMANDE UTILISATRICE (2026-09-28) : « quand je clique sur envoyer il
+         doit afficher le bon en PDF avec les détails du réassort, puis il
+         lance le réassort dans Base Pivot ».
+         (2026-09-29) : même chose pour « Commander au fournisseur ».
+
+         Le bon ne porte sur aucun enregistrement : il décrit ce qui VA être
+         envoyé ou commandé, avant que Base Pivot ne crée les documents. Il
+         est donc rendu depuis un dictionnaire (voir reassort_bon_pdf dans
+         controllers/dashboard.py), pas depuis un ir.actions.report lié à un
+         modèle.
+
+         `mode` vaut « vente » (le dépôt sert les magasins) ou « achat »
+         (le dépôt commande au fournisseur ce qu'il n'a pas). -->
+    <template id="report_reassort_template">
+        <t t-call="web.html_container">
+            <div class="page" style="font-family:Arial,Helvetica,sans-serif;color:#0F172A;">
+
+                <t t-set="est_achat" t-value="mode == 'achat'"/>
+
+                <div t-attf-style="border-bottom:2px solid #{'B45309' if est_achat else '6D28D9'};padding-bottom:10px;margin-bottom:16px;">
+                    <div style="font-size:20px;font-weight:700;">
+                        <t t-if="est_achat">Demande d'achat fournisseur</t>
+                        <t t-else="">Bon de réassort</t>
+                    </div>
+                    <div style="font-size:12px;color:#64748B;margin-top:2px;">
+                        <t t-if="est_achat">
+                            <t t-esc="depot_nom"/> → fournisseur <t t-esc="fournisseur or '—'"/>
+                        </t>
+                        <t t-else="">
+                            Dépôt <t t-esc="depot_nom"/> → magasins
+                        </t>
+                        · édité le <t t-esc="edite_le"/>
+                        <t t-if="edite_par"> · par <t t-esc="edite_par"/></t>
+                    </div>
+                </div>
+
+                <table style="width:100%;margin-bottom:16px;font-size:13px;">
+                    <tr>
+                        <td style="width:50%;vertical-align:top;">
+                            <div style="color:#64748B;font-size:11px;text-transform:uppercase;">Référence</div>
+                            <div style="font-size:16px;font-weight:700;"><t t-esc="reference"/></div>
+                            <div t-if="produit and produit != reference" style="color:#475569;">
+                                <t t-esc="produit"/>
+                            </div>
+                        </td>
+                        <td style="width:50%;vertical-align:top;">
+                            <div style="color:#64748B;font-size:11px;text-transform:uppercase;">Déclinaison</div>
+                            <div style="font-size:14px;font-weight:600;">
+                                <t t-esc="couleur or '—'"/>
+                                <t t-if="taille"> · pointure <t t-esc="taille"/></t>
+                            </div>
+                            <div t-if="fournisseur" style="color:#475569;">
+                                Fournisseur : <t t-esc="fournisseur"/>
+                            </div>
+                        </td>
+                    </tr>
+                </table>
+
+                <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                    <thead>
+                        <tr t-attf-style="background:#{'FEF3C7' if est_achat else 'EDE9FE'};">
+                            <th style="text-align:left;padding:8px;border:1px solid #E2E8F0;">
+                                <t t-if="est_achat">Destination prévue</t>
+                                <t t-else="">Magasin</t>
+                            </th>
+                            <th style="text-align:left;padding:8px;border:1px solid #E2E8F0;">Société</th>
+                            <th style="text-align:right;padding:8px;border:1px solid #E2E8F0;">Stock magasin</th>
+                            <th style="text-align:right;padding:8px;border:1px solid #E2E8F0;">
+                                Vendu (<t t-esc="fenetre"/> j)
+                            </th>
+                            <th style="text-align:right;padding:8px;border:1px solid #E2E8F0;">Besoin</th>
+                            <th t-attf-style="text-align:right;padding:8px;border:1px solid #E2E8F0;background:#{'FDE68A' if est_achat else 'DDD6FE'};">
+                                <t t-if="est_achat">À commander</t>
+                                <t t-else="">À envoyer</t>
+                            </th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr t-foreach="lignes" t-as="l">
+                            <td style="padding:7px 8px;border:1px solid #E2E8F0;font-weight:600;">
+                                <t t-esc="l['magasin']"/>
+                            </td>
+                            <td style="padding:7px 8px;border:1px solid #E2E8F0;color:#64748B;">
+                                <t t-esc="l['societe']"/>
+                            </td>
+                            <td style="padding:7px 8px;border:1px solid #E2E8F0;text-align:right;">
+                                <t t-esc="l['stock']"/>
+                            </td>
+                            <td style="padding:7px 8px;border:1px solid #E2E8F0;text-align:right;">
+                                <t t-esc="l['vendu']"/>
+                            </td>
+                            <td style="padding:7px 8px;border:1px solid #E2E8F0;text-align:right;">
+                                <t t-esc="l['besoin']"/>
+                            </td>
+                            <td style="padding:7px 8px;border:1px solid #E2E8F0;text-align:right;font-weight:700;">
+                                <t t-esc="l['qty']"/>
+                            </td>
+                        </tr>
+                    </tbody>
+                    <tfoot>
+                        <tr style="background:#F8FAFC;font-weight:700;">
+                            <td colspan="5" style="padding:8px;border:1px solid #E2E8F0;text-align:right;">
+                                <t t-if="est_achat">Total à commander au fournisseur</t>
+                                <t t-else="">Total à envoyer depuis le dépôt</t>
+                            </td>
+                            <td style="padding:8px;border:1px solid #E2E8F0;text-align:right;">
+                                <t t-esc="total"/>
+                            </td>
+                        </tr>
+                    </tfoot>
+                </table>
+
+                <div style="margin-top:14px;font-size:12px;color:#475569;">
+                    Stock du dépôt sur cette déclinaison : <b><t t-esc="depot_qty"/></b> pièces.
+                    <t t-if="est_achat">
+                        Le dépôt ne peut pas couvrir le besoin : ces pièces sont à commander.
+                    </t>
+                    <t t-else="">
+                        <t t-if="manque"> Il manque <b><t t-esc="manque"/></b> pièces : à commander au fournisseur.</t>
+                    </t>
+                </div>
+
+                <div style="margin-top:6px;font-size:11px;color:#64748B;">
+                    Couverture visée : <t t-esc="jours"/> jours de vente, calculée sur les
+                    <t t-esc="fenetre"/> derniers jours.
+                </div>
+
+                <div style="margin-top:26px;font-size:12px;">
+                    <table style="width:100%;">
+                        <tr>
+                            <td style="width:50%;padding-top:24px;border-top:1px solid #CBD5E1;">
+                                <t t-if="est_achat">Demandé par</t>
+                                <t t-else="">Préparé par</t>
+                            </td>
+                            <td style="width:8%;"></td>
+                            <td style="width:42%;padding-top:24px;border-top:1px solid #CBD5E1;">
+                                <t t-if="est_achat">Validé par</t>
+                                <t t-else="">Reçu par</t>
+                            </td>
+                        </tr>
+                    </table>
+                </div>
+
+                <div style="margin-top:18px;font-size:10px;color:#94A3B8;">
+                    Document préparatoire.
+                    <t t-if="est_achat">
+                        Le bon d'achat fournisseur est créé par Base Pivot au moment de la validation.
+                    </t>
+                    <t t-else="">
+                        Les bons de vente inter-sociétés sont créés par Base Pivot au moment de la validation.
+                    </t>
+                </div>
+            </div>
+        </t>
+    </template>
+
+</odoo>

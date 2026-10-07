@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from odoo import _, api, fields, models
-from odoo.exceptions import UserError
+from odoo.exceptions import UserError, ValidationError
 
 
 class InterInternalTransferExt(models.Model):
@@ -12,6 +12,46 @@ class InterInternalTransferExt(models.Model):
     modules, donc c'est le bon endroit pour cette extension.
     """
     _inherit = 'inter.internal.transfer'
+
+    date_validation = fields.Datetime(string='Fait le', readonly=True, copy=False)
+
+    def _notify_destinataire_for_reception(self):
+        super()._notify_destinataire_for_reception()
+        dest = self.env['res.users'].sudo().search([
+            ('groups_id', '=', self.env.ref('transfert_interne.group_transfert_destinataire').id),
+            ('transfert_default_location_id', '=', self.location_target_id.id)])
+        self._notifier_boite(dest, u"Transfert %s à réceptionner" % self.name,
+                             u"Le transfert %s vous attend pour vérification et confirmation de réception." % self.name)
+
+    def _notify_appro_for_final_validation(self):
+        super()._notify_appro_for_final_validation()
+        appro = self.env['res.users'].sudo().search([
+            ('groups_id', '=', self.env.ref('transfert_interne.group_transfert_appro').id)])
+        self._notifier_boite(appro, u"Transfert %s à valider" % self.name,
+                             u"Le transfert %s a été réceptionné et attend votre validation finale." % self.name)
+
+    def _notifier_boite(self, users, sujet, corps):
+        """Notification dans la boite de reception Odoo, sans e-mail."""
+        partners = users.mapped('partner_id')
+        if partners:
+            self.sudo().message_notify(partner_ids=partners.ids, subject=sujet, body=corps)
+
+    def write(self, vals):
+        res = super().write(vals)
+        if vals.get('state') == 'done':
+            self.filtered(lambda r: not r.date_validation).sudo().write(
+                {'date_validation': fields.Datetime.now()})
+        return res
+
+    @api.constrains('company_source_id', 'company_target_id')
+    def _check_companies(self):
+        # Le tableau de bord cree des bons entre magasins d'une meme societe
+        # (contexte mavie_intra_societe) ; la regle reste pour le reste de l'appli.
+        for rec in self:
+            if (rec.company_source_id and rec.company_target_id
+                    and rec.company_source_id == rec.company_target_id
+                    and not rec.env.context.get('mavie_intra_societe')):
+                raise ValidationError(_("La société source et la société cible doivent être différentes."))
 
     # ── Relais vers l'Inventaire pour les transferts intra-société ──
     #
@@ -37,8 +77,8 @@ class InterInternalTransferExt(models.Model):
         # puis done » place le nouvel état AVANT « Fait » dans la barre
         # d'état, comme dans le parcours réel. Sans cette ancre, il serait
         # simplement ajouté à la fin, après « Fait ».
-        selection_add=[('transmitted', "Transmis à l'inventaire"), ('done',)],
-        ondelete={'transmitted': 'set default'},
+        selection_add=[('transmitted', "Transmis à l'inventaire"), ('done',), ('cancelled', 'Annulé')],
+        ondelete={'transmitted': 'set default', 'cancelled': 'set default'},
     )
     picking_id = fields.Many2one(
         'stock.picking',
@@ -180,7 +220,34 @@ class InterInternalTransferExt(models.Model):
                 "Ce transfert a été transmis à l'Inventaire : il se collecte et se "
                 "valide dans Inventaire → Transferts → Interne, sur l'opération %s."
             ) % (self.picking_id.name or '—'))
-        return super().action_validate()
+        # Le magasin n'a plus à confirmer la réception : l'approvisionnement
+        # valide directement un bon soumis, la réception est enregistrée à ce moment.
+        if self.state == 'submitted':
+            self.write({'state': 'received', 'received_uid': self.env.user.id,
+                        'received_date': fields.Datetime.now()})
+        Quant = self.env['stock.quant'].sudo().with_company(self.company_source_id)
+        ajustements = []
+        for l in self.line_ids:
+            dispo = max(Quant._get_available_quantity(l.product_id, self.location_source_id), 0)
+            if dispo + 1e-6 < l.quantity:
+                ajustements.append('%s : demandé %s, envoyé %s' % (
+                    l.product_id.display_name, int(l.quantity), int(dispo)))
+                if dispo <= 0:
+                    l.unlink()
+                else:
+                    l.quantity = dispo
+        if not self.line_ids:
+            raise UserError(_("Aucun article n'est disponible dans le stock source : rien à transférer."))
+        if ajustements:
+            self.message_post(body='Quantités ajustées à la validation (stock insuffisant) :<br/>'
+                              + '<br/>'.join(ajustements))
+        resultat = super().action_validate()
+        if ajustements:
+            return {'type': 'ir.actions.client', 'tag': 'display_notification', 'params': {
+                'title': 'Transfert validé avec quantités ajustées',
+                'message': 'Stock insuffisant au moment de la validation : ' + ' ; '.join(ajustements),
+                'type': 'warning', 'sticky': True}}
+        return resultat
 
     def _create_intra_company_picking(self):
         """Crée l'opération d'inventaire interne (même société, deux

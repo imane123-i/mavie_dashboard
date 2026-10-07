@@ -28,6 +28,7 @@
         'views/mv_batch_shop_mapping_views_ext.xml',
         'views/inter_internal_transfer_views_ext.xml',
         'report/mavie_transfer_report.xml',
+        'report/mavie_reassort_report.xml',
     ],
     'assets': {
         'web.assets_backend': [

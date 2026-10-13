@@ -96,13 +96,25 @@ def resolve_variant_color_size(product_variant):
                 color_name = attr_val.name.strip()
             elif size_name is None and any(k in attr_upper for k in ('TAILLE', 'POINTURE', 'SIZE')):
                 size_name = attr_val.name.strip()
+    # DEMANDE UTILISATEUR (2026-10-12) : certaines fiches produit ont les
+    # lignes d'attribut COULEURS/POINTURES inversées à la saisie (ex. GG-86 :
+    # "COULEURS" contient 36-41, "POINTURES" contient NOIR/GOLD/BRONZE). On
+    # ne peut pas corriger la fiche Odoo (hors périmètre dashboard), donc on
+    # absorbe le défaut à l'affichage : une "couleur" purement numérique
+    # alors que la "taille" ne l'est pas est quasi certainement inversée.
+    if color_name and color_name.isdigit() and size_name and not size_name.isdigit():
+        color_name, size_name = size_name, color_name
     return color_name, size_name
 
 
 def _arrondi_prix_solde(p):
-    """Prix soldé arrondi à l'entier : sous 0,50 on descend (99,30 -> 99), à partir de 0,50 on monte (99,60 -> 100)."""
+    """Prix soldé arrondi à l'ENTIER (demande utilisateur, confirmée sur
+    plusieurs exemples le 2026-10-07 : 198,55 -> 199, 170,70 -> 171,
+    250,50 -> 250, 280 à -18 % (229,60) -> 230). À 0,50 ou en dessous on
+    descend, au-dessus on monte — un essai au demi-dirham entre-temps est
+    revenu en arrière, il ne correspondait pas à ces exemples."""
     n = int(p // 1)
-    return float(n) if round(p - n, 2) < 0.5 else float(n + 1)
+    return float(n) if round(p - n, 2) <= 0.5 else float(n + 1)
 
 
 def _fr_nombre(valeur):
@@ -116,6 +128,16 @@ def _fr_nombre(valeur):
     entier, _, decimales = txt.partition('.')
     entier = entier.replace(',', ' ')
     return (entier + ',' + decimales) if decimales else entier
+
+
+def _trad_date_fr(iso):
+    """'2026-10-07' -> '07/10/2026'. Renvoie la valeur telle quelle si elle
+    n'a pas le format attendu, plutôt que de planter l'affichage."""
+    try:
+        y, m, d = iso.split('-')
+        return '%s/%s/%s' % (d, m, y)
+    except (AttributeError, ValueError):
+        return iso or ''
 
 
 class MaVieDashboardController(http.Controller):
@@ -2361,25 +2383,39 @@ class MaVieDashboardController(http.Controller):
                 (ecarts_refs_count / (total_active_skus or 1)) * 100, 1
             ) if ecarts_refs_count else 0.0
 
+            # BUG CORRIGÉ (2026-10-12) : le classement ABC ne portait QUE sur
+            # les ~200 candidats de Top/Flop Produits (product_stats), pas
+            # sur le catalogue entier — vérifié en base : sur « recette
+            # test », les 80%/95% étaient calculés sur 5,9M MAD de CA alors
+            # que le vrai CA Vendu total est de 94,2M MAD (seulement 6 % du
+            # CA réel pris en compte). Les paliers « Produits A — 80 % du
+            # CA » n'avaient donc aucun sens par rapport au vrai chiffre
+            # d'affaires. Corrigé : le cumul porte maintenant sur
+            # sales_by_tmpl/filtered_sales, qui couvre déjà TOUT le
+            # catalogue (déjà calculé plus haut, aucune requête
+            # supplémentaire) — seul l'affichage reste limité aux 10
+            # premiers de chaque classe, via tmpl_by_id déjà chargé plus
+            # haut (lui aussi déjà un sur-ensemble du catalogue concerné).
             abc_class_map = {}
-            ca_sorted = sorted(product_stats, key=lambda a: a['ca'], reverse=True)
-            ca_cumul_total = sum(p['ca'] for p in product_stats)
+            univers_ca = filtered_sales if is_filtered else sales_by_tmpl
+            ca_sorted_ids = sorted(univers_ca.keys(), key=lambda k: univers_ca[k]['ca'], reverse=True)
+            ca_cumul_total = sum(v['ca'] for v in univers_ca.values())
             cumul = 0
             abc = {'A': [], 'B': [], 'C': []}
+            LIMITE_ABC_AFFICHEE = 10
 
-            for p in ca_sorted:
-                cumul += p['ca']
+            for tid in ca_sorted_ids:
+                ca = univers_ca[tid]['ca']
+                cumul += ca
                 pct = (cumul / ca_cumul_total * 100) if ca_cumul_total > 0 else 0
-                p_item = {'id': p['id'], 'name': p['name'], 'ref': p['ref'], 'ca': round(p['ca'], 2)}
-                if pct <= 80:
-                    abc['A'].append(p_item)
-                    abc_class_map[p['id']] = 'A'
-                elif pct <= 95:
-                    abc['B'].append(p_item)
-                    abc_class_map[p['id']] = 'B'
-                else:
-                    abc['C'].append(p_item)
-                    abc_class_map[p['id']] = 'C'
+                classe = 'A' if pct <= 80 else ('B' if pct <= 95 else 'C')
+                abc_class_map[tid] = classe
+                if len(abc[classe]) < LIMITE_ABC_AFFICHEE:
+                    t = tmpl_by_id.get(tid)
+                    if t:
+                        ref = t.get('base_pivot_reference') or t.get('default_code') or t.get('name') or '—'
+                        abc[classe].append({'id': tid, 'name': t.get('name') or '—',
+                                             'ref': ref, 'ca': round(ca, 2)})
 
             # ── Magasins configurés : source unique de vérité pour toutes les résolutions ──
             shop_mappings = self._get_active_shop_mappings()
@@ -2905,6 +2941,16 @@ class MaVieDashboardController(http.Controller):
                 'partner': mod_for_life.partner_id.id,
                 'companies': retail_companies.ids,
             })
+            # BUG CORRIGÉ (2026-10-12) : il faut récupérer les résultats de
+            # cette requête (fetchall) AVANT d'appeler _get_active_shop_mappings
+            # ci-dessous — celle-ci exécute ses propres requêtes ORM sur le
+            # même curseur, qui écrasaient silencieusement le jeu de
+            # résultats en attente. Conséquence réelle observée : tout bon
+            # de vente dont la correspondance ne pouvait venir QUE du bon
+            # d'achat miroir (origin vide sur le bon de vente lui-même)
+            # tombait à tort dans « Magasin non identifié », alors que le
+            # bon miroir pointait bien un entrepôt mappé.
+            lignes_po = request.env.cr.fetchall()
             # Le bon d'achat miroir ne pointe le magasin que si son type
             # d'opération est celui d'un entrepôt MAPPÉ. Sur Elite il pointe
             # l'entrepôt générique de la société (« SQUARE TARGA »), et le
@@ -2916,7 +2962,7 @@ class MaVieDashboardController(http.Controller):
                 m.warehouse_id.id for m in self._get_active_shop_mappings()
                 if m.warehouse_id
             }
-            for origin, wh_id, wh_name in request.env.cr.fetchall():
+            for origin, wh_id, wh_name in lignes_po:
                 if wh_id not in entrepots_magasins:
                     continue
                 for so_name, so_id in so_by_name.items():
@@ -4213,6 +4259,263 @@ class MaVieDashboardController(http.Controller):
         }
         return stream, book, formats
 
+    def _ventes_groupees_par_variante(self, kw):
+        """(grouped, couleur_by_pid, tmpl_info_by_pid) : les ventes POS
+        groupées par variante, sur le périmètre filtré, avec la couleur de
+        chaque variante déjà résolue. Partagé par le Top/Flop Couleurs et
+        son détail par référence, pour ne calculer qu'une fois.
+
+        PERF (2026-10-12) : sur une base avec un gros historique (ex.
+        « recette test », ~434k lignes de vente), regrouper + résoudre la
+        couleur de chaque variante prend plusieurs secondes — mis en cache
+        (même mécanisme que les KPIs) pour que les rechargements/clics
+        successifs sur la même période soient instantanés. Le résultat
+        renvoyé doit donc rester 100% JSON-safe (pas d'enregistrement ORM
+        en cache, qui référencerait un curseur fermé à la requête
+        suivante) — d'où tmpl_info_by_pid (dict simple) à la place d'un
+        variant_by_pid d'enregistrements.
+        """
+        # 'couleur' (passé par api_couleur_detail) ne change pas ce que
+        # cette fonction calcule — exclu de la clé pour que le clic sur une
+        # couleur réutilise le cache déjà posé par le chargement de la page.
+        kw_cle = {k: v for k, v in (kw or {}).items() if k != 'couleur'}
+        cle = self._cache_cle('ventes_variante', kw_cle)
+        garde = self._cache_lire(cle)
+        if garde is not None:
+            return garde['grouped'], garde['couleur_by_pid'], garde['tmpl_info_by_pid']
+
+        product_tmpl_ids = None
+        if self._filtre_produit_actif(kw):
+            product_tmpl_ids = request.env['product.template'].sudo().with_context(
+                active_test=False).search(self._build_product_domain(kw)).ids or [-1]
+        domain = self._build_pos_domain(kw, product_tmpl_ids)
+        # DEMANDE UTILISATEUR (2026-10-07) : les cartes cadeaux, recharges
+        # e-wallet et lignes de remise technique (type='service', ex. « All
+        # Gift Card », « REMISE PROMOTIONNELLE ») polluaient « Sans couleur »
+        # — ce ne sont pas des articles avec une couleur, on les exclut.
+        domain = domain + [('product_id.type', '=', 'product')]
+        grouped = request.env['pos.order.line'].sudo().read_group(
+            domain, ['qty:sum', 'price_subtotal_incl:sum'], ['product_id'], lazy=False)
+        pids = [g['product_id'][0] for g in grouped if g.get('product_id')]
+        if not pids:
+            self._cache_ecrire(cle, {'grouped': [], 'couleur_by_pid': {}, 'tmpl_info_by_pid': {}})
+            return [], {}, {}
+        variants = request.env['product.product'].sudo().with_context(
+            active_test=False).browse(pids)
+        couleur_by_pid = {}
+        tmpl_info_by_pid = {}
+        for v in variants:
+            couleur, _taille = resolve_variant_color_size(v)
+            couleur_by_pid[v.id] = couleur or 'Sans couleur'
+            tmpl = v.product_tmpl_id
+            tmpl_info_by_pid[v.id] = {
+                'id': tmpl.id,
+                'ref': tmpl.base_pivot_reference or tmpl.default_code or tmpl.name or '—',
+                'nom': tmpl.name or '—',
+            }
+        self._cache_ecrire(cle, {'grouped': grouped, 'couleur_by_pid': couleur_by_pid,
+                                  'tmpl_info_by_pid': tmpl_info_by_pid})
+        return grouped, couleur_by_pid, tmpl_info_by_pid
+
+    @http.route('/mavie/api/top-flop-couleurs', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_top_flop_couleurs(self, **kw):
+        """Top/Flop des ventes PAR COULEUR, toutes références confondues.
+
+        DEMANDE UTILISATEUR (2026-10-07) : savoir quelles couleurs se
+        vendent, indépendamment du modèle — même principe que Top/Flop
+        Produits, mais regroupé sur la couleur de la variante vendue plutôt
+        que sur la référence.
+        """
+        try:
+            grouped, couleur_by_pid, _tmpl_info_by_pid = self._ventes_groupees_par_variante(kw)
+            if not grouped:
+                return {'top': [], 'flop': []}
+            par_couleur = {}
+            for g in grouped:
+                pid = g['product_id'][0] if g.get('product_id') else None
+                if not pid:
+                    continue
+                couleur = couleur_by_pid.get(pid, 'Sans couleur')
+                # DEMANDE UTILISATEUR (2026-10-13) : « Sans couleur » n'est pas
+                # une erreur de saisie à afficher — ce sont de vrais articles
+                # (uniformes : polo/chemise/sweat) qui n'ont tout simplement
+                # aucun attribut couleur. Un classement « quelle couleur se
+                # vend le mieux » n'a rien à en dire, donc on les exclut au
+                # lieu de les montrer comme une couleur à part.
+                if couleur == 'Sans couleur':
+                    continue
+                e = par_couleur.setdefault(couleur, {'couleur': couleur, 'qty': 0.0, 'ca': 0.0})
+                e['qty'] += g.get('qty') or 0.0
+                e['ca'] += g.get('price_subtotal_incl') or 0.0
+            # DEMANDE UTILISATEUR (2026-10-13) : nombre affiché saisissable,
+            # comme Top/Flop Produits — ici aussi le serveur renvoie TOUJOURS
+            # large (plafond technique, 200 couvre les ~106 couleurs réelles
+            # constatées), et c'est le client qui tranche localement sans
+            # round-trip quand on change le nombre à l'écran (cf. top_limit/
+            # flop_limit pour les produits, même principe).
+            TFC_PLAFOND = 200
+            lignes = list(par_couleur.values())
+            top = sorted(lignes, key=lambda x: x['ca'], reverse=True)[:TFC_PLAFOND]
+            # Un retour pur (qty et CA négatifs) n'est pas « une couleur qui
+            # se vend mal » : écarté du Flop, comme pour le Flop Produits.
+            flop_candidats = [l for l in lignes if l['qty'] > 0]
+            flop = sorted(flop_candidats, key=lambda x: x['ca'])[:TFC_PLAFOND]
+            # BUG CORRIGÉ (2026-10-13) : top et flop peuvent désormais se
+            # recouper presque entièrement (plafond 200 pour ~106 couleurs
+            # réelles), donc les MÊMES dicts se retrouvaient dans les deux
+            # listes — muter 'rank' en place sur l'un écrasait le rang déjà
+            # posé par l'autre (constaté : NOIR, 1er du Top, affichait rank
+            # 106 car le tri du Flop l'écrasait après coup). On construit
+            # maintenant un dict indépendant par sortie, rang inclus.
+            return {
+                'top': [dict(l, rank=i + 1, qty=round(l['qty']), ca=round(l['ca'], 2))
+                        for i, l in enumerate(top)],
+                'flop': [dict(l, rank=i + 1, qty=round(l['qty']), ca=round(l['ca'], 2))
+                         for i, l in enumerate(flop)],
+            }
+        except Exception as e:
+            _logger.error("Erreur api_top_flop_couleurs: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/couleur-detail', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_couleur_detail(self, **kw):
+        """Références vendues pour UNE couleur (clic sur une ligne du
+        Top/Flop Couleurs), mêmes filtres qu'à l'écran."""
+        try:
+            couleur = (kw.get('couleur') or '').strip()
+            if not couleur:
+                return {'error': 'Couleur manquante.'}
+            grouped, couleur_by_pid, tmpl_info_by_pid = self._ventes_groupees_par_variante(kw)
+            par_ref = {}
+            for g in grouped:
+                pid = g['product_id'][0] if g.get('product_id') else None
+                if not pid or couleur_by_pid.get(pid) != couleur:
+                    continue
+                info = tmpl_info_by_pid.get(pid)
+                if not info:
+                    continue
+                e = par_ref.setdefault(info['id'], {
+                    'id': info['id'],
+                    'ref': info['ref'],
+                    'nom': info['nom'],
+                    'qty': 0.0, 'ca': 0.0,
+                })
+                e['qty'] += g.get('qty') or 0.0
+                e['ca'] += g.get('price_subtotal_incl') or 0.0
+            lignes = sorted(par_ref.values(), key=lambda x: -x['ca'])
+            return {
+                'couleur': couleur,
+                'lignes': [dict(l, qty=round(l['qty']), ca=round(l['ca'], 2)) for l in lignes],
+            }
+        except Exception as e:
+            _logger.error("Erreur api_couleur_detail: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/top-flop-couleurs/export', type='http', auth='user',
+                methods=['GET'], csrf=False)
+    def api_top_flop_couleurs_export(self, **kw):
+        """Export Excel du Top/Flop Couleurs affiché à l'écran, mêmes
+        filtres (DEMANDE UTILISATEUR 2026-10-12)."""
+        try:
+            data = self.api_top_flop_couleurs(**kw)
+            if not data or data.get('error'):
+                message = data.get('error') if data else 'Erreur inconnue'
+                return request.make_response(
+                    'Erreur : ' + message,
+                    headers=[('Content-Type', 'text/plain; charset=utf-8')],
+                    status=404,
+                )
+            # api_top_flop_couleurs renvoie toujours jusqu'à 200 lignes (même
+            # principe que Top/Flop Produits) ; on tranche ici à la valeur
+            # réellement affichée à l'écran au moment de l'export.
+            try:
+                top_n = max(1, int(kw.get('top_couleurs_limit') or 10))
+            except (TypeError, ValueError):
+                top_n = 10
+            try:
+                flop_n = max(1, int(kw.get('flop_couleurs_limit') or 10))
+            except (TypeError, ValueError):
+                flop_n = 10
+            data = dict(data, top=(data.get('top') or [])[:top_n],
+                        flop=(data.get('flop') or [])[:flop_n])
+            stream, book, fmt = self._xlsx_workbook()
+            columns = ['#', 'Couleur', 'Qté vendue', 'CA Vendu (TTC)']
+
+            for titre, cle in (('Top Couleurs', 'top'), ('Flop Couleurs', 'flop')):
+                lignes = data.get(cle) or []
+                sheet = book.add_worksheet(titre)
+                sheet.write(0, 0, titre, fmt['title'])
+                sheet.write(1, 0, '%s couleur(s)' % len(lignes), fmt['meta'])
+                for col, label in enumerate(columns):
+                    sheet.write(3, col, label, fmt['header'])
+                sheet.set_column(0, 0, 6)
+                sheet.set_column(1, 1, 22)
+                sheet.set_column(2, 3, 16)
+                sheet.freeze_panes(4, 0)
+                for idx, l in enumerate(lignes):
+                    excel_row = 4 + idx
+                    sheet.write(excel_row, 0, l.get('rank'), fmt['cell'])
+                    sheet.write(excel_row, 1, l.get('couleur') or '—', fmt['cell'])
+                    sheet.write(excel_row, 2, l.get('qty') or 0, fmt['num'])
+                    sheet.write(excel_row, 3, l.get('ca') or 0, fmt['money'])
+
+            # DEMANDE UTILISATEUR (2026-10-12) : le détail par référence de
+            # chaque couleur du Top/Flop, pas seulement le total couleur —
+            # même regroupement que le clic « voir le détail » à l'écran
+            # (api_couleur_detail), mais pour toutes les couleurs du Top et
+            # du Flop d'un coup, une feuille par classement.
+            grouped, couleur_by_pid, tmpl_info_by_pid = self._ventes_groupees_par_variante(kw)
+            detail_columns = ['Couleur', 'Référence', 'Qté vendue', 'CA Vendu (TTC)']
+            for titre, cle in (('Détail Top Couleurs', 'top'), ('Détail Flop Couleurs', 'flop')):
+                couleurs_classees = {l['couleur']: l.get('rank', 0) for l in (data.get(cle) or [])}
+                if not couleurs_classees:
+                    continue
+                par_couleur_ref = {}
+                for g in grouped:
+                    pid = g['product_id'][0] if g.get('product_id') else None
+                    if not pid:
+                        continue
+                    couleur = couleur_by_pid.get(pid)
+                    if couleur not in couleurs_classees:
+                        continue
+                    info = tmpl_info_by_pid.get(pid)
+                    if not info:
+                        continue
+                    key = (couleur, info['id'])
+                    e = par_couleur_ref.setdefault(key, {
+                        'couleur': couleur, 'ref': info['ref'], 'qty': 0.0, 'ca': 0.0,
+                    })
+                    e['qty'] += g.get('qty') or 0.0
+                    e['ca'] += g.get('price_subtotal_incl') or 0.0
+                detail_lignes = sorted(
+                    par_couleur_ref.values(),
+                    key=lambda l: (couleurs_classees.get(l['couleur'], 0), -l['ca']))
+
+                sheet = book.add_worksheet(titre)
+                sheet.write(0, 0, titre, fmt['title'])
+                sheet.write(1, 0, '%s référence(s)' % len(detail_lignes), fmt['meta'])
+                for col, label in enumerate(detail_columns):
+                    sheet.write(3, col, label, fmt['header'])
+                sheet.set_column(0, 0, 18)
+                sheet.set_column(1, 1, 28)
+                sheet.set_column(2, 3, 16)
+                sheet.freeze_panes(4, 0)
+                for idx, l in enumerate(detail_lignes):
+                    excel_row = 4 + idx
+                    sheet.write(excel_row, 0, l['couleur'] or '—', fmt['cell'])
+                    sheet.write(excel_row, 1, l['ref'], fmt['cell'])
+                    sheet.write(excel_row, 2, round(l['qty']), fmt['num'])
+                    sheet.write(excel_row, 3, round(l['ca'], 2), fmt['money'])
+
+            return self._xlsx_response(stream, book, 'mavie_export_top_flop_couleurs.xlsx')
+        except Exception as e:
+            _logger.error("Erreur api_top_flop_couleurs_export: %s", e, exc_info=True)
+            return request.make_response(
+                'Erreur : ' + str(e),
+                headers=[('Content-Type', 'text/plain; charset=utf-8')],
+                status=500,
+            )
+
     def _xlsx_insert_photo(self, sheet, row, col, image_bytes, index):
         """Incruste une vignette centrée dans la cellule."""
         if not image_bytes:
@@ -4466,7 +4769,13 @@ class MaVieDashboardController(http.Controller):
             # Recherche native — base_pivot_reference est un champ stocké
             # simple sur product.template (une référence déjà écrite), donc
             # pas une requête live vers Base Pivot.
+            # sale_ok=True exclut les produits techniques « Produit gratuit »
+            # qu'Odoo crée automatiquement pour chaque récompense panier
+            # progressif/fidélité (type service, sale_ok=False) — sans quoi
+            # ils ressortaient dans la recherche dès que leur nom généré
+            # contenait la référence cherchée (ex. « 3251.0 »).
             products = ProductTemplate.search([
+                ('sale_ok', '=', True),
                 '|', '|', '|',
                 ('name', 'ilike', query),
                 ('default_code', 'ilike', query),
@@ -5999,9 +6308,15 @@ class MaVieDashboardController(http.Controller):
                 "(transfert entre deux sociétés)"
             )
 
+        # DEMANDE UTILISATEUR (2026-10-12) : un lien cliquable direct vers le
+        # document à ouvrir, pas seulement son nom en texte — le responsable
+        # devait jusqu'ici chercher lui-même le bon dans Odoo.
+        lien_direct = self._absolute_url(
+            '/web#model=%s&id=%s&view_type=form' % (model, res_id))
         route_txt = (
             f"<p><strong>Transfert {escape(transfer.name)}</strong> : "
             f"<strong>{source_label}</strong> → <strong>{dest_label}</strong></p>"
+            f'<p><a href="{lien_direct}" target="_blank">→ Ouvrir et valider ce bon</a></p>'
         )
         if test_partner:
             route_txt = self.BANDEAU_TEST + route_txt
@@ -6524,15 +6839,22 @@ class MaVieDashboardController(http.Controller):
     @http.route('/mavie/api/transfer-create', type='json', auth='user', methods=['POST'], csrf=False)
     def api_transfer_create(self, **kw):
         try:
+            # product_tmpl_id reste obligatoire pour le bouton « Transférer »
+            # du Réassort (une seule référence) — restreint alors les lignes
+            # à cette référence. DEMANDE UTILISATEUR (2026-10-12) : l'assistant
+            # Transferts Proposition doit pouvoir créer UN SEUL bon regroupant
+            # PLUSIEURS références différentes pour une même paire de
+            # magasins (il créait avant un bon par référence) — product_tmpl_id
+            # devient donc optionnel, uniquement pour ce cas-là.
             product_tmpl_id = kw.get('product_tmpl_id')
             source_shop_field = kw.get('source_shop_field')
             dest_shop_field = kw.get('dest_shop_field')
             lines = kw.get('lines') or []
 
-            if not (product_tmpl_id and source_shop_field and dest_shop_field and lines):
-                return {'error': 'Paramètres manquants (produit, magasin source, magasin cible, lignes).'}
+            if not (source_shop_field and dest_shop_field and lines):
+                return {'error': 'Paramètres manquants (magasin source, magasin cible, lignes).'}
 
-            product_tmpl_id = int(product_tmpl_id)
+            product_tmpl_id = int(product_tmpl_id) if product_tmpl_id else None
 
             mappings = self._get_active_shop_mappings()
             source_mapping = mappings.filtered(lambda m: m.shop_field == source_shop_field)[:1]
@@ -6556,6 +6878,23 @@ class MaVieDashboardController(http.Controller):
             source_location = source_mapping.warehouse_id.lot_stock_id
             Quant = request.env['stock.quant'].sudo().with_company(source_mapping.company_id)
 
+            # DEMANDE UTILISATEUR (2026-10-12) : le stock disponible doit
+            # aussi tenir compte des quantités déjà engagées dans D'AUTRES
+            # bons de transfert créés depuis ce même magasin source mais pas
+            # encore validés. Odoo lui-même ne protège pas contre ça : un
+            # bon intra-société désréserve volontairement son stock juste
+            # après création pour rester « en attente » tant que personne ne
+            # l'a repris manuellement (voir _create_intra_company_picking) —
+            # sans ce correctif, un 2e bon pouvait reprendre les mêmes
+            # pièces qu'un 1er bon non encore validé.
+            TransferLine = request.env['inter.internal.transfer.line'].sudo()
+            deja_engage = {}
+            for l in TransferLine.search([
+                ('transfer_id.location_source_id', '=', source_location.id),
+                ('transfer_id.state', 'not in', ('done', 'cancelled')),
+            ]):
+                deja_engage[l.product_id.id] = deja_engage.get(l.product_id.id, 0.0) + l.quantity
+
             line_vals = []
             warning_parts = []
             for line in lines:
@@ -6567,15 +6906,19 @@ class MaVieDashboardController(http.Controller):
                 if requested <= 0:
                     continue
                 variant = request.env['product.product'].sudo().browse(variant_id)
-                if not variant.exists() or variant.product_tmpl_id.id != product_tmpl_id:
+                if not variant.exists():
+                    continue
+                if product_tmpl_id and variant.product_tmpl_id.id != product_tmpl_id:
                     continue
                 available = Quant._get_available_quantity(variant, source_location)
+                available = max(0.0, available - deja_engage.get(variant_id, 0.0))
                 take = min(requested, available)
                 if take <= 0:
                     continue
                 if take < requested:
                     warning_parts.append(f"{variant.display_name} : {take:.0f}/{requested:.0f}")
                 line_vals.append((0, 0, {'product_id': variant_id, 'quantity': take}))
+                deja_engage[variant_id] = deja_engage.get(variant_id, 0.0) + take
 
             if not line_vals:
                 return {'error': 'Aucune quantité valide à transférer (stock insuffisant ou lignes vides).'}
@@ -7367,7 +7710,7 @@ class MaVieDashboardController(http.Controller):
                             'solde_apres': solde,
                             'caisse': pos.session_id.config_id.name if pos else 'Hors caisse : aucune commande de caisse liée',
                             'vendeur': pos.user_id.name if pos and pos.user_id else 'Hors caisse',
-                            'utilisateur': ml.create_uid.name or '—',
+                            'utilisateur': ml.create_uid.login or ml.create_uid.name or '—',
                             'move_line_id': ml.id,
                             'origine_saisie': (pick.origin or '') if pick else '',
                         })
@@ -7450,6 +7793,7 @@ class MaVieDashboardController(http.Controller):
         state_labels = {
             'draft': 'Brouillon',
             'submitted': 'En attente de validation',
+            'received': "Réceptionné - en attente de validation appro",
             'transmitted': "Transmis à l'inventaire",
             'done': 'Fait',
             'cancelled': 'Annulé',
@@ -7475,15 +7819,609 @@ class MaVieDashboardController(http.Controller):
                 # intra-société, il a été transmis à l'Inventaire et c'est
                 # cette opération-là que le responsable doit valider — sans
                 # son nom, l'historique dit « transmis » sans dire à quoi.
-                'picking_name': tr.picking_id.name or '',
+                # DEMANDE UTILISATEUR (2026-10-12) : « pourquoi ya pas
+                # l'opération remplie dans les autres » — un transfert
+                # inter-sociétés a lui aussi une vraie opération de
+                # réception (le bon d'achat créé à la destination la génère
+                # automatiquement), simplement pas via tr.picking_id. On
+                # l'affiche ici aussi, à défaut.
+                'picking_name': (tr.picking_id.name
+                                  or (tr.purchase_id.picking_ids[-1:].name
+                                      if tr.purchase_id and tr.purchase_id.picking_ids else '')),
                 # Permet d'ouvrir l'opération dans Odoo depuis l'historique.
-                'picking_id': tr.picking_id.id or None,
+                'picking_id': (tr.picking_id.id
+                                or (tr.purchase_id.picking_ids[-1:].id
+                                    if tr.purchase_id and tr.purchase_id.picking_ids else None)),
                 'nb_references': len(refs),
                 'nb_lignes': len(tr.line_ids),
                 'qty': int(qty),
                 'group_ref': tr.group_ref or '',
+                # DEMANDE UTILISATEUR (2026-10-12) : 4 étapes affichées dans
+                # l'État (Émetteur / En attente / Récepteur /
+                # Approvisionnement), pur affichage de ce qui est déjà fait
+                # dans le circuit de validation — rien de nouveau n'est
+                # calculé ici, juste les horodatages déjà posés par
+                # transfert_interne / mavie_dashboard.
+                'received_date': str(tr.received_date)[:16] if tr.received_date else None,
+                'date_validation': str(tr.date_validation)[:16] if tr.date_validation else None,
             })
         return rows
+
+    def _suivi_pickings_resolus(self, picking):
+        """Le picking original + toute sa chaîne de reliquats (backorders).
+
+        BUG CONSTATÉ EN ENQUÊTANT SUR UNE VRAIE ANOMALIE (2026-10-08,
+        TI/2026/00023) : quand Odoo ne peut valider qu'une partie d'un
+        picking, il crée un reliquat (backorder) pour le reste. Regarder
+        seulement `tr.picking_id` — comme ce code le faisait jusqu'ici —
+        ignore ce reliquat : si quelqu'un le valide plus tard, la pièce
+        « manquante » serait en réalité bien arrivée, mais resterait
+        signalée en anomalie pour toujours. On suit maintenant toute la
+        chaîne. `resolu` est False si un maillon est encore ouvert (ni
+        fait, ni annulé) — l'écart n'est alors pas encore définitif.
+        """
+        vus = picking
+        a_traiter = [picking]
+        resolu = True
+        while a_traiter:
+            p = a_traiter.pop()
+            if p.state not in ('done', 'cancel'):
+                resolu = False
+            for bo in p.backorder_ids:
+                if bo.id not in vus.ids:
+                    vus |= bo
+                    a_traiter.append(bo)
+        return vus, resolu
+
+    def _suivi_verif_stock_inter(self, tr):
+        """Pour un transfert entre sociétés (circuit avoir + commande
+        d'achat, hors de portée du dashboard) : croise ce que le bon dit
+        avoir envoyé avec le stock RÉEL actuel du magasin destinataire,
+        référence par référence.
+
+        Renvoie (verdict, détail) :
+          - 'introuvable' : au moins une référence n'a JAMAIS eu le
+            moindre mouvement de stock à cet emplacement — le signe le
+            plus net d'un article qui n'a pas été reconnu/retrouvé par
+            l'autre circuit.
+          - 'insuffisant' : le stock actuel du magasin destinataire est
+            inférieur à ce qui a été envoyé, pour au moins une référence —
+            plus faible comme preuve (l'article peut avoir été revendu
+            depuis), mais vaut la peine d'être regardé.
+          - 'ok' : rien d'anormal détecté sur le stock actuel.
+          - None : rien à vérifier (bon sans ligne, ou emplacement cible
+            non résolu).
+
+        CORRECTION (2026-10-09) : « introuvable » se base sur
+        `stock.move.line` (état 'done'), PAS sur l'existence d'un
+        `stock.quant` — Odoo supprime automatiquement les quants retombés
+        à zéro (_unlink_zero_quants, tâche périodique), donc un article
+        réellement arrivé PUIS entièrement revendu finit par ne plus
+        laisser aucune ligne de quant, identique en apparence à un article
+        jamais arrivé. Le mouvement de stock, lui, n'est jamais supprimé
+        (c'est la piste d'audit) : c'est la seule source fiable pour
+        « est-ce que ça a un jour été crédité ici ».
+        """
+        if not tr.location_target_id or not tr.line_ids:
+            return None, None
+        Quant = request.env['stock.quant'].sudo()
+        MoveLine = request.env['stock.move.line'].sudo()
+        soucis = []
+        jamais_vu = []
+        for l in tr.line_ids:
+            if l.quantity <= 0:
+                # Ligne à quantité nulle (résidu de saisie) : rien n'a été
+                # envoyé, donc rien à vérifier côté réception.
+                continue
+            existe = MoveLine.search_count([
+                ('product_id', '=', l.product_id.id),
+                ('location_dest_id', 'child_of', tr.location_target_id.id),
+                ('state', '=', 'done'),
+            ])
+            dispo = Quant._get_available_quantity(l.product_id, tr.location_target_id)
+            ref = (l.product_id.product_tmpl_id.base_pivot_reference
+                   or l.product_id.default_code or l.product_id.display_name or '—')
+            if not existe:
+                jamais_vu.append(ref)
+            elif dispo < l.quantity:
+                soucis.append('%s (envoyé %s, %s en stock)' % (ref, int(l.quantity), int(dispo)))
+        if jamais_vu:
+            return 'introuvable', ('Jamais vu en stock à %s : %s' %
+                                    (tr.recepteur_display or tr.company_target_id.name, ', '.join(jamais_vu)))
+        if soucis:
+            return 'insuffisant', ('Stock actuel inférieur à l\'envoi à %s : %s' %
+                                    (tr.recepteur_display or tr.company_target_id.name, ', '.join(soucis)))
+        return 'ok', None
+
+    def _suivi_build_rows(self, kw):
+        """Construit les lignes de la page Suivi : envoyé / reçu côte à
+        côte, bon par bon, plus les agrégats (anomalies, valeur en transit,
+        références les plus en écart). Partagé par la vue JSON et l'export
+        Excel — un seul endroit qui calcule, pas deux versions à maintenir
+        en phase.
+
+        DEMANDE UTILISATEUR (2026-10-07) : pouvoir vérifier que ce qu'un
+        magasin a envoyé correspond à ce que l'autre a reçu. Le « reçu »
+        n'est fiable que pour les transferts même société (ils passent par
+        un stock.picking réel, avec des mouvements qty_done) : pour les
+        transferts entre sociétés, l'autre circuit (avoir + bon d'achat) ne
+        porte pas une quantité « reçue » distincte dans ce module — on
+        l'affiche comme non vérifiable plutôt que d'inventer un chiffre.
+        """
+        rows = self._transfer_history_rows(kw, limit=300)
+        ids = [r['id'] for r in rows]
+        transfers = request.env['inter.internal.transfer'].sudo().browse(ids)
+        tr_by_id = {t.id: t for t in transfers}
+        out = []
+        nb_anomalies = 0
+        valeur_en_transit = 0.0
+        # Quelles références reviennent le plus souvent en écart : calculé
+        # seulement sur les bons déjà repérés en anomalie (peu nombreux en
+        # pratique), pas sur les 300 bons — le détail ligne par ligne,
+        # lui, coûte une requête par bon.
+        par_magasin_delai = {}
+        for r in rows:
+            tr = tr_by_id.get(r['id'])
+            envoye = r['qty']
+            recu = None
+            verifiable = False
+            # Transfert entre sociétés (avoir + commande d'achat — l'autre
+            # circuit, celui qu'on ne peut pas modifier) : pas de
+            # `tr.picking_id` suivi par le dashboard, donc pas de « reçu »
+            # fiable au sens strict. DEMANDE UTILISATEUR (2026-10-09) :
+            # « le système affiche un nombre mais dans le stock il y a un
+            # autre nombre, parce qu'ils n'ont pas trouvé l'article » — on
+            # ne peut pas corriger le circuit lui-même, mais on peut
+            # croiser ce qu'il PRÉTEND avoir livré avec le stock RÉEL du
+            # magasin destinataire, et le dire quand ça ne colle pas.
+            # DEMANDE UTILISATEUR (2026-10-12) : le signal « À surveiller »
+            # (jamais vu en stock / stock insuffisant) est retiré — jugé pas
+            # assez clair/fiable à l'usage. La vraie réception (via le bon
+            # d'achat, ci-dessous) couvre maintenant la quasi-totalité des
+            # cas ; stock_verif ne sert plus qu'en tout dernier recours,
+            # uniquement pour confirmer silencieusement un bon sans jamais
+            # plus afficher d'avertissement.
+            stock_verif = None
+            stock_verif_detail = None
+            if tr and tr.picking_id:
+                verifiable = True
+                pickings, resolu = self._suivi_pickings_resolus(tr.picking_id)
+                if resolu:
+                    # Odoo 17 : stock.move.line porte la quantité
+                    # réellement traitée dans `quantity` (`qty_done`
+                    # dans les versions antérieures n'existe plus). On
+                    # additionne le picking d'origine ET tous ses
+                    # reliquats faits — un reliquat annulé n'apporte rien,
+                    # ce qui est la bonne réponse : cette pièce n'est
+                    # jamais partie.
+                    recu = int(sum(pickings.filtered(lambda p: p.state == 'done')
+                                   .move_line_ids.mapped('quantity')))
+                else:
+                    recu = None  # un maillon de la chaîne est encore ouvert
+            elif tr and not tr.picking_id and tr.purchase_id and tr.purchase_id.picking_ids:
+                # DEMANDE UTILISATEUR (2026-10-12) : « pourquoi ici c'est
+                # vide » — un transfert inter-sociétés a bien une réception
+                # réelle, juste par un autre circuit (le bon d'achat créé à
+                # la destination reçoit automatiquement). On la suit
+                # exactement comme un picking classique, chaîne de
+                # reliquats comprise, au lieu de laisser Reçu/Écart vides.
+                verifiable = True
+                pickings = request.env['stock.picking']
+                resolu = True
+                for p0 in tr.purchase_id.picking_ids:
+                    chaine, resolu_p = self._suivi_pickings_resolus(p0)
+                    pickings |= chaine
+                    resolu = resolu and resolu_p
+                if resolu:
+                    recu = int(sum(pickings.filtered(lambda p: p.state == 'done')
+                                   .move_line_ids.mapped('quantity')))
+                else:
+                    recu = None
+            elif tr and not tr.picking_id and tr.state in ('received', 'done'):
+                # Dernier recours (pas de bon d'achat/réception trouvable) :
+                # on confirme silencieusement via le stock réel si tout est
+                # cohérent, sans jamais afficher d'avertissement (voir plus
+                # haut — « À surveiller » retiré).
+                verdict, _detail = self._suivi_verif_stock_inter(tr)
+                if verdict == 'ok':
+                    stock_verif = 'ok'
+            ecart = (envoye - recu) if (recu is not None) else None
+            anomalie = bool(ecart)
+            if anomalie:
+                nb_anomalies += 1
+            # Valeur marchande (TTC) de ce qui a été envoyé : transforme
+            # « il manque 1 pièce » en un montant — ce qui parle
+            # davantage à un responsable qu'un simple compte de pièces.
+            # DEMANDE UTILISATEUR (2026-10-08) : « autre chose plus
+            # efficace ».
+            valeur_ttc = 0.0
+            if tr:
+                for l in tr.line_ids:
+                    tmpl = l.product_id.product_tmpl_id
+                    ratio = self._solde_tax_ratio(tmpl, tr.company_source_id)
+                    valeur_ttc += l.quantity * (l.product_id.lst_price or 0.0) * ratio
+            if recu is None and tr and tr.state not in ('done', 'cancelled'):
+                valeur_en_transit += valeur_ttc
+            # Délai de traitement : de la création du bon à sa validation
+            # finale (date_validation, posée par InterInternalTransferExt
+            # dès que state passe à 'done'). Permet de voir si UN magasin
+            # traîne particulièrement par rapport aux autres — un problème
+            # qu'une liste plate ne montre pas. DEMANDE UTILISATEUR
+            # (2026-10-09) : « ajoute plus d'options ».
+            delai_jours = None
+            if tr and tr.date_validation and tr.create_date:
+                delai_jours = round((tr.date_validation - tr.create_date).total_seconds() / 86400.0, 1)
+                e = par_magasin_delai.setdefault(r['source_magasin'], {'total': 0.0, 'nb': 0})
+                e['total'] += delai_jours
+                e['nb'] += 1
+            out.append({
+                'id': r['id'],
+                'name': r['name'],
+                'trajet': '%s → %s' % (r['source_magasin'], r['dest_magasin']),
+                'source_magasin': r['source_magasin'],
+                'state': r['state'],
+                'state_label': r['state_label'],
+                'date': r['date'],
+                'envoye': envoye,
+                'recu': recu,
+                'verifiable': verifiable,
+                'ecart': ecart,
+                'anomalie': anomalie,
+                'valeur_ttc': round(valeur_ttc, 2),
+                'picking_id': r['picking_id'],
+                # Vérification manuelle (case à cocher côté Suivi) :
+                # distincte du circuit d'approbation Odoo lui-même.
+                'dashboard_valide': bool(tr and tr.dashboard_valide),
+                # DEMANDE UTILISATEUR (2026-10-12) : le login n'est pas
+                # toujours une adresse mail (ex. le compte « admin » par
+                # défaut) — l'email du partenaire associé, quand il existe,
+                # identifie mieux qui a validé.
+                'dashboard_valide_par': ((tr.dashboard_valide_uid.email or tr.dashboard_valide_uid.login
+                                           or tr.dashboard_valide_uid.name)
+                                          if tr and tr.dashboard_valide_uid else None),
+                'dashboard_valide_date': (str(tr.dashboard_valide_date)[:16]
+                                           if tr and tr.dashboard_valide_date else None),
+                'dashboard_anomalie_note': (tr.dashboard_anomalie_note or None) if tr else None,
+                'dashboard_anomalie_par': ((tr.dashboard_anomalie_uid.email or tr.dashboard_anomalie_uid.login
+                                             or tr.dashboard_anomalie_uid.name)
+                                            if tr and tr.dashboard_anomalie_uid else None),
+                'delai_jours': delai_jours,
+                'stock_verif': stock_verif,
+                'stock_verif_detail': stock_verif_detail,
+            })
+        tous_delais = [v['total'] for v in par_magasin_delai.values()]
+        tous_nb = sum(v['nb'] for v in par_magasin_delai.values())
+        delai_moyen_global = round(sum(tous_delais) / tous_nb, 1) if tous_nb else None
+        return out, nb_anomalies, round(valeur_en_transit, 2), delai_moyen_global
+
+    @http.route('/mavie/api/suivi-transferts', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_suivi_transferts(self, **kw):
+        try:
+            out, nb_anomalies, valeur_en_transit, delai_moyen_global = \
+                self._suivi_build_rows(kw)
+            return {
+                'rows': out,
+                'total': len(out),
+                'nb_anomalies': nb_anomalies,
+                'valeur_en_transit': valeur_en_transit,
+                'delai_moyen_global': delai_moyen_global,
+            }
+        except Exception as e:
+            _logger.error("Erreur api_suivi_transferts: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/suivi-anomalie-note', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_suivi_anomalie_note(self, **kw):
+        """Enregistre l'explication d'un écart (casse, vol, erreur de
+        comptage...) — garde l'écart visible mais dit pourquoi, pour qu'il
+        n'ait plus besoin d'attention une fois la cause connue."""
+        try:
+            tr = request.env['inter.internal.transfer'].sudo().browse(int(kw.get('id') or 0))
+            if not tr.exists():
+                return {'error': 'Transfert introuvable.'}
+            note = (kw.get('note') or '').strip()
+            tr.write({
+                'dashboard_anomalie_note': note or False,
+                'dashboard_anomalie_uid': request.env.user.id if note else False,
+                'dashboard_anomalie_date': fields.Datetime.now() if note else False,
+            })
+            return {'ok': True, 'dashboard_anomalie_note': note or None,
+                    'dashboard_anomalie_par': ((request.env.user.email or request.env.user.login
+                                                 or request.env.user.name) if note else None)}
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_suivi_anomalie_note: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @staticmethod
+    def _suivi_categorie(r):
+        """Même règle que _suiviCategorie côté JS (dashboard.js) : les
+        filtres rapides de la page ET les onglets de l'export doivent
+        compter exactement les mêmes bons, sinon les deux se contredisent."""
+        # DEMANDE UTILISATEUR (2026-10-12) : un bon inter-sociétés confirmé
+        # par le stock de destination (stock_verif='ok') ne doit pas rester
+        # coincé en « En attente » indéfiniment faute de picking suivi par
+        # le dashboard — il suit la même règle que les bons avec un reçu
+        # connu : validé si coché, sinon à vérifier.
+        if r.get('stock_verif') == 'ok' and r['recu'] is None:
+            return 'valides' if r['dashboard_valide'] else 'a_verifier'
+        if r['recu'] is None:
+            return 'attente'
+        if r['anomalie']:
+            return 'anomalies'
+        if r['dashboard_valide']:
+            return 'valides'
+        return 'a_verifier'
+
+    @http.route('/mavie/api/suivi/export', type='http', auth='user', methods=['GET'], csrf=False)
+    def api_suivi_export(self, **kw):
+        """Export Excel du suivi des transferts.
+
+        Sans filtre actif sur la page : un onglet par catégorie (comme
+        avant). DEMANDE UTILISATEUR (2026-10-09) : quand un filtre rapide,
+        un magasin ou une recherche est actif à l'écran, l'export ne doit
+        contenir QUE ce qui est affiché — pas tout exporter à chaque fois.
+        """
+        try:
+            out, nb_anomalies, valeur_en_transit, _delai_moyen = \
+                self._suivi_build_rows(kw)
+
+            def _verif_txt(r):
+                if r['recu'] is None:
+                    return 'Pas encore collecté' if r['verifiable'] else 'Non vérifiable'
+                if r['anomalie']:
+                    return ('Écart : ' + (r['dashboard_anomalie_note'] or 'cause non renseignée'))
+                if r['dashboard_valide']:
+                    return 'Vérifié par %s le %s' % (r['dashboard_valide_par'] or '—', r['dashboard_valide_date'] or '')
+                return 'À vérifier'
+
+            stream, book, fmt = self._xlsx_workbook()
+            columns = ['Bon', 'Trajet', 'État', 'Envoyé', 'Reçu', 'Écart',
+                       'Valeur du bon (TTC)', 'Vérification', 'Créé le']
+
+            def _write_sheet(nom, titre, rows):
+                sheet = book.add_worksheet(nom)
+                sheet.write(0, 0, titre, fmt['title'])
+                sheet.write(1, 0, '%s bon(s)' % len(rows), fmt['meta'])
+                for col, label in enumerate(columns):
+                    sheet.write(3, col, label, fmt['header'])
+                sheet.set_column(0, 0, 16)
+                sheet.set_column(1, 1, 34)
+                sheet.set_column(2, 2, 26)
+                sheet.set_column(3, 5, 10)
+                sheet.set_column(6, 6, 16)
+                sheet.set_column(7, 7, 30)
+                sheet.set_column(8, 8, 16)
+                sheet.freeze_panes(4, 0)
+                for idx, r in enumerate(rows, start=1):
+                    row = 3 + idx
+                    sheet.write(row, 0, r['name'], fmt['cell'])
+                    sheet.write(row, 1, r['trajet'], fmt['cell'])
+                    sheet.write(row, 2, r['state_label'], fmt['cell'])
+                    sheet.write(row, 3, r['envoye'], fmt['num'])
+                    sheet.write(row, 4, r['recu'] if r['recu'] is not None else '—', fmt['num'])
+                    sheet.write(row, 5, r['ecart'] if r['ecart'] is not None else '—', fmt['num'])
+                    sheet.write(row, 6, r['valeur_ttc'], fmt['money'])
+                    sheet.write(row, 7, _verif_txt(r), fmt['cell'])
+                    sheet.write(row, 8, r['date'], fmt['cell'])
+                if not rows:
+                    sheet.write(4, 0, 'Aucun bon dans cette catégorie.', fmt['muted'])
+                return sheet
+
+            # Filtres actifs côté page (envoyés par le bouton Exporter de
+            # la page elle-même) : même règle que _suiviFiltrees() en JS.
+            filtre = (kw.get('filtre') or 'tous').strip()
+            magasin = (kw.get('magasin') or '').strip()
+            recherche = (kw.get('recherche') or '').strip().lower()
+            CATEGORIE_LABELS = {
+                'a_verifier': 'À vérifier', 'anomalies': 'Anomalies',
+                'valides': 'Validés', 'attente': 'En attente de réception',
+            }
+            filtre_actif = filtre != 'tous' or magasin or recherche
+
+            if filtre_actif:
+                rows = out
+                if filtre != 'tous':
+                    rows = [r for r in rows if self._suivi_categorie(r) == filtre]
+                if magasin:
+                    rows = [r for r in rows if magasin in r['trajet']]
+                if recherche:
+                    rows = [r for r in rows if recherche in (r['name'] + ' ' + r['trajet']).lower()]
+                morceaux = []
+                if filtre != 'tous':
+                    morceaux.append(CATEGORIE_LABELS.get(filtre, filtre))
+                if magasin:
+                    morceaux.append(magasin)
+                if recherche:
+                    morceaux.append('« %s »' % recherche)
+                titre = 'Suivi des transferts — ' + ' · '.join(morceaux)
+                _write_sheet('Suivi filtré', titre, rows)
+                return self._xlsx_response(stream, book, 'mavie_suivi_transferts_filtre.xlsx')
+
+            par_categorie = {'a_verifier': [], 'anomalies': [], 'valides': [], 'attente': []}
+            for r in out:
+                par_categorie[self._suivi_categorie(r)].append(r)
+
+            # « Tous » d'abord : vue d'ensemble avant le détail par onglet.
+            _write_sheet('Tous', 'Suivi des transferts — tous (%s bon(s), %s avec écart, %.2f MAD en transit)'
+                         % (len(out), nb_anomalies, valeur_en_transit), out)
+            _write_sheet('A verifier', 'À vérifier', par_categorie['a_verifier'])
+            _write_sheet('Anomalies', 'Anomalies', par_categorie['anomalies'])
+            _write_sheet('Valides', 'Validés', par_categorie['valides'])
+            _write_sheet('En attente', 'En attente de réception', par_categorie['attente'])
+
+            return self._xlsx_response(stream, book, 'mavie_suivi_transferts.xlsx')
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_suivi_export: %s", e, exc_info=True)
+            return request.make_response("Erreur : %s" % e, [('Content-Type', 'text/plain; charset=utf-8')])
+
+    @http.route('/mavie/api/suivi-transfert-detail', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_suivi_transfert_detail(self, **kw):
+        """Détail article par article d'UN bon, pour la ligne dépliée de la
+        page Suivi : stock actuel de chaque côté, envoyé, reçu, écart.
+
+        DEMANDE UTILISATEUR (2026-10-08) : voir, pour chaque référence du
+        bon, combien il y a en stock, combien a été envoyé et combien il en
+        reste — calculé à la demande (pas pour les 300 bons d'un coup) pour
+        rester léger.
+        """
+        try:
+            tr = request.env['inter.internal.transfer'].sudo().browse(int(kw.get('id') or 0))
+            if not tr.exists():
+                return {'error': 'Transfert introuvable.'}
+            recu_par_produit = {}
+            verifiable = bool(tr.picking_id) or bool(tr.purchase_id and tr.purchase_id.picking_ids)
+            picking_done = False
+            pickings = request.env['stock.picking']
+            if tr.picking_id:
+                # Suit aussi les reliquats (backorders) du picking, pas
+                # seulement le picking d'origine — sinon une pièce
+                # réceptionnée plus tard via un reliquat resterait
+                # affichée comme manquante indéfiniment (voir
+                # _suivi_pickings_resolus).
+                pickings, resolu = self._suivi_pickings_resolus(tr.picking_id)
+                picking_done = resolu
+            elif tr.purchase_id and tr.purchase_id.picking_ids:
+                # DEMANDE UTILISATEUR (2026-10-12) : un transfert inter-
+                # sociétés reçoit bien réellement, via le bon de réception
+                # créé automatiquement par le bon d'achat à la destination
+                # — on le suit ici au lieu de laisser Reçu/Écart/Bon
+                # concerné vides pour ce circuit.
+                resolu = True
+                for p0 in tr.purchase_id.picking_ids:
+                    chaine, resolu_p = self._suivi_pickings_resolus(p0)
+                    pickings |= chaine
+                    resolu = resolu and resolu_p
+                picking_done = resolu
+            if picking_done:
+                for ml in pickings.filtered(lambda p: p.state == 'done').move_line_ids:
+                    recu_par_produit[ml.product_id.id] = (
+                        recu_par_produit.get(ml.product_id.id, 0) + ml.quantity)
+
+            def _stock(product, location):
+                if not location:
+                    return None
+                return int(round(request.env['stock.quant'].sudo()
+                                  ._get_available_quantity(product, location)))
+
+            valeur_ecart_totale = 0.0
+            lignes = []
+            for l in tr.line_ids:
+                envoye = int(round(l.quantity))
+                recu = None
+                if verifiable and picking_done:
+                    recu = int(round(recu_par_produit.get(l.product_id.id, 0)))
+                ecart = (envoye - recu) if recu is not None else None
+                # Valeur TTC de l'écart sur CETTE ligne : ici, contrairement
+                # au total du bon, on sait exactement quel produit manque —
+                # le montant est donc fiable, pas une moyenne.
+                ratio = self._solde_tax_ratio(l.product_id.product_tmpl_id, tr.company_source_id)
+                valeur_unitaire = (l.product_id.lst_price or 0.0) * ratio
+                valeur_ecart = round(abs(ecart) * valeur_unitaire, 2) if ecart else 0.0
+                if ecart:
+                    valeur_ecart_totale += valeur_ecart
+                # Tous les pickings de la chaîne (original + reliquat(s))
+                # qui ont traité — ou pas — CETTE référence, avec la
+                # quantité de CHACUN : un envoi peut être livré en
+                # plusieurs fois (1 sur l'original, 1 sur un reliquat
+                # complété plus tard), et ne montrer qu'un seul bon donnait
+                # l'impression trompeuse qu'une seule pièce était partie
+                # (CONSTATÉ EN TEST 2026-10-08 : TI/2026/00049, la demande
+                # affichait 2 envoyés/2 reçus mais le lien n'ouvrait que
+                # CE/INT/00001, qui n'en montre qu'1 — l'autre est sur le
+                # reliquat CE/INT/00002). Un reliquat annulé reste listé
+                # même à 0 pièce : c'est la preuve qu'elle n'est jamais
+                # partie (voir TI/2026/00023).
+                state_labels_fr = {
+                    'draft': 'Brouillon', 'waiting': "En attente d'une autre opération",
+                    'confirmed': 'En attente', 'assigned': 'Prêt',
+                    'done': 'Fait', 'cancel': 'Annulé',
+                }
+                pickings_ligne = []
+                for p in pickings:
+                    if l.product_id not in p.move_ids.product_id:
+                        continue
+                    qte_p = sum(p.move_line_ids.filtered(
+                        lambda ml: ml.product_id == l.product_id).mapped('quantity'))
+                    if not qte_p and p.state != 'cancel':
+                        continue
+                    pickings_ligne.append({
+                        'id': p.id, 'name': p.name, 'qty': int(round(qte_p)),
+                        'state_label': state_labels_fr.get(p.state, p.state),
+                    })
+                lignes.append({
+                    'reference': (l.product_id.product_tmpl_id.base_pivot_reference
+                                  or l.product_id.default_code
+                                  or l.product_id.display_name or '—'),
+                    'produit': l.product_id.display_name or '',
+                    'envoye': envoye,
+                    'recu': recu,
+                    'ecart': ecart,
+                    'anomalie': bool(ecart),
+                    'stock_source': _stock(l.product_id, tr.location_source_id),
+                    'stock_dest': _stock(l.product_id, tr.location_target_id),
+                    'valeur_unitaire': round(valeur_unitaire, 2),
+                    'valeur_ecart': valeur_ecart,
+                    'pickings': pickings_ligne,
+                })
+            return {
+                'lignes': lignes,
+                'verifiable': verifiable,
+                'picking_done': picking_done,
+                'valeur_ecart_totale': round(valeur_ecart_totale, 2),
+            }
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_suivi_transfert_detail: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/suivi-valider', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_suivi_valider(self, **kw):
+        """Coche/décoche la vérification manuelle « envoyé = reçu » d'un bon.
+
+        Refuse de cocher si un écart existe réellement : la case ne doit
+        pouvoir être cochée que quand c'est vrai, sinon elle ne veut plus
+        rien dire.
+        """
+        try:
+            tr = request.env['inter.internal.transfer'].sudo().browse(int(kw.get('id') or 0))
+            if not tr.exists():
+                return {'error': 'Transfert introuvable.'}
+            valide = bool(kw.get('valide'))
+            if valide:
+                if tr.picking_id and tr.picking_id.state == 'done':
+                    envoye = sum(tr.line_ids.mapped('quantity'))
+                    recu = sum(tr.picking_id.move_line_ids.mapped('quantity'))
+                    if abs(envoye - recu) > 1e-6:
+                        return {'error': 'Écart détecté (%s envoyé(s), %s reçu(s)) : impossible de valider.'
+                                         % (int(envoye), int(recu))}
+                elif not tr.picking_id and tr.state in ('received', 'done'):
+                    # DEMANDE UTILISATEUR (2026-10-12) : un bon inter-sociétés
+                    # (avoir + commande d'achat) n'a pas de picking suivi par
+                    # le dashboard, donc pas de « reçu » au sens ci-dessus —
+                    # mais le stock réel du magasin destinataire peut quand
+                    # même confirmer l'arrivée (voir _suivi_verif_stock_inter).
+                    # On l'accepte comme base de validation manuelle.
+                    verdict, detail = self._suivi_verif_stock_inter(tr)
+                    if verdict != 'ok':
+                        return {'error': (detail or "Le stock de destination ne confirme pas l'arrivée : "
+                                           "impossible de valider.")}
+                else:
+                    return {'error': "Rien à vérifier : la réception n'est pas encore collectée."}
+                tr.write({'dashboard_valide': True, 'dashboard_valide_uid': request.env.user.id,
+                          'dashboard_valide_date': fields.Datetime.now()})
+            else:
+                tr.write({'dashboard_valide': False, 'dashboard_valide_uid': False,
+                          'dashboard_valide_date': False})
+            return {
+                'ok': True,
+                'dashboard_valide': tr.dashboard_valide,
+                'dashboard_valide_par': ((tr.dashboard_valide_uid.email or tr.dashboard_valide_uid.login
+                                           or tr.dashboard_valide_uid.name) or None),
+                'dashboard_valide_date': (str(tr.dashboard_valide_date)[:16]
+                                           if tr.dashboard_valide_date else None),
+            }
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_suivi_valider: %s", e, exc_info=True)
+            return {'error': str(e)}
 
     # Condition SQL « vendu sous le prix catalogue » — partagée par la liste
     # et par le comptage, pour que les deux parlent bien de la même chose.
@@ -7714,6 +8652,7 @@ class MaVieDashboardController(http.Controller):
             state_labels = {
                 'draft': 'Brouillon',
                 'submitted': 'En attente de validation',
+                'received': "Réceptionné - en attente de validation appro",
                 'transmitted': "Transmis à l'inventaire",
                 'done': 'Fait',
             }
@@ -8279,6 +9218,7 @@ class MaVieDashboardController(http.Controller):
             if not tmpl.exists():
                 return {'error': 'Référence introuvable.'}
             etats = {'draft': 'Brouillon', 'submitted': 'En attente de validation',
+                     'received': "Réceptionné - en attente de validation appro",
                      'transmitted': "Transmis à l'inventaire", 'done': 'Fait'}
             request.env.cr.execute("""
                 SELECT t.id, t.name, t.state, t.create_date, COALESCE(t.origin, '') = %(orig)s,
@@ -11398,40 +12338,119 @@ class MaVieDashboardController(http.Controller):
         À ne pas confondre avec la section « Historique » du tableau de
         bord, qui liste les VENTES faites sous le prix catalogue : ici on
         liste ce qui a été POSÉ, même si rien n'a encore été vendu.
+
+        BUG CORRIGÉ (2026-10-13) : ce journal ne regardait que les listes de
+        prix (product.pricelist.item) — or le mode « promotion » (Remise &
+        Fidélité, loyalty.program) est celui que les magasins utilisent
+        VRAIMENT pour solder (cf. _soldes_deja_en_place, déjà étendu pour la
+        même raison). Une solde posée depuis le panneau en mode promotion
+        n'apparaissait donc JAMAIS ici, alors qu'elle est bien active en
+        caisse. On fusionne maintenant les deux sources.
         """
         try:
+            aujourdhui = fields.Date.context_today(request.env.user)
+            entries = []
+
+            # --- Source 1 : listes de prix (compute_price='fixed') ---
             listes = self._soldes_listes_par_magasin()
-            if not listes:
-                return {'rows': [], 'kpis': {}}
-            Item = request.env['product.pricelist.item'].sudo()
-            domaine = [('pricelist_id', 'in', list(listes)),
-                       ('compute_price', '=', 'fixed')]
+            if listes:
+                Item = request.env['product.pricelist.item'].sudo()
+                domaine = [('pricelist_id', 'in', list(listes)),
+                           ('compute_price', '=', 'fixed')]
+                if kw.get('date_start'):
+                    domaine.append(('write_date', '>=', kw['date_start'] + ' 00:00:00'))
+                if kw.get('date_end'):
+                    domaine.append(('write_date', '<=', kw['date_end'] + ' 23:59:59'))
+                regles = Item.search(domaine, order='write_date desc',
+                                     limit=self.JOURNAL_SOLDES_MAX)
+                for it in regles:
+                    tmpl = it.product_tmpl_id or it.product_id.product_tmpl_id
+                    info = listes.get(it.pricelist_id.id) or {}
+                    if not tmpl or not info.get('warehouse_ids'):
+                        continue
+                    societe = request.env['res.company'].sudo().browse(info['company_id'])
+                    ratio = self._solde_tax_ratio(tmpl, societe)
+                    catalogue = round(float(tmpl.list_price or 0) * ratio, 2)
+                    prix_ttc = round(float(it.fixed_price or 0) * ratio, 2)
+                    remise = (round((1 - prix_ttc / catalogue) * 100.0, 1)
+                              if catalogue > 0 and prix_ttc <= catalogue else 0.0)
+                    entries.append({
+                        'source_id': 'pl%d' % it.id,
+                        'tmpl': tmpl,
+                        'variante': it.product_id.display_name if it.product_id else '',
+                        'magasins': info.get('magasins') or [],
+                        'warehouse_ids': info.get('warehouse_ids') or [],
+                        'societes': info.get('societes') or [],
+                        'liste': info['liste'],
+                        'prix_catalogue': catalogue,
+                        'prix_solde': prix_ttc,
+                        'remise': remise,
+                        'pose_dt': it.write_date,
+                        'depuis_dt': it.date_start or it.write_date or it.create_date,
+                        'fin_dt': it.date_end,
+                        'par': (it.write_uid or it.create_uid).name or '',
+                    })
+
+            # --- Source 2 : promotions Remise & Fidélité (loyalty.program) ---
+            prog_domaine = [('program_type', '=', 'promotion')]
             if kw.get('date_start'):
-                domaine.append(('write_date', '>=', kw['date_start'] + ' 00:00:00'))
+                prog_domaine.append(('write_date', '>=', kw['date_start'] + ' 00:00:00'))
             if kw.get('date_end'):
-                domaine.append(('write_date', '<=', kw['date_end'] + ' 23:59:59'))
-            regles = Item.search(domaine, order='write_date desc',
-                                 limit=self.JOURNAL_SOLDES_MAX)
-            if not regles:
+                prog_domaine.append(('write_date', '<=', kw['date_end'] + ' 23:59:59'))
+            programmes = request.env['loyalty.program'].sudo().search(
+                prog_domaine, order='write_date desc', limit=self.JOURNAL_SOLDES_MAX)
+            for prog in programmes:
+                remise_pct = 0.0
+                for reward in prog.reward_ids:
+                    if reward.reward_type == 'discount' and reward.discount_mode == 'percent':
+                        remise_pct = max(remise_pct, reward.discount)
+                if remise_pct <= 0:
+                    continue
+                warehouse_ids = prog.pos_config_ids.mapped('warehouse_id').ids
+                if not warehouse_ids:
+                    continue
+                magasins = [w for w in prog.pos_config_ids.mapped('warehouse_id.name') if w]
+                tmpls = prog.rule_ids.product_ids.mapped('product_tmpl_id')
+                for tmpl in tmpls:
+                    ratio = self._solde_tax_ratio(tmpl, prog.company_id)
+                    catalogue = round(float(tmpl.list_price or 0) * ratio, 2)
+                    prix_ttc = round(catalogue * (1 - remise_pct / 100.0), 2)
+                    entries.append({
+                        'source_id': 'lp%d_%d' % (prog.id, tmpl.id),
+                        'tmpl': tmpl,
+                        'variante': '',
+                        'magasins': magasins,
+                        'warehouse_ids': warehouse_ids,
+                        'societes': [prog.company_id.name] if prog.company_id else [],
+                        'liste': prog.name,
+                        'prix_catalogue': catalogue,
+                        'prix_solde': prix_ttc,
+                        'remise': remise_pct,
+                        'pose_dt': prog.write_date,
+                        'depuis_dt': prog.date_from or prog.write_date or prog.create_date,
+                        'fin_dt': prog.date_to,
+                        'par': (prog.write_uid or prog.create_uid).name or '',
+                    })
+
+            if not entries:
                 return {'rows': [], 'kpis': {}}
+            entries.sort(key=lambda e: e['pose_dt'] or '', reverse=True)
+            tronque = len(entries) > self.JOURNAL_SOLDES_MAX
+            entries = entries[:self.JOURNAL_SOLDES_MAX]
 
             # Ce que chaque remise a vendu depuis sa pose : c'est la seule
             # facon de savoir si elle a pris. Les regles posees le meme jour
             # partagent une requete, sinon on en ferait une par ligne.
-            aujourdhui = fields.Date.context_today(request.env.user)
             paquets = {}
-            for it in regles:
-                tmpl = it.product_tmpl_id or it.product_id.product_tmpl_id
-                info = listes.get(it.pricelist_id.id) or {}
-                if not tmpl or not info.get('warehouse_ids'):
-                    continue
-                depuis = it.date_start or it.write_date or it.create_date
+            for e in entries:
+                depuis = e['depuis_dt']
                 jour = fields.Datetime.to_string(depuis)[:10] if depuis else str(aujourdhui)
-                # Une liste partagee vaut pour tous ses magasins : les
-                # ventes depuis la pose se comptent sur tous, sinon on
+                e['jour'] = jour
+                # Une liste/un programme partagé vaut pour tous ses magasins :
+                # les ventes depuis la pose se comptent sur tous, sinon on
                 # sous-estime l'effet de la remise.
-                for wh_id in info['warehouse_ids']:
-                    paquets.setdefault(jour, set()).add((tmpl.id, wh_id))
+                for wh_id in e['warehouse_ids']:
+                    paquets.setdefault(jour, set()).add((e['tmpl'].id, wh_id))
             vendu = {}
             for jour, paires in paquets.items():
                 request.env.cr.execute("""
@@ -11465,47 +12484,36 @@ class MaVieDashboardController(http.Controller):
 
             rows = []
             pieces_vendues = recette = 0.0
-            for it in regles:
-                tmpl = it.product_tmpl_id or it.product_id.product_tmpl_id
-                info = listes.get(it.pricelist_id.id) or {}
-                if not tmpl or not info:
-                    continue
-                societe = request.env['res.company'].sudo().browse(info['company_id'])
-                ratio = self._solde_tax_ratio(tmpl, societe)
-                magasins = info.get('magasins') or []
-                prix_ttc = round(float(it.fixed_price or 0) * ratio, 2)
-                catalogue = round(float(tmpl.list_price or 0) * ratio, 2)
-                remise = (round((1 - prix_ttc / catalogue) * 100.0, 1)
-                          if catalogue > 0 and prix_ttc <= catalogue else 0.0)
-                depuis = it.date_start or it.write_date or it.create_date
-                jour = fields.Datetime.to_string(depuis)[:10] if depuis else str(aujourdhui)
-                q, m = _vendu(tmpl.id, info.get('warehouse_ids') or [], jour)
+            for e in entries:
+                tmpl = e['tmpl']
+                magasins = e['magasins']
+                q, m = _vendu(tmpl.id, e['warehouse_ids'], e['jour'])
                 pieces_vendues += q
                 recette += m
-                fin = fields.Datetime.to_string(it.date_end)[:10] if it.date_end else ''
+                fin = fields.Datetime.to_string(e['fin_dt'])[:10] if e['fin_dt'] else ''
                 rows.append({
-                    'id': it.id,
-                    'pose_le': fields.Datetime.to_string(it.write_date)[:16]
-                               if it.write_date else '',
-                    'par': (it.write_uid or it.create_uid).name or '',
+                    'id': e['source_id'],
+                    'pose_le': fields.Datetime.to_string(e['pose_dt'])[:16]
+                               if e['pose_dt'] else '',
+                    'par': e['par'],
                     'article_id': tmpl.id,
                     'reference': (tmpl.base_pivot_reference or tmpl.default_code
                                   or tmpl.name or '—'),
                     'produit': tmpl.name or '',
-                    'variante': it.product_id.display_name if it.product_id else '',
-                    # Une liste partagee : on nomme tous les magasins
-                    # concernes, sinon le journal laisse croire que la
-                    # remise n'a touche qu'une boutique.
+                    'variante': e['variante'],
+                    # Une liste/un programme partagé : on nomme tous les
+                    # magasins concernes, sinon le journal laisse croire que
+                    # la remise n'a touche qu'une boutique.
                     'magasin': (magasins[0] if len(magasins) == 1
                                 else '%s magasins' % len(magasins)),
                     'magasins': magasins,
                     'partagee': len(magasins) > 1,
-                    'societe': ', '.join(info.get('societes') or []),
-                    'liste': info['liste'],
-                    'prix_catalogue': catalogue,
-                    'prix_solde': prix_ttc,
-                    'remise': remise,
-                    'debut': jour,
+                    'societe': ', '.join(e['societes']),
+                    'liste': e['liste'],
+                    'prix_catalogue': e['prix_catalogue'],
+                    'prix_solde': e['prix_solde'],
+                    'remise': e['remise'],
+                    'debut': e['jour'],
                     'fin': fin,
                     # Une remise sans date de fin court indefiniment ; une
                     # remise expiree ne s'applique plus en caisse.
@@ -11527,7 +12535,7 @@ class MaVieDashboardController(http.Controller):
                     'pieces_vendues': int(pieces_vendues),
                     'recette': round(recette, 2),
                 },
-                'tronque': len(regles) >= self.JOURNAL_SOLDES_MAX,
+                'tronque': tronque,
             }
         except Exception as e:  # noqa: BLE001
             _logger.error("Erreur api_soldes_journal: %s", e, exc_info=True)
@@ -11793,7 +12801,16 @@ class MaVieDashboardController(http.Controller):
                                    if not cibles else "Prix soldé invalide."})
                     continue
                 res = self.api_solde_apply(
-                    product_tmpl_id=aid, prix_ttc=prix, mode='pricelist',
+                    # DEMANDE UTILISATEUR (2026-10-07) : avec mode='pricelist',
+                    # la remise ne s'appliquait jamais en caisse — il fallait
+                    # que la caissière sélectionne elle-même la liste de
+                    # soldes, ce qui n'arrivait jamais. 'promotion' crée un
+                    # programme Remise & Fidélité à déclenchement automatique
+                    # (trigger='auto') : le prix soldé s'applique tout seul
+                    # dès que l'article est scanné, sans aucune action en
+                    # caisse. Vérifié : la création fonctionne (voir
+                    # _solde_creer_promotion).
+                    product_tmpl_id=aid, prix_ttc=prix, mode='promotion',
                     date_start=date_start, date_end=date_end,
                     magasins=[{'shop_field': m['shop_field'],
                                'nom_liste': '' if m.get('liste') else m.get('nom_propose')}
@@ -11897,7 +12914,24 @@ class MaVieDashboardController(http.Controller):
                 }
 
             if question == 'moment_vente':
-                depuis = fields.Datetime.now() - timedelta(days=90)
+                # DEMANDE UTILISATEUR (2026-10-07) : respecter le filtre
+                # Période de la barre du haut (jour/semaine/année/personnalisé)
+                # au lieu d'un historique figé à 90 jours. Sans filtre choisi
+                # (« Toutes les dates »), on revient au repère par défaut de
+                # 90 jours, plus lisible qu'un historique complet de plusieurs
+                # années sur un graphique par heure/jour de semaine.
+                date_start = (kw.get('date_start') or '').strip()
+                date_end = (kw.get('date_end') or '').strip()
+                if date_start or date_end:
+                    borne_debut = (date_start + ' 00:00:00') if date_start else '2000-01-01 00:00:00'
+                    borne_fin = (date_end + ' 23:59:59') if date_end else fields.Datetime.now()
+                    periode_titre = '%s – %s' % (
+                        _trad_date_fr(date_start) if date_start else 'depuis toujours',
+                        _trad_date_fr(date_end) if date_end else "aujourd'hui")
+                else:
+                    borne_debut = fields.Datetime.now() - timedelta(days=90)
+                    borne_fin = fields.Datetime.now()
+                    periode_titre = '90 derniers jours'
                 request.env.cr.execute("""
                     SELECT w.name, EXTRACT(ISODOW FROM x.d)::int, EXTRACT(HOUR FROM x.d)::int,
                            COUNT(DISTINCT x.oid), COALESCE(SUM(x.qte), 0)
@@ -11910,10 +12944,10 @@ class MaVieDashboardController(http.Controller):
                               JOIN pos_config pc ON pc.id = ps.config_id
                               JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
                              WHERE po.state IN ('paid', 'done', 'invoiced')
-                               AND po.date_order >= %s) x
+                               AND po.date_order >= %s AND po.date_order <= %s) x
                       JOIN stock_warehouse w ON w.id = x.wid
                      GROUP BY 1, 2, 3
-                """, (depuis,))
+                """, (borne_debut, borne_fin))
                 jours = ['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'dimanche']
                 heures = list(range(8, 24))
                 par = {}
@@ -11935,24 +12969,63 @@ class MaVieDashboardController(http.Controller):
                     bh = max(d['heure'], key=d['heure'].get)
                     lignes.append([nom, jours[bj - 1], '%02dh – %02dh' % (bh, (bh + 1) % 24),
                                    _fr_nombre(d['tickets_heure'][bh]), _fr_nombre(d['tickets'])])
+                graphiques = [
+                    {'titre': 'Articles vendus par jour de la semaine', 'type': 'colonnes', 'unite': 'articles',
+                     'items': [{'nom': jours[j].capitalize(), 'valeur': round(articles_jour[j], 0),
+                                'fort': articles_jour[j] == max(articles_jour), 'detail': ''}
+                               for j in range(7)],
+                     'legende': 'Nombre d’articles vendus, tous magasins confondus, %s.' % periode_titre},
+                    {'titre': 'Articles vendus par heure', 'type': 'colonnes', 'unite': 'articles',
+                     'items': [{'nom': '%02dh' % h, 'valeur': round(articles_heure[h], 0),
+                                'fort': articles_heure[h] == max(articles_heure[x] for x in heures),
+                                'detail': '%02dh – %02dh' % (h, (h + 1) % 24)} for h in heures],
+                     'legende': 'Nombre d’articles vendus par heure, tous magasins confondus, %s. La barre pleine est l’heure la plus forte.' % periode_titre},
+                ]
+                # DEMANDE UTILISATEUR (2026-10-08) : pas un filtre de période,
+                # mais un classement des jours/semaines/années PRÉCIS qui ont
+                # le plus vendu, sur tout l'historique (pas la fenêtre
+                # ci-dessus, qui ne sert qu'aux deux graphiques jour/heure).
+                granularite = (kw.get('granularite') or '').strip()
+                if granularite in ('jour', 'semaine', 'mois', 'annee'):
+                    bucket_sql = {
+                        'jour': "to_char(x.d, 'DD/MM/YYYY')",
+                        'semaine': "'Semaine ' || to_char(x.d, 'IW') || ' / ' || to_char(x.d, 'IYYY')",
+                        'mois': "to_char(x.d, 'MM/YYYY')",
+                        'annee': "to_char(x.d, 'YYYY')",
+                    }[granularite]
+                    request.env.cr.execute("""
+                        SELECT %s AS bucket, COALESCE(SUM(x.qte), 0), COUNT(DISTINCT x.oid)
+                          FROM (SELECT po.id AS oid, pol.qty AS qte,
+                                       (po.date_order AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Casablanca' AS d
+                                  FROM pos_order_line pol
+                                  JOIN pos_order po ON po.id = pol.order_id
+                                 WHERE po.state IN ('paid', 'done', 'invoiced')) x
+                         GROUP BY 1
+                         ORDER BY 2 DESC
+                         LIMIT 10
+                    """ % bucket_sql)
+                    classement = request.env.cr.fetchall()
+                    if classement:
+                        max_qte = max(row[1] for row in classement)
+                        graphiques.append({
+                            'titre': {'jour': 'Meilleures journées (tout l’historique)',
+                                      'semaine': 'Meilleures semaines (tout l’historique)',
+                                      'mois': 'Meilleurs mois (tout l’historique)',
+                                      'annee': 'Meilleures années (tout l’historique)'}[granularite],
+                            'type': 'colonnes', 'unite': 'articles',
+                            'items': [{'nom': bucket, 'valeur': round(float(qte), 0),
+                                       'fort': float(qte) == max_qte,
+                                       'detail': '%s ticket(s)' % _fr_nombre(tickets)}
+                                      for bucket, qte, tickets in classement],
+                            'legende': 'Top 10, toutes dates confondues, tous magasins confondus.',
+                        })
                 return {
-                    'titre': 'Quel moment vend le mieux (90 derniers jours, heure du Maroc)',
+                    'titre': 'Quel moment vend le mieux (%s, heure du Maroc)' % periode_titre,
                     'resume': '',
-                    'colonnes': ['Magasin', 'Meilleur jour', 'Meilleure heure', 'Tickets dans cette heure', 'Tickets sur 90 jours'],
+                    'colonnes': ['Magasin', 'Meilleur jour', 'Meilleure heure', 'Tickets dans cette heure', 'Tickets sur la période'],
                     'lignes': lignes,
                     'cles': [],
-                    'graphiques': [
-                        {'titre': 'Articles vendus par jour de la semaine', 'type': 'colonnes', 'unite': 'articles',
-                         'items': [{'nom': jours[j].capitalize(), 'valeur': round(articles_jour[j], 0),
-                                    'fort': articles_jour[j] == max(articles_jour), 'detail': ''}
-                                   for j in range(7)],
-                         'legende': 'Nombre d’articles vendus, tous magasins confondus, 90 derniers jours.'},
-                        {'titre': 'Articles vendus par heure', 'type': 'colonnes', 'unite': 'articles',
-                         'items': [{'nom': '%02dh' % h, 'valeur': round(articles_heure[h], 0),
-                                    'fort': articles_heure[h] == max(articles_heure[x] for x in heures),
-                                    'detail': '%02dh – %02dh' % (h, (h + 1) % 24)} for h in heures],
-                         'legende': 'Nombre d’articles vendus par heure, tous magasins confondus, 90 derniers jours. La barre pleine est l’heure la plus forte.'},
-                    ],
+                    'graphiques': graphiques,
                 }
 
             if question == 'remise_qui_marche':
@@ -12492,6 +13565,7 @@ class MaVieDashboardController(http.Controller):
                     'deja_solde': bool(pose),
                     'solde_en_place': pose.get('liste') or None,
                     'remise_en_place': remise_en_place or None,
+                    'remise_expiree': bool(pose.get('expiree')),
                     'remise_au_plafond': remise_au_plafond,
                     # D'ou vient la remise proposee : l'habitude de la
                     # categorie, le releve general, l'accentuation d'une
@@ -12535,12 +13609,19 @@ class MaVieDashboardController(http.Controller):
             return {'error': str(e)}
 
     def _soldes_deja_en_place(self, tmpl_ids):
-        """{tmpl_id: {'liste', 'remise'}} pour les références qui portent
-        déjà une règle de solde.
+        """{tmpl_id: {'liste', 'remise', 'expiree'}} pour les références qui
+        portent déjà une règle de solde.
 
         La remise en place compte : on ne peut pas proposer moins que ce
         qui est déjà posé, puisque la marchandise n'a pas bougé à ce
         prix-là. On retient la remise la PLUS FORTE déjà en place.
+
+        DEMANDE UTILISATEUR (2026-10-13) : distinguer une remise qui tourne
+        encore (signal faible, on ne sait pas encore si ça va vendre) d'une
+        remise déjà TERMINÉE sans que l'article ait bougé (signal fort,
+        preuve que le prix seul ne suffit pas) — `expiree` ne devient True
+        que si AUCUNE règle n'est active maintenant mais qu'au moins une a
+        déjà une date de fin passée.
         """
         if not tmpl_ids:
             return {}
@@ -12549,7 +13630,10 @@ class MaVieDashboardController(http.Controller):
                    MAX(COALESCE(pl.name->>'fr_FR', pl.name->>'en_US')) AS liste,
                    MAX(CASE WHEN pi.compute_price = 'fixed' AND pt.list_price > 0
                             THEN (1 - pi.fixed_price / pt.list_price) * 100.0
-                            ELSE COALESCE(pi.percent_price, 0) END) AS remise
+                            ELSE COALESCE(pi.percent_price, 0) END) AS remise,
+                   bool_or((pi.date_start IS NULL OR pi.date_start <= NOW())
+                           AND (pi.date_end IS NULL OR pi.date_end >= NOW())) AS actif,
+                   bool_or(pi.date_end IS NOT NULL AND pi.date_end < NOW()) AS a_expire
               FROM product_pricelist_item pi
               JOIN product_pricelist pl ON pl.id = pi.pricelist_id
               LEFT JOIN product_product pp ON pp.id = pi.product_id
@@ -12558,8 +13642,46 @@ class MaVieDashboardController(http.Controller):
              WHERE COALESCE(pi.product_tmpl_id, pp.product_tmpl_id) = ANY(%s)
              GROUP BY 1
         """, (list(tmpl_ids),))
-        return {t: {'liste': nom, 'remise': int(round(float(rem or 0)))}
-                for t, nom, rem in request.env.cr.fetchall() if t}
+        resultat = {t: {'liste': nom, 'remise': int(round(float(rem or 0))),
+                        'actif': bool(actif), 'expiree': bool(a_expire and not actif)}
+                    for t, nom, rem, actif, a_expire in request.env.cr.fetchall() if t}
+        # DEMANDE UTILISATEUR (2026-10-08) : cette détection ne regardait que
+        # les listes de prix (product.pricelist.item). Depuis que le coeur
+        # du moteur de solde pose des programmes Remise & Fidélité (mode
+        # 'promotion', loyalty.program) plutôt que des lignes de liste de
+        # prix — le vrai fix pour que la solde s'applique en caisse —, une
+        # référence soldée ainsi n'apparaissait JAMAIS comme « déjà soldée ».
+        # Vérifié en base avant d'écrire ce code (programmes actifs sur
+        # cette base de test, référence absente de la détection pricelist).
+        tmpl_ids_set = set(tmpl_ids)
+        Program = request.env['loyalty.program'].sudo()
+        programmes = Program.search([
+            ('program_type', '=', 'promotion'), ('active', '=', True),
+            '|', ('date_to', '=', False),
+                 ('date_to', '>=', fields.Date.context_today(request.env.user)),
+        ])
+        for prog in programmes:
+            remise_pct = 0.0
+            for reward in prog.reward_ids:
+                if reward.reward_type == 'discount' and reward.discount_mode == 'percent':
+                    remise_pct = max(remise_pct, reward.discount)
+            if remise_pct <= 0:
+                continue
+            for rule in prog.rule_ids:
+                for t in rule.product_ids.mapped('product_tmpl_id'):
+                    if t.id not in tmpl_ids_set:
+                        continue
+                    courant = resultat.get(t.id)
+                    # Ce programme est actif MAINTENANT (filtré plus haut) :
+                    # quel que soit le signal pricelist (même expiré), il y a
+                    # bien une remise en cours sur cette référence.
+                    if not courant or remise_pct > courant['remise']:
+                        resultat[t.id] = {'liste': prog.name, 'remise': int(round(remise_pct)),
+                                           'actif': True, 'expiree': False}
+                    else:
+                        courant['actif'] = True
+                        courant['expiree'] = False
+        return resultat
 
     @http.route('/mavie/api/solde-context', type='json', auth='user', methods=['POST'], csrf=False)
     def api_solde_context(self, **kw):
@@ -12626,6 +13748,7 @@ class MaVieDashboardController(http.Controller):
                     }
                 magasins.append({
                     'shop_field': m.shop_field,
+                    'warehouse_id': m.warehouse_id.id,
                     'magasin': m.warehouse_id.name,
                     'libelle': m.shop_label or m.warehouse_id.name,
                     'societe': m.company_id.name,
@@ -12638,6 +13761,9 @@ class MaVieDashboardController(http.Controller):
                 })
             magasins.sort(key=lambda x: (x['societe'], x['magasin']))
             ratio_ref = ratio_ref or 1.0
+            # DEMANDE UTILISATEUR (2026-10-12) : voir la photo de l'article
+            # avant de valider une solde, même affichage que la fiche produit.
+            src = self._image_availability({tmpl.id}).get(tmpl.id)
             return {
                 'operation': self._solde_operation(),
                 'product_tmpl_id': tmpl.id,
@@ -12647,9 +13773,104 @@ class MaVieDashboardController(http.Controller):
                 'couleur': couleur,
                 'nb_variantes': len(variantes) if variantes else 0,
                 'magasins': magasins,
+                'image_url': self._image_url(tmpl.id, src),
+                'has_image': bool(src),
             }
         except Exception as e:
             _logger.error(f"Erreur api_solde_context: {str(e)}", exc_info=True)
+            return {'error': str(e)}
+
+    def _stock_detail_par_variante(self, tmpl_id, warehouse_ids):
+        """{warehouse_id: [{'variante', 'stock'}, ...]} pour un article,
+        triée par stock décroissant — pour savoir exactement QUELLE couleur/
+        taille est disponible dans QUEL magasin avant de se déplacer."""
+        if not tmpl_id or not warehouse_ids:
+            return {}
+        request.env.cr.execute("""
+            SELECT w.id AS wh, pp.id AS variant_id, SUM(sq.quantity) AS qty
+              FROM stock_quant sq
+              JOIN product_product pp ON pp.id = sq.product_id
+              JOIN stock_location l ON l.id = sq.location_id
+              JOIN stock_warehouse w ON w.id = ANY(%(wh)s)
+              JOIN stock_location wl ON wl.id = w.lot_stock_id
+             WHERE pp.product_tmpl_id = %(tmpl)s
+               AND l.parent_path LIKE wl.parent_path || '%%'
+             GROUP BY 1, 2
+            HAVING SUM(sq.quantity) > 0
+        """, {'wh': list(warehouse_ids), 'tmpl': tmpl_id})
+        rows = request.env.cr.fetchall()
+        variant_ids = list({r[1] for r in rows})
+        # DEMANDE UTILISATRICE (2026-10-13) : couleur et pointure dans des
+        # colonnes séparées (pour un tableau unique magasin/couleur/pointure),
+        # pas un libellé combiné — même détection que resolve_variant_color_size,
+        # déjà utilisée partout ailleurs dans ce module pour ça.
+        infos = {}
+        for v in request.env['product.product'].sudo().browse(variant_ids):
+            couleur, pointure = resolve_variant_color_size(v)
+            infos[v.id] = {'couleur': couleur or '—', 'pointure': pointure or '—'}
+        par_wh = {}
+        for wh, vid, qty in rows:
+            info = infos.get(vid, {'couleur': '—', 'pointure': '—'})
+            par_wh.setdefault(wh, []).append({
+                'couleur': info['couleur'], 'pointure': info['pointure'], 'stock': int(round(qty)),
+            })
+        for wh in par_wh:
+            par_wh[wh].sort(key=lambda x: -x['stock'])
+        return par_wh
+
+    @http.route('/mavie/api/panier-progressif-stock', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_panier_progressif_stock(self, **kw):
+        """Détail du stock, par magasin ET par variante (couleur/taille),
+        pour l'article à acheter ET l'article offert d'un panier progressif.
+
+        DEMANDE UTILISATRICE (2026-10-13) : avant de se déplacer en magasin
+        poser une solde, savoir dans quel magasin les DEUX articles ont du
+        stock, et quelle variante précise choisir sur place."""
+        try:
+            offert_id = int(kw.get('offert_tmpl_id') or 0)
+            achat_id = int(kw.get('achat_tmpl_id') or 0) or offert_id
+            Tmpl = request.env['product.template'].sudo()
+            offert_tmpl = Tmpl.browse(offert_id)
+            if not offert_tmpl.exists():
+                return {'error': 'Référence offerte introuvable.'}
+            achat_tmpl = Tmpl.browse(achat_id) if achat_id != offert_id else offert_tmpl
+            mappings = self._solde_mappings()
+            wh_ids = mappings.mapped('warehouse_id').ids
+            detail_offert = self._stock_detail_par_variante(offert_tmpl.id, wh_ids)
+            detail_achat = (detail_offert if achat_id == offert_id
+                             else self._stock_detail_par_variante(achat_tmpl.id, wh_ids))
+            magasins = []
+            for m in mappings:
+                wid = m.warehouse_id.id
+                vo = detail_offert.get(wid) or []
+                va = detail_achat.get(wid) or []
+                magasins.append({
+                    'warehouse_id': wid,
+                    'magasin': m.warehouse_id.name,
+                    'libelle': m.shop_label or m.warehouse_id.name,
+                    'societe': m.company_id.name,
+                    'offert_total': sum(x['stock'] for x in vo),
+                    'offert_variantes': vo,
+                    'achat_total': sum(x['stock'] for x in va),
+                    'achat_variantes': va,
+                    'utilisable': bool(vo) and bool(va),
+                })
+            # Les magasins où les DEUX articles sont en stock d'abord : ce
+            # sont les seuls où le panier progressif peut réellement
+            # fonctionner — ensuite par volume total, pour repérer vite les
+            # plus gros dépôts.
+            magasins.sort(key=lambda x: (not x['utilisable'],
+                                          -(x['offert_total'] + x['achat_total'])))
+            return {
+                'offert': {'reference': offert_tmpl.base_pivot_reference or offert_tmpl.default_code or offert_tmpl.name,
+                           'nom': offert_tmpl.name},
+                'achat': None if achat_id == offert_id else
+                         {'reference': achat_tmpl.base_pivot_reference or achat_tmpl.default_code or achat_tmpl.name,
+                          'nom': achat_tmpl.name},
+                'magasins': magasins,
+            }
+        except Exception as e:
+            _logger.error(f"Erreur api_panier_progressif_stock: {str(e)}", exc_info=True)
             return {'error': str(e)}
 
     # ─────────────────────────────────────────────────────────────
@@ -12690,49 +13911,75 @@ class MaVieDashboardController(http.Controller):
         if couleur:
             libelle += ' ' + couleur
 
+        # Clé stable (sans la date) pour retrouver un programme déjà posé
+        # sur cette référence/couleur et le METTRE À JOUR plutôt que d'en
+        # recréer un à chaque réapplication — sinon Remise & Fidélité se
+        # remplit d'un programme par clic sur « Appliquer ».
+        prefixe_nom = 'Solde %s —' % libelle
         for company, data in par_societe.items():
             ratio = data['ratio']
             catalogue_ht = min(variantes.mapped('lst_price')) if variantes else tmpl.list_price
             pct = self._promo_pourcentage(catalogue_ht * ratio, prix_ttc)
             if not pct:
                 return None, ('Prix soldé trop proche du prix de vente : la remise calculée serait de 0 %.')
-            programme = Program.create({
-                'name': 'Solde %s — %s' % (libelle, (date_start or fields.Date.today().isoformat())),
-                'program_type': 'promotion',
-                'applies_on': 'current',
-                'trigger': 'auto',
-                'company_id': company.id,
-                'currency_id': company.currency_id.id,
-                # Caisses uniquement : le dashboard solde le magasin, pas les
-                # bons de vente inter-sociétés.
-                'pos_ok': True,
-                'sale_ok': False,
+            programme = Program.search([
+                ('company_id', '=', company.id),
+                ('program_type', '=', 'promotion'),
+                ('name', 'like', prefixe_nom),
+            ], limit=1)
+            programme_existant = bool(programme)
+            vals_programme = {
                 'date_from': date_start or False,
                 'date_to': date_end or False,
-                'pos_config_ids': [(6, 0, data['configs'].ids)],
-                'rule_ids': [(0, 0, {
-                    'mode': 'auto',
-                    'minimum_qty': 0,
-                    'minimum_amount': 1,
-                    'minimum_amount_tax_mode': 'incl',
-                    'reward_point_mode': 'order',
-                    'reward_point_amount': 1,
-                    'product_ids': [(6, 0, variantes.ids)],
-                })],
-                'reward_ids': [(0, 0, {
-                    'reward_type': 'discount',
-                    'discount_mode': 'percent',
-                    'discount': pct,
-                    'discount_applicability': 'specific',
-                    'discount_product_ids': [(6, 0, variantes.ids)],
-                    'required_points': 1,
-                })],
-            })
+                'active': True,
+            }
+            if programme:
+                vals_programme['pos_config_ids'] = [(6, 0, (programme.pos_config_ids | data['configs']).ids)]
+                programme.write(vals_programme)
+                if programme.rule_ids:
+                    programme.rule_ids[0].write({'product_ids': [(6, 0, variantes.ids)]})
+                if programme.reward_ids:
+                    programme.reward_ids[0].write({
+                        'discount': pct,
+                        'discount_product_ids': [(6, 0, variantes.ids)],
+                    })
+            else:
+                vals_programme.update({
+                    'name': '%s %s' % (prefixe_nom, (date_start or fields.Date.today().isoformat())),
+                    'program_type': 'promotion',
+                    'applies_on': 'current',
+                    'trigger': 'auto',
+                    'company_id': company.id,
+                    'currency_id': company.currency_id.id,
+                    # Caisses uniquement : le dashboard solde le magasin, pas
+                    # les bons de vente inter-sociétés.
+                    'pos_ok': True,
+                    'sale_ok': False,
+                    'pos_config_ids': [(6, 0, data['configs'].ids)],
+                    'rule_ids': [(0, 0, {
+                        'mode': 'auto',
+                        'minimum_qty': 0,
+                        'minimum_amount': 1,
+                        'minimum_amount_tax_mode': 'incl',
+                        'reward_point_mode': 'order',
+                        'reward_point_amount': 1,
+                        'product_ids': [(6, 0, variantes.ids)],
+                    })],
+                    'reward_ids': [(0, 0, {
+                        'reward_type': 'discount',
+                        'discount_mode': 'percent',
+                        'discount': pct,
+                        'discount_applicability': 'specific',
+                        'discount_product_ids': [(6, 0, variantes.ids)],
+                        'required_points': 1,
+                    })],
+                })
+                programme = Program.create(vals_programme)
             for m in data['mappings']:
                 resultats.append({
                     'magasin': m.warehouse_id.name,
                     'liste': programme.name,
-                    'liste_creee': True,
+                    'liste_creee': not programme_existant,
                     'promotion': True,
                     'remise_pct': pct,
                     'ancien_prix_ttc': None,
@@ -12816,6 +14063,124 @@ class MaVieDashboardController(http.Controller):
                                   'prix_ttc': 0, 'prix_ht': 0})
         return resultats, None
 
+    def _creer_bons_reduction(self, tmpl, variantes, kw, plan, date_start, date_end, libelle):
+        """Bons de réduction (program_type='coupons') : génère N codes
+        uniques, chacun valable une fois pour la remise sur cette référence.
+
+        DEMANDE UTILISATEUR (2026-10-08) : même richesse que le menu natif
+        Odoo « Type de programme ». Structure (trigger='with_code', aucune
+        rule_ids, un reward 'discount' à 1 point requis, puis des
+        loyalty.card générées à la main) copiée du code natif
+        loyalty.generate.wizard / _program_type_default_values — pas de
+        programme « coupons » existant dans cette base pour en copier un,
+        donc vérifiée contre la source Odoo plutôt que contre une donnée
+        réelle.
+        """
+        try:
+            nb = int(kw.get('coupons_nb') or 0)
+        except (TypeError, ValueError):
+            return None, 'Nombre de bons invalide.'
+        if nb < 1 or nb > 500:
+            return None, 'Le nombre de bons doit être entre 1 et 500.'
+        pct = self._promo_pourcentage_demandee(tmpl, variantes, kw, plan)
+        if not pct:
+            return None, 'Indiquez un prix soldé ou une remise.'
+        Program = request.env['loyalty.program'].sudo()
+        Card = request.env['loyalty.card'].sudo()
+        resultats = []
+        for company, data in self._programme_societes(plan).items():
+            programme = Program.create({
+                'name': 'Bons de réduction %s — %s' % (libelle, (date_start or fields.Date.today().isoformat())),
+                'program_type': 'coupons',
+                'applies_on': 'current',
+                'trigger': 'with_code',
+                'company_id': company.id,
+                'currency_id': company.currency_id.id,
+                'pos_ok': True,
+                'sale_ok': False,
+                'date_from': date_start or False,
+                'date_to': date_end or False,
+                'pos_config_ids': [(6, 0, data['configs'].ids)],
+                'rule_ids': [(5, 0, 0)],
+                'reward_ids': [(0, 0, {
+                    'reward_type': 'discount',
+                    'discount_mode': 'percent',
+                    'discount': pct,
+                    'discount_applicability': 'specific',
+                    'discount_product_ids': [(6, 0, variantes.ids)],
+                    'required_points': 1,
+                })],
+            })
+            Card.create([{
+                'program_id': programme.id,
+                'points': 1,
+                'expiration_date': date_end or False,
+            } for _i in range(nb)])
+            for m in data['mappings']:
+                resultats.append({
+                    'magasin': m.warehouse_id.name, 'liste': programme.name,
+                    'coupons': True, 'remise_pct': pct, 'nb_coupons': nb,
+                    'liste_creee': True, 'ancien_prix_ttc': None,
+                    'prix_ttc': 0, 'prix_ht': 0,
+                })
+        return resultats, None
+
+    def _creer_bon_prochaine_commande(self, variantes, kw, plan, date_start, date_end, libelle):
+        """Bon de réduction pour la prochaine commande (program_type=
+        'next_order_coupons') : l'achat de cette référence donne un bon
+        valable sur la commande SUIVANTE (pas sur celle-ci).
+
+        Structure copiée de _program_type_default_values côté Odoo
+        (applies_on='future', trigger='auto', reward 'order'-wide) — pas de
+        programme existant dans cette base pour ce type, vérifiée contre la
+        source plutôt qu'une donnée réelle.
+        """
+        try:
+            remise = float(kw.get('remise_pct') or 0)
+        except (TypeError, ValueError):
+            remise = 0
+        if not (0 < remise < 100):
+            return None, 'Indiquez une remise entre 1 et 99 %.'
+        Program = request.env['loyalty.program'].sudo()
+        resultats = []
+        for company, data in self._programme_societes(plan).items():
+            programme = Program.create({
+                'name': 'Bon prochaine commande %s — %s' % (libelle, (date_start or fields.Date.today().isoformat())),
+                'program_type': 'next_order_coupons',
+                'applies_on': 'future',
+                'trigger': 'auto',
+                'company_id': company.id,
+                'currency_id': company.currency_id.id,
+                'pos_ok': True,
+                'sale_ok': False,
+                'date_from': date_start or False,
+                'date_to': date_end or False,
+                'pos_config_ids': [(6, 0, data['configs'].ids)],
+                'rule_ids': [(0, 0, {
+                    'mode': 'auto',
+                    'any_product': False,
+                    'product_ids': [(6, 0, variantes.ids)],
+                    'minimum_qty': 1,
+                    'reward_point_mode': 'order',
+                    'reward_point_amount': 1,
+                })],
+                'reward_ids': [(0, 0, {
+                    'reward_type': 'discount',
+                    'discount_mode': 'percent',
+                    'discount': remise,
+                    'discount_applicability': 'order',
+                    'required_points': 1,
+                })],
+            })
+            for m in data['mappings']:
+                resultats.append({
+                    'magasin': m.warehouse_id.name, 'liste': programme.name,
+                    'bon_prochaine_commande': True, 'remise_pct': remise,
+                    'liste_creee': True, 'ancien_prix_ttc': None,
+                    'prix_ttc': 0, 'prix_ht': 0,
+                })
+        return resultats, None
+
     def _creer_carte_cadeau(self, kw, plan, date_end, libelle):
         try:
             montant = float(kw.get('montant') or 0)
@@ -12868,6 +14233,192 @@ class MaVieDashboardController(http.Controller):
                                   'liste_creee': creee, 'cartes': cartes.mapped('code'),
                                   'montant': montant, 'ancien_prix_ttc': None,
                                   'prix_ttc': montant, 'prix_ht': montant})
+        return resultats, None
+
+    def _creer_panier_progressif(self, variantes, kw, plan, date_start, date_end, libelle):
+        """Panier progressif (« Achetez X, recevez Y ») : pour X pièces
+        achetées, Y sont offertes avec une remise dessus (100 % = gratuit).
+
+        DEMANDE UTILISATEUR (2026-10-08). Structure calquée sur un
+        programme buy_x_get_y déjà posé à la main sur la base Elite (même
+        champs, mêmes valeurs par défaut) — vérifiée en base avant
+        d'écrire ce code plutôt que devinée.
+
+        DEMANDE UTILISATEUR (2026-10-12) : l'offerte (`variantes`, l'article
+        qui dort) peut être couplée à une AUTRE référence à acheter
+        (`bxgy_article_achat_id`), pas forcément elle-même — ex. « achetez
+        la référence qui se vend bien, recevez la référence qui dort
+        offerte », pour écouler le stock dormant via un article qui tourne.
+        Garde-fou : l'offerte doit toujours être la moins chère des deux,
+        sans quoi le magasin perdrait de l'argent à chaque vente.
+        """
+        try:
+            qte_achat = int(kw.get('bxgy_x') or 0)
+            qte_offerte = int(kw.get('bxgy_y') or 0)
+            remise = float(kw.get('bxgy_remise') or 0)
+        except (TypeError, ValueError):
+            return None, 'Quantités ou remise invalides.'
+        if qte_achat < 1:
+            return None, 'La quantité à acheter doit être au moins 1.'
+        if qte_offerte < 1:
+            return None, 'La quantité offerte doit être au moins 1.'
+        if not (0 < remise <= 100):
+            return None, 'La remise doit être entre 1 et 100 %.'
+
+        achat_variantes = variantes
+        libelle_achat = libelle
+        prix_unitaire_offerte = min(variantes.mapped('lst_price')) if variantes else 0.0
+        try:
+            achat_tmpl_id = int(kw.get('bxgy_article_achat_id') or 0)
+        except (TypeError, ValueError):
+            achat_tmpl_id = 0
+        if achat_tmpl_id and achat_tmpl_id != (variantes.product_tmpl_id.id if variantes else 0):
+            achat_tmpl = request.env['product.template'].sudo().browse(achat_tmpl_id)
+            if not achat_tmpl.exists():
+                return None, 'Référence à acheter introuvable.'
+            achat_variantes = achat_tmpl.product_variant_ids
+            if not achat_variantes:
+                return None, 'Aucune variante active pour la référence à acheter.'
+            libelle_achat = (achat_tmpl.base_pivot_reference or achat_tmpl.default_code
+                              or achat_tmpl.name or '').strip()
+            prix_achat = min(achat_variantes.mapped('lst_price')) if achat_variantes else 0.0
+            if prix_unitaire_offerte > prix_achat:
+                return None, (
+                    "L'article offert (%s, %.2f MAD) coûte plus cher que l'article à "
+                    "acheter (%s, %.2f MAD) : l'offerte doit toujours être la moins "
+                    "chère des deux." % (libelle, prix_unitaire_offerte, libelle_achat, prix_achat))
+
+        Program = request.env['loyalty.program'].sudo()
+        Tag = request.env['product.tag'].sudo()
+        # reward_product_ids sur loyalty.reward est un champ CALCULÉ en lecture
+        # seule (= reward_product_id + reward_product_tag_id.product_ids) :
+        # on ne peut pas y écrire directement une liste de variantes. Pour que
+        # l'offre couvre toutes les couleurs/tailles de la référence, on passe
+        # par un product.tag qui regroupe ces variantes (vérifié en base sur
+        # le modèle loyalty.reward / product.tag avant d'écrire ce code).
+        nom_tag = 'Panier progressif — %s' % libelle
+        tag = Tag.search([('name', '=', nom_tag)], limit=1)
+        if tag:
+            tag.write({'product_product_ids': [(6, 0, variantes.ids)]})
+        else:
+            tag = Tag.create({'name': nom_tag, 'product_product_ids': [(6, 0, variantes.ids)]})
+        nom_programme = (
+            'Panier progressif %s → %s offert — %s' % (
+                libelle_achat, libelle, (date_start or fields.Date.today().isoformat()))
+            if achat_variantes is not variantes else
+            'Panier progressif %s — %s' % (libelle, (date_start or fields.Date.today().isoformat()))
+        )
+        # BUG CORRIGÉ (2026-10-13) : pour reward_type='product', Odoo ignore
+        # purement et simplement le champ `discount` — il code en dur 100 %
+        # de remise dans _get_reward_values_product() (sale_loyalty/models/
+        # sale_order.py), quelle que soit la valeur écrite ici. Constaté en
+        # base : un programme avec discount=50.0 donnait quand même
+        # l'article totalement gratuit en caisse. Une remise < 100 % doit
+        # donc passer par reward_type='discount' (ciblé sur le tag via
+        # discount_product_tag_id), plafonné par discount_max_amount pour
+        # ne jamais dépasser l'équivalent de « qte_offerte unités à remise
+        # % » même si le client a plus d'unités de l'article dans le panier.
+        if remise >= 100:
+            reward_vals_fixe = {
+                'reward_type': 'product',
+                'discount': remise,
+                'discount_mode': 'percent',
+                'discount_applicability': 'order',
+                'required_points': qte_achat,
+                'reward_product_tag_id': tag.id,
+                'discount_product_tag_id': False,
+                'reward_product_qty': qte_offerte,
+                'multi_product': False,
+            }
+        else:
+            reward_vals_fixe = None
+
+        resultats = []
+        for company, data in self._programme_societes(plan).items():
+            if reward_vals_fixe is not None:
+                reward_vals = reward_vals_fixe
+            else:
+                # BUG CORRIGÉ (2026-10-13) : le plafond doit être en TTC, pas
+                # en HT. _discountable_specific() (sale_loyalty) calcule le
+                # montant remisable à partir de price_total (TTC) des lignes,
+                # et compare discount_max_amount à ce même montant TTC.
+                # Écrire le plafond en HT (prix catalogue sans taxe) le
+                # limitait artificiellement : constaté en base, un plafond de
+                # 116,25 DH (HT) donnait -116,26 DH en caisse au lieu de
+                # -139,50 DH (50 % de 279,00 DH TTC) — soit 41,7 % de remise
+                # réelle au lieu des 50 % voulus.
+                ratio = self._solde_tax_ratio(variantes.product_tmpl_id, company)
+                plafond = round(prix_unitaire_offerte * ratio * qte_offerte * (remise / 100.0), 2)
+                reward_vals = {
+                    'reward_type': 'discount',
+                    'discount': remise,
+                    'discount_mode': 'percent',
+                    'discount_applicability': 'specific',
+                    'discount_product_tag_id': tag.id,
+                    'reward_product_tag_id': False,
+                    'discount_max_amount': plafond,
+                    'required_points': qte_achat,
+                }
+            # BUG CORRIGÉ (2026-10-13) : chaque clic sur « Créer le panier
+            # progressif » créait un NOUVEAU programme au lieu de réutiliser
+            # celui déjà posé pour le même couple achat/offert — constaté en
+            # base : 3 programmes identiques actifs simultanément, dont les
+            # remises se cumulaient sur un même achat (100 % + 50 % au lieu
+            # de 50 % voulu). On met à jour en place le programme déjà actif
+            # pour cette paire (même société, même règle d'achat, même
+            # article offert) plutôt que d'en empiler un autre.
+            existant = Program.search([
+                ('company_id', '=', company.id),
+                ('program_type', '=', 'buy_x_get_y'),
+                ('active', '=', True),
+                '|',
+                ('reward_ids.reward_product_tag_id', '=', tag.id),
+                ('reward_ids.discount_product_tag_id', '=', tag.id),
+            ]).filtered(lambda p: set(p.rule_ids.product_ids.ids) == set(achat_variantes.ids))
+            if existant:
+                programme = existant[0]
+                programme.write({
+                    'pos_config_ids': [(6, 0, data['configs'].ids)],
+                    'date_from': date_start or False,
+                    'date_to': date_end or False,
+                })
+                programme.rule_ids.write({
+                    'minimum_qty': qte_achat,
+                    'product_ids': [(6, 0, achat_variantes.ids)],
+                })
+                programme.reward_ids.write(reward_vals)
+                if len(existant) > 1:
+                    existant[1:].write({'active': False})
+            else:
+                programme = Program.create({
+                    'name': nom_programme,
+                    'program_type': 'buy_x_get_y',
+                    'applies_on': 'current',
+                    'trigger': 'auto',
+                    'company_id': company.id,
+                    'currency_id': company.currency_id.id,
+                    'pos_ok': True,
+                    'sale_ok': False,
+                    'date_from': date_start or False,
+                    'date_to': date_end or False,
+                    'pos_config_ids': [(6, 0, data['configs'].ids)],
+                    'rule_ids': [(0, 0, {
+                        'mode': 'auto',
+                        'minimum_qty': qte_achat,
+                        'any_product': False,
+                        'product_ids': [(6, 0, achat_variantes.ids)],
+                        'reward_point_mode': 'unit',
+                        'reward_point_amount': 1,
+                    })],
+                    'reward_ids': [(0, 0, reward_vals)],
+                })
+            for m in data['mappings']:
+                resultats.append({
+                    'magasin': m.warehouse_id.name, 'liste': programme.name,
+                    'liste_creee': True, 'bxgy': True,
+                    'bxgy_x': qte_achat, 'bxgy_y': qte_offerte, 'remise_pct': remise,
+                    'ancien_prix_ttc': None, 'prix_ttc': 0, 'prix_ht': 0,
+                })
         return resultats, None
 
     def _creer_fidelite(self, kw, plan, date_start, date_end):
@@ -12996,12 +14547,21 @@ class MaVieDashboardController(http.Controller):
                 libelle += ' ' + couleur
             cibles_prog = variantes if variantes else tmpl.product_variant_ids
 
-            if mode in ('promo_code', 'gift_card', 'loyalty'):
+            if mode in ('promo_code', 'gift_card', 'loyalty', 'buy_x_get_y', 'coupons', 'next_order_coupons'):
                 if mode == 'promo_code':
                     resultats, erreur = self._creer_code_promo(
                         tmpl, cibles_prog, kw, plan, date_start, date_end, libelle)
                 elif mode == 'gift_card':
                     resultats, erreur = self._creer_carte_cadeau(kw, plan, date_end, libelle)
+                elif mode == 'buy_x_get_y':
+                    resultats, erreur = self._creer_panier_progressif(
+                        cibles_prog, kw, plan, date_start, date_end, libelle)
+                elif mode == 'coupons':
+                    resultats, erreur = self._creer_bons_reduction(
+                        tmpl, cibles_prog, kw, plan, date_start, date_end, libelle)
+                elif mode == 'next_order_coupons':
+                    resultats, erreur = self._creer_bon_prochaine_commande(
+                        cibles_prog, kw, plan, date_start, date_end, libelle)
                 else:
                     resultats, erreur = self._creer_fidelite(kw, plan, date_start, date_end)
                 if erreur:
@@ -13162,7 +14722,7 @@ class MaVieDashboardController(http.Controller):
                 'date': fields.Datetime.to_string(it.create_date)[:16] if it.create_date else '—',
                 'modifiee': (fields.Datetime.to_string(it.write_date)[:16]
                              if it.write_date and it.create_date and (it.write_date - it.create_date).total_seconds() > 60 else ''),
-                'par': it.create_uid.name or '—',
+                'par': it.create_uid.login or it.create_uid.name or '—',
                 'liste': pl.name,
                 'societe': pl.company_id.name or '',
                 'magasins': caisses.mapped('name'),

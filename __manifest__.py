@@ -23,6 +23,7 @@
     ],
     'data': [
         'security/ir.model.access.csv',
+        'data/suivi_cron.xml',
         'views/dashboard_menu.xml',
         'views/dashboard_templates.xml',
         'views/mv_batch_shop_mapping_views_ext.xml',

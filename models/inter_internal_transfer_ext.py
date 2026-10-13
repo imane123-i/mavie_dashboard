@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from datetime import timedelta
+
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
 
@@ -14,6 +16,114 @@ class InterInternalTransferExt(models.Model):
     _inherit = 'inter.internal.transfer'
 
     date_validation = fields.Datetime(string='Fait le', readonly=True, copy=False)
+
+    # ── Validation « envoyé = reçu » côté page Suivi du dashboard ──
+    # DEMANDE UTILISATEUR (2026-10-08) : le responsable doit pouvoir confirmer
+    # qu'un bon est parfait (même quantité envoyée et reçue) d'un coup de
+    # case à cocher, qui laisse une trace (qui, quand). Champ séparé de
+    # `state`/`date_validation` (qui suivent le circuit d'approbation Odoo) :
+    # celui-ci ne vaut que pour la vérification envoyé/reçu faite depuis le
+    # dashboard, qu'un bon soit déjà "Fait" ou non n'a pas d'incidence dessus.
+    dashboard_valide = fields.Boolean(string='Vérifié (envoyé = reçu)', copy=False)
+    dashboard_valide_uid = fields.Many2one('res.users', string='Vérifié par', readonly=True, copy=False)
+    dashboard_valide_date = fields.Datetime(string='Vérifié le', readonly=True, copy=False)
+
+    # DEMANDE UTILISATEUR (2026-10-08) : une anomalie (écart envoyé/reçu) ne
+    # doit pas rester un drapeau rouge indéfiniment une fois la cause
+    # trouvée (casse, vol, erreur de comptage...) — une note explique
+    # pourquoi, sans effacer l'écart lui-même (qui reste un fait constaté).
+    dashboard_anomalie_note = fields.Char(string='Explication de l\'écart', copy=False)
+    dashboard_anomalie_uid = fields.Many2one('res.users', string='Expliqué par', readonly=True, copy=False)
+    dashboard_anomalie_date = fields.Datetime(string='Expliqué le', readonly=True, copy=False)
+
+    # DEMANDE UTILISATEUR (2026-10-08) : « quelque chose qui va m'aider
+    # beaucoup » — jusqu'ici la page Suivi est entièrement en lecture
+    # active (il faut l'ouvrir pour remarquer un problème). Un bon bloqué
+    # ou une anomalie fraîche notifient maintenant tout seuls, dans la
+    # boîte Odoo du responsable approvisionnement (JAMAIS d'email, base de
+    # test — même règle que les autres notifications du module).
+    dashboard_derniere_alerte = fields.Datetime(
+        string='Dernière alerte Suivi', readonly=True, copy=False,
+        help="Horodatage de la dernière notification automatique (bon bloqué "
+             "ou écart détecté) envoyée pour ce transfert — évite de renotifier "
+             "à chaque passage du cron.")
+
+    SUIVI_SEUIL_BLOQUE_JOURS = 5
+
+    @api.model
+    def _cron_suivi_alertes(self):
+        """Notifie automatiquement (boîte Odoo) les bons bloqués depuis
+        trop longtemps et les écarts envoyé/reçu fraîchement détectés —
+        sans attendre que quelqu'un pense à ouvrir la page Suivi du
+        dashboard. Une notification par bon et par problème au plus une
+        fois par 24h (voir dashboard_derniere_alerte)."""
+        appro = self.env['res.users'].sudo().search([
+            ('groups_id', '=', self.env.ref('transfert_interne.group_transfert_appro').id)])
+        if not appro:
+            return
+        pas_recemment_alerte = ['|', ('dashboard_derniere_alerte', '=', False),
+                                 ('dashboard_derniere_alerte', '<=',
+                                  fields.Datetime.now() - timedelta(days=1))]
+
+        # 1) Bons encore en attente/transmis depuis trop longtemps : personne
+        # ne les a ni collectés ni validés.
+        limite = fields.Datetime.now() - timedelta(days=self.SUIVI_SEUIL_BLOQUE_JOURS)
+        state_labels = dict(self._fields['state'].selection)
+        bloques = self.sudo().search([
+            ('state', 'in', ('submitted', 'transmitted')),
+            ('create_date', '<=', limite),
+        ] + pas_recemment_alerte)
+        for tr in bloques:
+            jours = (fields.Datetime.now() - tr.create_date).days
+            tr._notifier_boite(
+                appro, _("Transfert %s bloqué depuis %s jours") % (tr.name, jours),
+                _("Le transfert %s (%s → %s) est encore « %s » depuis %s jours : "
+                  "personne ne semble l'avoir collecté ni validé.") % (
+                    tr.name, tr.emetteur_display or '—', tr.recepteur_display or '—',
+                    state_labels.get(tr.state, tr.state), jours))
+            tr.dashboard_derniere_alerte = fields.Datetime.now()
+
+        # 2) Écarts envoyé/reçu fraîchement constatés (réception collectée,
+        # pas encore expliqués) : même calcul que la page Suivi du
+        # dashboard (mavie_dashboard/controllers/dashboard.py).
+        candidats = self.sudo().search([
+            ('picking_id', '!=', False),
+            ('picking_id.state', '=', 'done'),
+            ('dashboard_anomalie_note', '=', False),
+        ] + pas_recemment_alerte)
+        for tr in candidats:
+            # Suit aussi les reliquats (backorders) du picking : sinon une
+            # pièce réceptionnée plus tard via un reliquat déclenche une
+            # fausse alerte ici alors qu'elle est bien arrivée. Même règle
+            # que mavie_dashboard/controllers/dashboard.py
+            # (_suivi_pickings_resolus) — dupliquée ici car ce module ne
+            # peut pas dépendre du contrôleur HTTP.
+            vus = tr.picking_id
+            a_traiter = [tr.picking_id]
+            resolu = True
+            while a_traiter:
+                p = a_traiter.pop()
+                if p.state not in ('done', 'cancel'):
+                    resolu = False
+                for bo in p.backorder_ids:
+                    if bo.id not in vus.ids:
+                        vus |= bo
+                        a_traiter.append(bo)
+            if not resolu:
+                continue
+            envoye = sum(tr.line_ids.mapped('quantity'))
+            recu = sum(vus.filtered(lambda p: p.state == 'done').move_line_ids.mapped('quantity'))
+            ecart = envoye - recu
+            if not ecart:
+                continue
+            mot = (_("il manque %s pièce(s)") % int(ecart)) if ecart > 0 \
+                else (_("%s pièce(s) en trop") % int(-ecart))
+            tr._notifier_boite(
+                appro, _("Écart détecté sur %s") % tr.name,
+                _("Le transfert %s (%s → %s) a un écart : %s (envoyé %s, reçu %s).") % (
+                    tr.name, tr.emetteur_display or '—', tr.recepteur_display or '—',
+                    mot, int(envoye), int(recu)))
+            tr.dashboard_derniere_alerte = fields.Datetime.now()
 
     def _notify_destinataire_for_reception(self):
         super()._notify_destinataire_for_reception()
@@ -77,9 +187,36 @@ class InterInternalTransferExt(models.Model):
         # puis done » place le nouvel état AVANT « Fait » dans la barre
         # d'état, comme dans le parcours réel. Sans cette ancre, il serait
         # simplement ajouté à la fin, après « Fait ».
-        selection_add=[('transmitted', "Transmis à l'inventaire"), ('done',), ('cancelled', 'Annulé')],
-        ondelete={'transmitted': 'set default', 'cancelled': 'set default'},
+        #
+        # BUG CRITIQUE CORRIGÉ (2026-10-12) : 'received' est un état NATIF du
+        # module transfert_interne sur TEST-ELITE (4 états : draft/submitted/
+        # received/done), mais ABSENT du transfert_interne de « recette
+        # test » (seulement 3 : draft/submitted/done) — vérifié en base des
+        # deux côtés. action_validate() ci-dessous écrit pourtant
+        # `state: 'received'` pour tout transfert inter-sociétés soumis :
+        # sans l'ajouter ici, cette écriture levait une erreur de valeur de
+        # sélection invalide et FAISAIT PLANTER la validation de tout
+        # transfert entre deux sociétés sur « recette test ». Réajouter
+        # 'received' avec le même libellé est sans effet sur TEST-ELITE (déjà
+        # natif là-bas), et corrige le crash sur les bases où il manque.
+        selection_add=[
+            ('transmitted', "Transmis à l'inventaire"),
+            ('received', "Réceptionné - en attente de validation appro"),
+            ('done',), ('cancelled', 'Annulé'),
+        ],
+        ondelete={'transmitted': 'set default', 'received': 'set default', 'cancelled': 'set default'},
     )
+    # BUG CRITIQUE CORRIGÉ (2026-10-12) : même problème que 'received'
+    # ci-dessus, mais pour les deux champs qui l'accompagnent —
+    # received_uid/received_date sont nativement déclarés dans le
+    # transfert_interne de TEST-ELITE, mais ABSENTS de celui de
+    # « recette test » (vérifié en base). action_validate() les écrit
+    # pourtant pour tout transfert inter-sociétés soumis : sans les
+    # redéclarer ici, l'écriture plantait avec « champ inconnu » sur les
+    # bases où ils manquent. Les redéclarer est sans effet sur TEST-ELITE
+    # (déjà natifs là-bas, même type).
+    received_uid = fields.Many2one('res.users', string='Réceptionné par (destinataire)', readonly=True)
+    received_date = fields.Datetime(string='Date de réception', readonly=True)
     picking_id = fields.Many2one(
         'stock.picking',
         string="Opération d'inventaire",
@@ -241,7 +378,50 @@ class InterInternalTransferExt(models.Model):
         if ajustements:
             self.message_post(body='Quantités ajustées à la validation (stock insuffisant) :<br/>'
                               + '<br/>'.join(ajustements))
+
+        # ── Garde-fou stock destination (transferts ENTRE sociétés) ──
+        # DEMANDE UTILISATEUR (2026-10-09), après avoir trouvé via le Suivi
+        # du dashboard des bons marqués « Réceptionné » dont l'article
+        # n'était en réalité JAMAIS arrivé dans le stock du magasin
+        # destinataire : « Réceptionné » ne vérifiait jusqu'ici QUE la
+        # disponibilité côté source (ci-dessus), jamais que quoi que ce
+        # soit soit réellement crédité côté destination — un choix déjà
+        # fait avant cette évolution (voir commentaire plus haut), pas un
+        # bug introduit ici. Le circuit avoir + commande d'achat
+        # (super().action_validate(), transfert_interne — module qu'on ne
+        # peut pas modifier) est censé « réceptionner automatiquement » ;
+        # on le laisse faire, puis on vérifie après coup que le stock
+        # destination a vraiment augmenté d'autant. Si non, on bloque :
+        # l'exception annule TOUTE la transaction (avoir et commande
+        # d'achat compris), rien n'est enregistré à moitié.
+        inter_societes = self.company_source_id != self.company_target_id
+        avant_dest = {}
+        if inter_societes and self.line_ids and self.location_target_id:
+            QuantDest = self.env['stock.quant'].sudo().with_company(self.company_target_id)
+            for l in self.line_ids:
+                avant_dest[l.id] = (
+                    l.product_id,
+                    l.quantity,
+                    max(QuantDest._get_available_quantity(l.product_id, self.location_target_id), 0),
+                )
+
         resultat = super().action_validate()
+
+        if avant_dest:
+            QuantDest = self.env['stock.quant'].sudo().with_company(self.company_target_id)
+            problemes = []
+            for product, qte_attendue, stock_avant in avant_dest.values():
+                stock_apres = max(QuantDest._get_available_quantity(product, self.location_target_id), 0)
+                if (stock_apres - stock_avant) + 1e-6 < qte_attendue:
+                    problemes.append('%s : attendu +%s, stock du magasin destinataire a augmenté de %s' % (
+                        product.display_name, int(qte_attendue), int(stock_apres - stock_avant)))
+            if problemes:
+                raise UserError(_(
+                    "Validation bloquée : le stock de %s n'a pas augmenté comme attendu après ce "
+                    "transfert — rien n'a été enregistré (ni la réception, ni l'avoir, ni la "
+                    "commande d'achat).\n\n%s\n\nVérifiez la référence de l'article et réessayez."
+                ) % (self.recepteur_display or self.company_target_id.name, '\n'.join(problemes)))
+
         if ajustements:
             return {'type': 'ir.actions.client', 'tag': 'display_notification', 'params': {
                 'title': 'Transfert validé avec quantités ajustées',
@@ -251,7 +431,15 @@ class InterInternalTransferExt(models.Model):
 
     def _create_intra_company_picking(self):
         """Crée l'opération d'inventaire interne (même société, deux
-        emplacements) : confirmée et réservée, mais PAS validée.
+        emplacements) : confirmée, mais PAS réservée ni validée.
+
+        DEMANDE UTILISATEUR (2026-10-07) : le bon doit rester « En attente »
+        (confirmé, pas réservé) tant que le responsable n'a pas lui-même
+        vérifié la disponibilité dans Inventaire — avant, le dashboard
+        réservait tout de suite (action_assign) et le bon arrivait déjà
+        « Prêt », sans geste de validation du responsable. C'est ce dernier
+        qui déclenche la réservation (« Vérifier la disponibilité ») puis
+        valide, comme pour ses autres opérations.
 
         C'est le bon que le responsable retrouve dans Inventaire →
         Transferts → Interne. Sa validation repasse ce transfert à « Fait »
@@ -306,9 +494,14 @@ class InterInternalTransferExt(models.Model):
             })
 
         picking.action_confirm()
-        # Réserve la marchandise : elle n'est plus proposée comme disponible
-        # pour un autre transfert tant que celui-ci n'est pas collecté.
-        picking.action_assign()
+        # CORRECTION (2026-10-08) : enlever le action_assign() ne suffisait
+        # pas — le type d'opération a « Réserver à la confirmation » par
+        # défaut dans Odoo, donc action_confirm() réserve déjà tout seul et
+        # le bon arrivait quand même à « Prêt ». do_unreserve() est la même
+        # action que le bouton « Annuler la disponibilité » dans Odoo : le
+        # bon redescend à « En attente », et c'est le responsable qui
+        # réserve lui-même en vérifiant la disponibilité dans Inventaire.
+        picking.do_unreserve()
         return picking
 
     def open_picking(self):

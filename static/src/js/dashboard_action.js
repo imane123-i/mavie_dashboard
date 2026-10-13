@@ -48,8 +48,17 @@ export class MaVieDashboardActionPropositions extends MaVieDashboardAction {
 }
 MaVieDashboardActionPropositions.template = "mavie_dashboard.IframeView";
 
+// Page « Suivi » : envoyé/reçu côte à côte, bon par bon.
+export class MaVieDashboardActionSuivi extends MaVieDashboardAction {
+    get page() {
+        return 'suivi';
+    }
+}
+MaVieDashboardActionSuivi.template = "mavie_dashboard.IframeView";
+
 // Register action components
 registry.category("actions").add("mavie_dashboard.action_sales", MaVieDashboardActionSales);
 registry.category("actions").add("mavie_dashboard.action_stock", MaVieDashboardActionStock);
 registry.category("actions").add("mavie_dashboard.action_action", MaVieDashboardActionAction);
 registry.category("actions").add("mavie_dashboard.action_propositions", MaVieDashboardActionPropositions);
+registry.category("actions").add("mavie_dashboard.action_suivi", MaVieDashboardActionSuivi);

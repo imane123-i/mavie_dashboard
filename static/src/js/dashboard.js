@@ -5,17 +5,19 @@
  * mv.article.base (Base Pivot) pour les calculs affichés.
  */
 
+var PAGES_CONNUES = ['ventes', 'stock', 'commandes', 'action', 'propositions', 'suivi'];
+
 function detectCurrentPage() {
     var urlP = new URLSearchParams(window.location.search);
     var p = urlP.get('page');
-    if (p && ['ventes', 'stock', 'commandes', 'action', 'propositions'].indexOf(p) !== -1) return p;
+    if (p && PAGES_CONNUES.indexOf(p) !== -1) return p;
     var hash = window.location.hash;
     var hashMatch = hash.match(/page=([^&]+)/);
-    if (hashMatch && ['ventes', 'stock', 'commandes', 'action', 'propositions'].indexOf(hashMatch[1]) !== -1) return hashMatch[1];
+    if (hashMatch && PAGES_CONNUES.indexOf(hashMatch[1]) !== -1) return hashMatch[1];
     try {
         var ref = new URLSearchParams(window.parent.location.search);
         var rp = ref.get('page');
-        if (rp && ['ventes', 'stock', 'commandes', 'action', 'propositions'].indexOf(rp) !== -1) return rp;
+        if (rp && PAGES_CONNUES.indexOf(rp) !== -1) return rp;
     } catch(e) {}
     return 'ventes';
 }
@@ -35,6 +37,10 @@ var state = {
     flop_limit: 10,
     top_products_all: [],
     flop_products_all: [],
+    top_couleurs_limit: 10,
+    flop_couleurs_limit: 10,
+    top_couleurs_all: [],
+    flop_couleurs_all: [],
     filters_loaded: false,
     shops: [],
     proches_rupture_30j_cache: [],
@@ -421,6 +427,8 @@ function updateFiltersFromUI() {
     var batEl  = el('filter-batch');
     var topLimitEl = el('top-limit');
     var flopLimitEl = el('flop-limit');
+    var topCouleursLimitEl = el('top-couleurs-limit');
+    var flopCouleursLimitEl = el('flop-couleurs-limit');
 
     var period = _computePeriodDates();
 
@@ -433,6 +441,8 @@ function updateFiltersFromUI() {
     state.date_end      = period.end;
     state.top_limit     = (topLimitEl && topLimitEl.value && !isNaN(parseInt(topLimitEl.value))) ? Math.max(1, parseInt(topLimitEl.value)) : 10;
     state.flop_limit    = (flopLimitEl && flopLimitEl.value && !isNaN(parseInt(flopLimitEl.value))) ? Math.max(1, parseInt(flopLimitEl.value)) : 10;
+    state.top_couleurs_limit  = (topCouleursLimitEl && topCouleursLimitEl.value && !isNaN(parseInt(topCouleursLimitEl.value))) ? Math.max(1, parseInt(topCouleursLimitEl.value)) : 10;
+    state.flop_couleurs_limit = (flopCouleursLimitEl && flopCouleursLimitEl.value && !isNaN(parseInt(flopCouleursLimitEl.value))) ? Math.max(1, parseInt(flopCouleursLimitEl.value)) : 10;
 }
 
 // ── Filtre Catégorie : menu à cocher ───────────────────────────────────
@@ -563,6 +573,8 @@ function getFilterParams() {
         date_end:      state.date_end,
         top_limit:     state.top_limit,
         flop_limit:    state.flop_limit,
+        top_couleurs_limit:  state.top_couleurs_limit,
+        flop_couleurs_limit: state.flop_couleurs_limit,
         page:          currentPage,
     };
 }
@@ -577,7 +589,7 @@ function isHistoryPage() {
 function adjustUIForPage() {
     // ── Bascule entre l'ancien tableau de bord et le nouveau "Stock & Rupture" ──
     var stockOnlyIds  = ['stock-kpi-grid', 'stock-middle-section', 'stock-30j-section', 'stock-valorisation-section'];
-    var legacyOnlyIds = ['main-kpi-grid', 'section-top-flop'];
+    var legacyOnlyIds = ['main-kpi-grid', 'section-top-flop', 'section-top-flop-couleurs'];
 
     if (currentPage === 'stock') {
         stockOnlyIds.forEach(function(id)  { var e = el(id); if (e) e.style.display = ''; });
@@ -603,12 +615,26 @@ function adjustUIForPage() {
     var actionPage = el('action-page');
     if (actionPage) actionPage.style.display = currentPage === 'action' ? '' : 'none';
 
+    // Page « Suivi » : seul son tableau s'affiche.
+    var suiviPage = el('suivi-page');
+    if (suiviPage) suiviPage.style.display = currentPage === 'suivi' ? '' : 'none';
+    if (currentPage === 'suivi') {
+        ['main-kpi-grid', 'stock-kpi-grid', 'section-top-flop', 'section-top-flop-couleurs', 'stock-middle-section',
+         'stock-30j-section', 'stock-valorisation-section', 'section-abc', 'section-sales-chart',
+         'modforlife-kpi-grid', 'history-section', 'action-page'].forEach(function(id) {
+            var e = el(id); if (e) e.style.display = 'none';
+        });
+        var sbU = document.querySelector('.search-bar-wrapper');
+        if (sbU) sbU.style.display = 'none';
+        return;
+    }
+
     // Page « Propositions » : seuls ses blocs s'affichent, comme la page
     // Action.
     var propositionsPage = el('propositions-page');
     if (propositionsPage) propositionsPage.style.display = currentPage === 'propositions' ? '' : 'none';
     if (currentPage === 'propositions') {
-        ['main-kpi-grid', 'stock-kpi-grid', 'section-top-flop', 'stock-middle-section',
+        ['main-kpi-grid', 'stock-kpi-grid', 'section-top-flop', 'section-top-flop-couleurs', 'stock-middle-section',
          'stock-30j-section', 'stock-valorisation-section', 'section-abc', 'section-sales-chart',
          'modforlife-kpi-grid', 'history-section', 'action-page'].forEach(function(id) {
             var e = el(id); if (e) e.style.display = 'none';
@@ -618,7 +644,7 @@ function adjustUIForPage() {
         return;
     }
     if (currentPage === 'action') {
-        ['main-kpi-grid', 'stock-kpi-grid', 'section-top-flop', 'stock-middle-section',
+        ['main-kpi-grid', 'stock-kpi-grid', 'section-top-flop', 'section-top-flop-couleurs', 'stock-middle-section',
          'stock-30j-section', 'stock-valorisation-section', 'section-abc', 'section-sales-chart',
          'modforlife-kpi-grid', 'history-section'].forEach(function(id) {
             var e = el(id); if (e) e.style.display = 'none';
@@ -706,6 +732,11 @@ async function loadKPIs() {
         loadPropositions();
         return;
     }
+    // Page « Suivi » : envoyé/reçu, aucune carte KPI.
+    if (currentPage === 'suivi') {
+        loadSuivi();
+        return;
+    }
     showLoading(true);
 
     var seq = ++_reqSeq.kpis;
@@ -730,7 +761,7 @@ async function loadKPIs() {
     // L'historique n'existe que sur la page "Tableau de bord" — inutile de
     // payer l'appel serveur ailleurs. Il reste chargé avant l'aiguillage
     // MOD FOR LIFE, car il s'affiche aussi sous cette vue.
-    if (isHistoryPage()) loadHistory();
+    if (isHistoryPage()) { loadHistory(); loadTopFlopCouleurs(); }
 
     if (data.is_modforlife) {
         var histo = el('history-section');
@@ -883,7 +914,7 @@ function _renderModForLifeDashboard(data) {
     // d'alertes rupture retail) : on masque tout l'affichage normal
     // (ventes/stock/commandes) et on montre sa propre grille dédiée.
     var idsToHide = [
-        'main-kpi-grid', 'stock-kpi-grid', 'section-top-flop',
+        'main-kpi-grid', 'stock-kpi-grid', 'section-top-flop', 'section-top-flop-couleurs',
         'stock-middle-section', 'stock-30j-section', 'stock-valorisation-section',
         'section-abc', 'section-sales-chart',
     ];
@@ -3744,13 +3775,13 @@ async function openDepotStock() {
         if (sub) {
             var archivesNonAchetees = data.total_archives - data.total_archives_achetees;
             sub.textContent = 'Liste (articles actifs) : ' + formatNumber(data.total)
-                + ' = ' + formatNumber(data.total_achetees) + ' achetées par le dépôt'
-                + ' ' + formatNumber(data.total_non_achetees_actifs) + ' non achetées'
+                + ' = ' + formatNumber(data.total_achetees) + ' achetées par le dépôt et '
+                + formatNumber(data.total_non_achetees_actifs) + ' non achetées'
                 + ' · Archivés (non listés) : ' + formatNumber(data.total_archives)
-                + ' = ' + formatNumber(data.total_archives_achetees) + ' achetées'
-                + ' ' + formatNumber(archivesNonAchetees) + ' non achetées'
+                + ' = ' + formatNumber(data.total_archives_achetees) + ' achetées et '
+                + formatNumber(archivesNonAchetees) + ' non achetées'
                 + ' · Total Odoo, tous articles : ' + formatNumber(data.total)
-                + ' ' + formatNumber(-data.total_archives) + ' = ' + formatNumber(data.total + data.total_archives)
+                + ' − ' + formatNumber(-data.total_archives) + ' = ' + formatNumber(data.total + data.total_archives)
                 + ' · Carte : ' + formatNumber(data.total_achetees) + ' + '
                 + formatNumber(data.total_archives_achetees) + ' = '
                 + formatNumber(data.total_achetees + data.total_archives_achetees)
@@ -4212,6 +4243,56 @@ function closeValorisationDetail() {
     if (overlay) overlay.classList.remove('active');
 }
 
+// DEMANDE UTILISATEUR (2026-10-07) : voir les références derrière une
+// couleur du Top/Flop Couleurs.
+async function openCouleurDetail(couleur) {
+    var overlay = el('couleur-detail-overlay');
+    var nameEl = el('couleur-detail-name');
+    var summaryEl = el('couleur-detail-summary');
+    var tbody = el('couleur-detail-tbody');
+    if (!overlay || !tbody) return;
+
+    if (nameEl) nameEl.textContent = couleur || '';
+    if (summaryEl) summaryEl.textContent = 'Chargement…';
+    tbody.innerHTML = '';
+    overlay.classList.add('active');
+
+    var params = getFilterParams();
+    params.couleur = couleur;
+    var data = await rpc('/mavie/api/couleur-detail', params);
+
+    if (!data || data.error) {
+        if (summaryEl) summaryEl.textContent = 'Erreur : ' + ((data && data.error) || 'inconnue');
+        return;
+    }
+
+    var lignes = data.lignes || [];
+    if (summaryEl) {
+        var totalQty = lignes.reduce(function(a, l) { return a + l.qty; }, 0);
+        var totalCa = lignes.reduce(function(a, l) { return a + l.ca; }, 0);
+        summaryEl.textContent = formatNumber(lignes.length) + ' référence(s) · '
+            + formatNumber(totalQty) + ' pièces vendues · ' + formatMAD(totalCa);
+    }
+    if (!lignes.length) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:24px;color:#94A3B8;">'
+            + 'Aucune vente pour cette couleur sur ce périmètre.</td></tr>';
+        return;
+    }
+    tbody.innerHTML = lignes.map(function(l) {
+        return '<tr style="border-bottom:1px solid #F1F5F9;cursor:pointer;" data-article="' + l.id + '">'
+            + '<td style="padding:10px;font-weight:600;color:#0F172A;">' + _escapeHtml(l.ref) + '</td>'
+            + '<td style="padding:10px;">' + _escapeHtml(l.nom) + '</td>'
+            + '<td style="padding:10px;text-align:center;">' + formatNumber(l.qty) + '</td>'
+            + '<td style="padding:10px;text-align:right;">' + formatMAD(l.ca) + '</td>'
+            + '</tr>';
+    }).join('');
+}
+
+function closeCouleurDetail() {
+    var overlay = el('couleur-detail-overlay');
+    if (overlay) overlay.classList.remove('active');
+}
+
 function _renderStockAlerts(alertes) {
     var container = el('stock-alerts-list');
     if (!container) return;
@@ -4483,11 +4564,25 @@ async function openEcartDetail(anomaly) {
         + _buildEcartDetailHtml(data);
 }
 
-// Ouvre le bon dans Odoo, dans un nouvel onglet.
-function _lienBon(nom, id) {
+// Ouvre un enregistrement Odoo dans un nouvel onglet.
+function _lienOdoo(nom, id, model) {
     if (!id) return _escapeHtml(nom || '—');
-    return '<a href="/web#id=' + id + '&model=stock.picking&view_type=form" target="_blank" rel="noopener" '
+    return '<a href="/web#id=' + id + '&model=' + model + '&view_type=form" target="_blank" rel="noopener" '
         + 'style="color:#1D4ED8;text-decoration:underline;">' + _escapeHtml(nom || '—') + '</a>';
+}
+
+// Ouvre le mouvement de stock (stock.picking) dans Odoo, dans un nouvel onglet.
+function _lienBon(nom, id) {
+    return _lienOdoo(nom, id, 'stock.picking');
+}
+
+// Ouvre le bon de transfert (inter.internal.transfer) lui-même — PAS le
+// stock.picking : utiliser _lienBon(nom, r.id) ici serait un bug silencieux
+// (id de transfert envoyé comme si c'était un id de picking, ouvrant un
+// enregistrement sans rapport, parfois d'une société inaccessible — bug
+// constaté en test 2026-10-08).
+function _lienTransfert(nom, id) {
+    return _lienOdoo(nom, id, 'inter.internal.transfer');
 }
 
 // Chaque ligne négative : quand, quoi, où, qui, avec un lien vers chaque mouvement.
@@ -4955,6 +5050,488 @@ function _buildReconDocsHtml(data) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// TOP / FLOP COULEURS — toutes références confondues
+// ═══════════════════════════════════════════════════════════
+async function loadTopFlopCouleurs() {
+    var section = el('section-top-flop-couleurs');
+    if (!section) return;
+    var data = await rpc('/mavie/api/top-flop-couleurs', getFilterParams());
+    if (!data || data.error) return;
+    // DEMANDE UTILISATEUR (2026-10-13) : nombre affiché saisissable, comme
+    // Top/Flop Produits — le serveur renvoie large (200), on garde tout en
+    // cache et on tranche localement sans round-trip (cf. _renderTopFlopFromCache).
+    state.top_couleurs_all = data.top || [];
+    state.flop_couleurs_all = data.flop || [];
+    _renderTopFlopCouleursFromCache();
+}
+
+function _renderTopFlopCouleursFromCache() {
+    _renderCouleursTable('top-couleurs-tbody', state.top_couleurs_all.slice(0, state.top_couleurs_limit));
+    _renderCouleursTable('flop-couleurs-tbody', state.flop_couleurs_all.slice(0, state.flop_couleurs_limit));
+}
+
+function _renderCouleursTable(tbodyId, lignes) {
+    var tbody = el(tbodyId);
+    if (!tbody) return;
+    if (!lignes.length) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#94A3B8;padding:14px;">Aucune donnée.</td></tr>';
+        return;
+    }
+    tbody.innerHTML = lignes.map(function(l) {
+        return '<tr style="cursor:pointer;" data-couleur="' + _escapeHtml(l.couleur)
+            + '" title="Cliquer pour voir les références de cette couleur"><td>' + l.rank + '</td><td>' + _escapeHtml(l.couleur)
+            + '</td><td class="num">' + formatNumber(l.qty)
+            + '</td><td class="num">' + formatMAD(l.ca) + '</td></tr>';
+    }).join('');
+    if (!tbody.getAttribute('data-bound')) {
+        tbody.setAttribute('data-bound', '1');
+        tbody.addEventListener('click', function(ev) {
+            var tr = ev.target.closest && ev.target.closest('tr[data-couleur]');
+            if (!tr) return;
+            openCouleurDetail(tr.getAttribute('data-couleur'));
+        });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// PAGE SUIVI — envoyé / reçu, bon par bon
+// ═══════════════════════════════════════════════════════════
+// DEMANDE UTILISATEUR (2026-10-08) : voir, bon par bon, l'article par
+// article : stock de chaque côté, envoyé, reçu, l'écart s'il y en a un.
+// Une case permet au responsable de confirmer "tout est parfait" quand
+// envoyé = reçu (traçée : qui, quand) ; quand il y a un écart, une alerte
+// remplace la case plutôt que de laisser valider quelque chose de faux.
+// Le détail par article est chargé à la demande (on déplie une ligne),
+// pas pour les 300 bons d'un coup.
+var suiviState = { order: [], rows: {}, open: {}, detail: {}, busy: {}, bound: false,
+    filtre: 'tous', recherche: '', editNote: {}, noteBusy: {}, magasin: '', tri: null };
+
+// Au-delà de ce nombre de jours sans être collecté/validé, un bon encore
+// "En attente" ou "Transmis à l'inventaire" est signalé comme bloqué —
+// personne n'est allé le chercher, ou il est resté sans suite.
+var SUIVI_SEUIL_BLOQUE_JOURS = 5;
+
+function _suiviJoursDepuis(dateStr) {
+    if (!dateStr) return null;
+    var d = new Date(dateStr.replace(' ', 'T'));
+    if (isNaN(d.getTime())) return null;
+    return Math.floor((Date.now() - d.getTime()) / 86400000);
+}
+
+// Liée depuis loadSuivi() lui-même (pas depuis _spBindOnce) : la page Suivi
+// a sa propre action cliente et peut être ouverte directement, sans passer
+// par Propositions d'abord — un bind-once posé seulement côté Propositions
+// ne se déclenchait jamais dans ce cas (bug constaté en testant le bouton
+// Rafraîchir existant, qui avait le même défaut).
+function _suiviBindOnce() {
+    if (suiviState.bound) return;
+    suiviState.bound = true;
+    var suiviRefresh = el('btn-suivi-refresh');
+    if (suiviRefresh) suiviRefresh.addEventListener('click', loadSuivi);
+    var suiviExport = el('btn-suivi-export');
+    if (suiviExport) suiviExport.addEventListener('click', function() {
+        // N'exporte que ce qui est affiché à l'écran : le filtre rapide
+        // actif, le magasin choisi et la recherche en cours. Sans aucun
+        // filtre, l'export reste complet (un onglet par catégorie).
+        // DEMANDE UTILISATEUR (2026-10-09) : « pour ne pas exporter tout ».
+        var params = _buildExportParams({
+            filtre: suiviState.filtre || 'tous',
+            magasin: suiviState.magasin || '',
+            recherche: suiviState.recherche || '',
+        });
+        window.open('/mavie/api/suivi/export?' + params.toString(), '_blank');
+    });
+    var suiviBody = el('suivi-tbody');
+    if (suiviBody) suiviBody.addEventListener('click', function(ev) {
+        var validerBtn = ev.target.closest && ev.target.closest('[data-suivi-valider]');
+        if (validerBtn) {
+            ev.stopPropagation();
+            _suiviValider(parseInt(validerBtn.getAttribute('data-suivi-valider'), 10));
+            return;
+        }
+        var noteEdit = ev.target.closest && ev.target.closest('[data-suivi-note-edit]');
+        if (noteEdit) {
+            ev.stopPropagation();
+            suiviState.editNote[parseInt(noteEdit.getAttribute('data-suivi-note-edit'), 10)] = true;
+            _suiviRepaint();
+            return;
+        }
+        var noteSave = ev.target.closest && ev.target.closest('[data-suivi-note-save]');
+        if (noteSave) {
+            ev.stopPropagation();
+            _suiviSetNote(parseInt(noteSave.getAttribute('data-suivi-note-save'), 10));
+            return;
+        }
+        var noteInput = ev.target.closest && ev.target.closest('[data-suivi-note-input]');
+        if (noteInput) { ev.stopPropagation(); return; }
+        var lien = ev.target.closest && ev.target.closest('a');
+        if (lien) return; // laisse le lien vers le bon (nouvel onglet) faire son travail
+        var row = ev.target.closest && ev.target.closest('[data-suivi-row]');
+        if (row) _suiviToggleRow(parseInt(row.getAttribute('data-suivi-row'), 10));
+    });
+    if (suiviBody) suiviBody.addEventListener('keydown', function(ev) {
+        var noteInput = ev.target.closest && ev.target.closest('[data-suivi-note-input]');
+        if (noteInput && ev.key === 'Enter') {
+            _suiviSetNote(parseInt(noteInput.getAttribute('data-suivi-note-input'), 10));
+        }
+    });
+    var filtres = el('suivi-filtres');
+    if (filtres) filtres.addEventListener('click', function(ev) {
+        var btn = ev.target.closest && ev.target.closest('.su-filtre-btn');
+        if (!btn) return;
+        suiviState.filtre = btn.getAttribute('data-filtre');
+        _suiviRepaint();
+    });
+    var recherche = el('suivi-recherche');
+    if (recherche) {
+        var t = null;
+        recherche.addEventListener('input', function() {
+            clearTimeout(t);
+            t = setTimeout(function() {
+                suiviState.recherche = (recherche.value || '').trim().toLowerCase();
+                _suiviRepaint();
+            }, 180);
+        });
+    }
+    var filtreMagasin = el('suivi-f-magasin');
+    if (filtreMagasin) filtreMagasin.addEventListener('change', function() {
+        suiviState.magasin = filtreMagasin.value || '';
+        _suiviRepaint();
+    });
+    // Tri en cliquant sur un en-tête de colonne : un clic = tri décroissant
+    // (le plus intéressant en premier, ex. le plus gros écart), un
+    // deuxième clic sur la même colonne inverse, un clic ailleurs repart
+    // sur cette nouvelle colonne en décroissant.
+    document.querySelectorAll('.su-th-tri').forEach(function(th) {
+        th.addEventListener('click', function() {
+            var col = th.getAttribute('data-tri');
+            if (suiviState.tri && suiviState.tri.col === col) {
+                suiviState.tri.dir = suiviState.tri.dir === 'desc' ? 'asc' : 'desc';
+            } else {
+                suiviState.tri = { col: col, dir: 'desc' };
+            }
+            _suiviRepaint();
+        });
+    });
+}
+
+async function loadSuivi() {
+    _suiviBindOnce();
+    var tbody = el('suivi-tbody');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#64748B;padding:18px;">Chargement…</td></tr>';
+    var data = await rpc('/mavie/api/suivi-transferts', getFilterParams());
+    if (!data || data.error) {
+        if (tbody) tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#B91C1C;padding:18px;">'
+            + _escapeHtml((data && data.error) || 'Erreur inconnue') + '</td></tr>';
+        return;
+    }
+    var resume = el('suivi-resume');
+    if (resume) {
+        resume.innerHTML = formatNumber(data.total) + ' bon(s)'
+            + (data.nb_anomalies
+                ? ' · <span style="color:#B91C1C;font-weight:700;">⚠️ ' + formatNumber(data.nb_anomalies)
+                  + ' avec un écart envoyé/reçu</span>'
+                : ' · aucun écart détecté sur les bons vérifiables')
+            + (data.valeur_en_transit
+                ? ' · <span title="Marchandise partie du magasin source, pas encore confirmée reçue">'
+                  + formatMAD(data.valeur_en_transit) + ' en transit</span>'
+                : '')
+            + (data.delai_moyen_global !== null && data.delai_moyen_global !== undefined
+                ? ' · <span title="De la création du bon à sa validation finale, sur les bons faits">délai moyen '
+                  + data.delai_moyen_global + ' j</span>'
+                : '');
+    }
+    suiviState.order = (data.rows || []).map(function(r) { return r.id; });
+    suiviState.rows = {};
+    (data.rows || []).forEach(function(r) { suiviState.rows[r.id] = r; });
+    suiviState.open = {};
+    suiviState.detail = {};
+    suiviState.busy = {};
+    suiviState.editNote = {};
+    suiviState.noteBusy = {};
+    _suiviRenderFiltreMagasin();
+    _suiviRepaint();
+}
+
+// Liste déroulante des magasins (source ou destination) apparaissant dans
+// les bons chargés, pour filtrer sur UN magasin précis sans avoir à
+// taper son nom dans la recherche libre.
+function _suiviRenderFiltreMagasin() {
+    var sel = el('suivi-f-magasin');
+    if (!sel) return;
+    var valeurActuelle = sel.value;
+    var magasins = {};
+    suiviState.order.forEach(function(id) {
+        var r = suiviState.rows[id];
+        (r.trajet || '').split(' → ').forEach(function(m) { if (m) magasins[m] = true; });
+    });
+    var noms = Object.keys(magasins).sort();
+    sel.innerHTML = '<option value="">Tous les magasins</option>'
+        + noms.map(function(m) { return '<option value="' + _escapeHtml(m) + '">' + _escapeHtml(m) + '</option>'; }).join('');
+    if (noms.indexOf(valeurActuelle) !== -1) sel.value = valeurActuelle;
+}
+
+async function _suiviSetNote(id) {
+    if (suiviState.noteBusy[id]) return;
+    var inputEl = el('suivi-tbody').querySelector('[data-suivi-note-input="' + id + '"]');
+    var note = inputEl ? (inputEl.value || '').trim() : '';
+    suiviState.noteBusy[id] = true;
+    var res = await rpc('/mavie/api/suivi-anomalie-note', { id: id, note: note });
+    suiviState.noteBusy[id] = false;
+    if (!res || res.error) {
+        window.alert((res && res.error) || "L'enregistrement a échoué.");
+        return;
+    }
+    var r = suiviState.rows[id];
+    if (r) {
+        r.dashboard_anomalie_note = res.dashboard_anomalie_note;
+        r.dashboard_anomalie_par = res.dashboard_anomalie_par;
+    }
+    delete suiviState.editNote[id];
+    _suiviRepaint();
+}
+
+// Catégorie d'un bon pour les filtres rapides. Reprend exactement la
+// logique d'affichage (_suiviVerifHtml) pour que « À vérifier » /
+// « Anomalies » / « Validés » / « En attente » comptent les mêmes bons que
+// ce qu'on y voit effectivement une fois le filtre appliqué.
+function _suiviCategorie(r) {
+    if (r.stock_verif === 'ok' && r.recu === null) return r.dashboard_valide ? 'valides' : 'a_verifier';
+    if (r.recu === null) return 'attente';
+    if (r.anomalie) return 'anomalies';
+    if (r.dashboard_valide) return 'valides';
+    return 'a_verifier';
+}
+
+var SUIVI_TRI_CLES = {
+    date: function(r) { return r.date; },
+    ecart: function(r) { return r.ecart === null ? -Infinity : Math.abs(r.ecart); },
+    envoye: function(r) { return r.envoye; },
+    valeur: function(r) { return r.valeur_ttc || 0; },
+    delai: function(r) { return r.delai_jours === null ? -Infinity : r.delai_jours; },
+};
+
+function _suiviFiltrees() {
+    var q = suiviState.recherche;
+    var magasin = suiviState.magasin;
+    var liste = suiviState.order.filter(function(id) {
+        var r = suiviState.rows[id];
+        if (suiviState.filtre !== 'tous' && _suiviCategorie(r) !== suiviState.filtre) return false;
+        if (magasin && r.trajet.indexOf(magasin) === -1) return false;
+        if (q) {
+            var hay = (r.name + ' ' + r.trajet).toLowerCase();
+            if (hay.indexOf(q) === -1) return false;
+        }
+        return true;
+    });
+    if (suiviState.tri) {
+        var cle = SUIVI_TRI_CLES[suiviState.tri.col];
+        var sens = suiviState.tri.dir === 'asc' ? 1 : -1;
+        if (cle) {
+            liste = liste.slice().sort(function(a, b) {
+                var va = cle(suiviState.rows[a]), vb = cle(suiviState.rows[b]);
+                return va < vb ? -sens : (va > vb ? sens : 0);
+            });
+        }
+    }
+    return liste;
+}
+
+function _suiviRepaint() {
+    var tbody = el('suivi-tbody');
+    if (!tbody) return;
+    // Pastilles de comptage sur chaque bouton de filtre + état actif.
+    var compte = { tous: suiviState.order.length, a_verifier: 0, anomalies: 0, valides: 0, attente: 0 };
+    suiviState.order.forEach(function(id) { compte[_suiviCategorie(suiviState.rows[id])]++; });
+    (document.querySelectorAll('#suivi-filtres .su-filtre-btn') || []).forEach(function(btn) {
+        var f = btn.getAttribute('data-filtre');
+        btn.classList.toggle('active', f === suiviState.filtre);
+        var base = btn.textContent.replace(/\s*\(\d+\)$/, '');
+        btn.textContent = base + ' (' + (compte[f] || 0) + ')';
+    });
+    (document.querySelectorAll('.su-th-tri') || []).forEach(function(th) {
+        var fleche = th.querySelector('.su-tri-fleche');
+        if (!fleche) return;
+        var actif = suiviState.tri && suiviState.tri.col === th.getAttribute('data-tri');
+        fleche.textContent = actif ? (suiviState.tri.dir === 'desc' ? '▼' : '▲') : '';
+    });
+    var visibles = _suiviFiltrees();
+    if (!visibles.length) {
+        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#64748B;padding:18px;">'
+            + (suiviState.order.length ? 'Aucun bon ne correspond à ce filtre.' : 'Aucun transfert.') + '</td></tr>';
+        return;
+    }
+    tbody.innerHTML = visibles.map(function(id) { return _suiviRowHtml(suiviState.rows[id]); }).join('');
+}
+
+// Classement par magasin : quel magasin source cause le plus d'écarts
+// envoyé/reçu, sur les bons vérifiables de cette page (calcul client, à
+// partir de ce qui est déjà chargé — pas de nouvel appel serveur).
+function _suiviVerifHtml(r) {
+    // DEMANDE UTILISATEUR (2026-10-12) : un bon inter-sociétés "Fait" dont le
+    // stock de destination confirme l'arrivée (stock_verif='ok') affichait
+    // "non vérifiable" — vrai au sens du picking suivi par le dashboard,
+    // mais trompeur : une vérification a bien eu lieu et n'a rien trouvé
+    // d'anormal. On le dit clairement, et on garde le bouton de validation
+    // manuelle (base désormais acceptée côté serveur pour ce cas).
+    if (r.stock_verif === 'ok' && r.recu === null) {
+        var autoOk = '<span class="su-valide-ok" title="Le stock du magasin destinataire a bien augmenté du nombre de pièces envoyées">✓ stock confirmé à l’arrivée</span>';
+        if (r.dashboard_valide) {
+            return autoOk + '<br/><span class="su-valide-ok">✓ vérifié' + (r.dashboard_valide_par ? ' par ' + _escapeHtml(r.dashboard_valide_par) : '')
+                 + (r.dashboard_valide_date ? ' le ' + _escapeHtml(r.dashboard_valide_date) : '') + '</span>';
+        }
+        return autoOk + '<br/><button type="button" class="su-valide-btn" data-suivi-valider="' + r.id + '"'
+             + (suiviState.busy[r.id] ? ' disabled' : '') + '>✓ Tout est parfait — Valider</button>';
+    }
+    if (r.recu === null) {
+        return '<span class="su-attente">' + (r.verifiable ? 'pas encore collecté' : 'non vérifiable') + '</span>';
+    }
+    if (r.anomalie) {
+        var mot = r.ecart > 0 ? ('il manque ' + formatNumber(r.ecart) + ' pièce' + (r.ecart > 1 ? 's' : ''))
+                               : (formatNumber(Math.abs(r.ecart)) + ' pièce' + (Math.abs(r.ecart) > 1 ? 's' : '') + ' en trop');
+        var alerte = '<span class="su-alerte" title="Envoyé ' + r.envoye + ', reçu ' + r.recu + '">⚠️ ' + mot + '</span>';
+        // Une anomalie reste un fait, mais une fois la cause connue
+        // (casse, vol, comptage...) elle n'a plus besoin d'attention —
+        // la note le dit sans effacer l'écart.
+        if (r.dashboard_anomalie_note && !suiviState.editNote[r.id]) {
+            return alerte + '<br/><span class="su-note-ok">💬 ' + _escapeHtml(r.dashboard_anomalie_note)
+                 + (r.dashboard_anomalie_par ? ' — ' + _escapeHtml(r.dashboard_anomalie_par) : '')
+                 + '</span><span class="su-note-edit" data-suivi-note-edit="' + r.id + '">modifier</span>';
+        }
+        return alerte + '<div class="su-note-form">'
+             + '<input type="text" placeholder="Pourquoi ? (casse, vol, erreur de comptage…)" '
+             + 'data-suivi-note-input="' + r.id + '" value="' + _escapeHtml(r.dashboard_anomalie_note || '') + '"/>'
+             + '<button type="button" data-suivi-note-save="' + r.id + '">Enregistrer</button></div>';
+    }
+    if (r.dashboard_valide) {
+        return '<span class="su-valide-ok">✓ vérifié' + (r.dashboard_valide_par ? ' par ' + _escapeHtml(r.dashboard_valide_par) : '')
+             + (r.dashboard_valide_date ? ' le ' + _escapeHtml(r.dashboard_valide_date) : '') + '</span>';
+    }
+    return '<button type="button" class="su-valide-btn" data-suivi-valider="' + r.id + '"'
+         + (suiviState.busy[r.id] ? ' disabled' : '') + '>✓ Tout est parfait — Valider</button>';
+}
+
+function _suiviRowHtml(r) {
+    var recuTxt = r.recu === null
+        ? (r.verifiable ? '<span style="color:#94A3B8;">pas encore collecté</span>'
+                         : '<span style="color:#94A3B8;" title="Transfert entre sociétés : pas de quantité reçue distincte dans ce module.">non vérifiable</span>')
+        : formatNumber(r.recu);
+    var ecartTxt = r.ecart === null ? '—'
+        : (r.ecart === 0 ? '<span style="color:#047857;">0</span>'
+                          : '<span style="color:#B91C1C;font-weight:700;">⚠️ ' + (r.ecart > 0 ? '+' : '') + formatNumber(r.ecart) + '</span>');
+    var ouvert = !!suiviState.open[r.id];
+    // Un bon encore en attente de collecte, laissé trop longtemps sans
+    // suite, mérite un signal — personne ne l'a peut-être remarqué.
+    var jours = _suiviJoursDepuis(r.date);
+    var bloque = (r.state === 'submitted' || r.state === 'transmitted')
+        && jours !== null && jours >= SUIVI_SEUIL_BLOQUE_JOURS;
+    var etatTxt = _escapeHtml(r.state_label)
+        + (bloque ? '<span class="su-stuck" title="Ni collecté ni validé depuis ' + jours + ' jours">⏳ ' + jours + 'j</span>' : '');
+    var ligne = '<tr class="su-row" data-suivi-row="' + r.id + '" data-open="' + (ouvert ? '1' : '0') + '" style="border-bottom:1px solid #F1F5F9;' + (r.anomalie ? 'background:#FEF2F2;' : '') + '">'
+        + '<td style="padding:8px;"><span class="su-caret">▸</span></td>'
+        + '<td style="padding:8px;">' + _lienTransfert(r.name, r.id) + '</td>'
+        + '<td style="padding:8px;">' + _escapeHtml(r.trajet) + '</td>'
+        + '<td style="padding:8px;">' + etatTxt + '</td>'
+        + '<td style="padding:8px;text-align:center;">' + formatNumber(r.envoye) + '</td>'
+        + '<td style="padding:8px;text-align:center;">' + recuTxt + '</td>'
+        + '<td style="padding:8px;text-align:center;">' + ecartTxt + '</td>'
+        + '<td style="padding:8px;">' + _suiviVerifHtml(r) + '</td>'
+        + '<td style="padding:8px;">' + _escapeHtml(r.date) + '</td>'
+        + '</tr>';
+    return ligne + (ouvert ? _suiviDetailRowHtml(r.id) : '');
+}
+
+function _suiviDetailRowHtml(id) {
+    var html = suiviState.detail[id];
+    return '<tr class="su-detail-tr"><td colspan="9" style="padding:0;">'
+        + '<div class="su-detail-wrap">' + (html || '<span class="rx-muted">Chargement du détail…</span>') + '</div>'
+        + '</td></tr>';
+}
+
+function _suiviDetailContentHtml(data) {
+    if (!data || data.error) {
+        return '<span class="su-alerte">' + _escapeHtml((data && data.error) || 'Erreur inconnue') + '</span>';
+    }
+    if (!data.lignes || !data.lignes.length) {
+        return '<span class="rx-muted">Aucune ligne.</span>';
+    }
+    var h = '<table class="su-detail-table"><thead><tr>'
+          + '<th>Référence</th><th class="num">Stock magasin source</th><th class="num">Envoyé</th>'
+          + '<th class="num">Stock magasin destination</th><th class="num">Reçu</th><th class="num">Écart</th>'
+          + '<th class="num">Valeur de l’écart</th><th>Bon concerné</th>'
+          + '</tr></thead><tbody>';
+    data.lignes.forEach(function(l) {
+        h += '<tr' + (l.anomalie ? ' class="su-anomalie"' : '') + '>'
+           + '<td>' + _escapeHtml(l.reference) + ' <span class="rx-muted">' + _escapeHtml(l.produit) + '</span></td>'
+           + '<td class="num">' + (l.stock_source === null ? '—' : formatNumber(l.stock_source)) + '</td>'
+           + '<td class="num">' + formatNumber(l.envoye) + '</td>'
+           + '<td class="num">' + (l.stock_dest === null ? '—' : formatNumber(l.stock_dest)) + '</td>'
+           + '<td class="num">' + (l.recu === null ? '<span class="rx-muted">—</span>' : formatNumber(l.recu)) + '</td>'
+           + '<td class="num">' + (l.ecart === null ? '—'
+               : (l.ecart === 0 ? '<span class="su-check su-check-ok">0</span>'
+                                 : '<span class="su-check su-check-ko">' + (l.ecart > 0 ? '+' : '') + formatNumber(l.ecart) + '</span>')) + '</td>'
+           + '<td class="num">' + (l.valeur_ecart ? '<span class="su-check su-check-ko">' + formatMAD(l.valeur_ecart) + '</span>'
+                                                    : '<span class="rx-muted">—</span>') + '</td>'
+           // Tous les pickings qui ont traité cette référence, chacun avec
+           // sa propre quantité : un envoi peut être livré en plusieurs
+           // fois (original + reliquat complété plus tard) — n'afficher
+           // qu'un seul bon donnerait l'impression trompeuse qu'une seule
+           // pièce est partie alors que la somme est correcte. Un
+           // reliquat « Annulé » (0 pièce) reste affiché : c'est la
+           // preuve qu'elle n'est jamais partie.
+           + '<td>' + ((l.pickings && l.pickings.length)
+               ? l.pickings.map(function(p) {
+                   return _lienOdoo(p.name, p.id, 'stock.picking') + ' <span class="rx-muted">('
+                        + formatNumber(p.qty) + ' · ' + _escapeHtml(p.state_label) + ')</span>';
+                 }).join('<br/>')
+               : '<span class="rx-muted">—</span>') + '</td>'
+           + '</tr>';
+    });
+    h += '</tbody></table>';
+    if (data.valeur_ecart_totale) {
+        h += '<div class="su-alerte" style="margin-top:6px;">Valeur totale de l’écart sur ce bon : ' + formatMAD(data.valeur_ecart_totale) + '</div>';
+    }
+    if (!data.picking_done && data.verifiable) {
+        h += '<div class="su-attente" style="margin-top:6px;">La réception n’est pas encore collectée : le reçu par article n’est pas encore connu.</div>';
+    } else if (!data.verifiable) {
+        h += '<div class="su-attente" style="margin-top:6px;">Transfert entre sociétés : la quantité reçue n’est pas suivie par ce module.</div>';
+    }
+    return h;
+}
+
+async function _suiviToggleRow(id) {
+    suiviState.open[id] = !suiviState.open[id];
+    if (suiviState.open[id] && !suiviState.detail[id]) {
+        _suiviRepaint();
+        var data = await rpc('/mavie/api/suivi-transfert-detail', { id: id });
+        suiviState.detail[id] = _suiviDetailContentHtml(data);
+        _suiviRepaint();
+        return;
+    }
+    _suiviRepaint();
+}
+
+async function _suiviValider(id) {
+    if (suiviState.busy[id]) return;
+    suiviState.busy[id] = true;
+    _suiviRepaint();
+    var res = await rpc('/mavie/api/suivi-valider', { id: id, valide: true });
+    suiviState.busy[id] = false;
+    if (!res || res.error) {
+        window.alert((res && res.error) || 'La vérification a échoué.');
+        _suiviRepaint();
+        return;
+    }
+    var r = suiviState.rows[id];
+    if (r) {
+        r.dashboard_valide = true;
+        r.dashboard_valide_par = res.dashboard_valide_par;
+        r.dashboard_valide_date = res.dashboard_valide_date;
+    }
+    _suiviRepaint();
+}
+
+// ═══════════════════════════════════════════════════════════
 // HISTORIQUE — TRANSFERTS & SOLDES
 // ═══════════════════════════════════════════════════════════
 async function loadHistory() {
@@ -5070,12 +5647,24 @@ function _renderHistory() {
                                 '#DC2626', '700', 'center'));
             tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
         } else {
-            var stateColor = r.state === 'done' ? '#10B981'
-                : (r.state === 'transmitted' ? '#2563EB'
-                : (r.state === 'submitted' ? '#F59E0B' : '#94A3B8'));
-            tr.appendChild(cell(r.name, '#0F172A', '700'));
+            // DEMANDE UTILISATEUR (2026-10-12) : chaque bon cliquable (ouvre
+            // le transfert dans Odoo, même lien que la colonne « Bon » de
+            // Suivi), et l'État détaillé en 4 étapes (Émetteur / En attente
+            // / Récepteur / Approvisionnement) plutôt qu'un seul libellé.
+            tr.style.cursor = 'pointer';
+            tr.addEventListener('click', function(ev) {
+                if (ev.target.closest('a, button')) return;
+                window.open('/web#id=' + r.id + '&model=inter.internal.transfer&view_type=form', '_blank');
+            });
+            var bonCell = document.createElement('td');
+            bonCell.style.cssText = 'padding:9px 8px;font-size:0.84rem;font-weight:700;';
+            bonCell.innerHTML = _lienTransfert(r.name, r.id);
+            tr.appendChild(bonCell);
             tr.appendChild(cell(r.date, '#64748B'));
-            tr.appendChild(cell(r.state_label, stateColor, '600'));
+            var etatCell = document.createElement('td');
+            etatCell.style.cssText = 'padding:9px 8px;';
+            etatCell.innerHTML = _historyEtatEtapes(r);
+            tr.appendChild(etatCell);
             // Opération d'inventaire à collecter (transfert intra-société) :
             // c'est le document que le responsable ouvre pour valider, donc
             // on ouvre directement le bon dans Odoo. Vide pour un transfert
@@ -5112,6 +5701,37 @@ function _renderHistory() {
 }
 
 // Bouton « Test » de l'historique (demande utilisatrice 2026-09-23) :
+// 4 étapes du circuit de validation (DEMANDE UTILISATEUR 2026-10-12) :
+// Émetteur / En attente / Récepteur / Approvisionnement. Pur affichage de
+// ce que transfert_interne / mavie_dashboard ont déjà fait — aucune
+// nouvelle logique de validation, juste une lecture de l'état réel du bon.
+// Un transfert annulé n'a pas d'étapes (rien à montrer comme progression).
+function _historyEtatEtapes(r) {
+    if (r.state === 'cancelled') {
+        return '<span style="color:#94A3B8;font-weight:600;">✗ Annulé</span>';
+    }
+    // Rang atteint par l'état réel du bon : intra-société passe par
+    // "transmitted" (transmis à l'Inventaire) plutôt que "received" (réservé
+    // au circuit inter-sociétés), donc les deux comptent pour le même rang.
+    var RANGS = { draft: 0, submitted: 1, transmitted: 1, received: 3, done: 4 };
+    var rang = RANGS.hasOwnProperty(r.state) ? RANGS[r.state] : 0;
+    var etapes = [
+        { label: 'Émetteur', seuil: 1, date: r.date },
+        { label: 'En attente', seuil: 1, date: null },
+        { label: 'Récepteur', seuil: 3, date: r.received_date },
+        { label: 'Approvisionnement', seuil: 4, date: r.date_validation },
+    ];
+    return '<div style="display:flex;flex-direction:column;gap:2px;font-size:0.72rem;">'
+        + etapes.map(function(e) {
+            var fait = rang >= e.seuil;
+            var titre = e.label + (fait && e.date ? ' — ' + e.date : '');
+            return '<span title="' + _escapeHtml(titre) + '" style="color:' + (fait ? '#059669' : '#94A3B8')
+                + ';font-weight:' + (fait ? '600' : '400') + ';">'
+                + (fait ? '✓' : '○') + ' ' + _escapeHtml(e.label) + '</span>';
+        }).join('')
+        + '</div>';
+}
+
 // renvoie la notification de CE bon à soi-même, avec un bandeau rouge
 // « ceci est un test », sans déranger les responsables de magasin.
 function _notifTestCell(r) {
@@ -5478,6 +6098,30 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
 
+    ['top-couleurs-limit', 'flop-couleurs-limit'].forEach(function(id) {
+        var sel = el(id);
+        if (sel) {
+            sel.addEventListener('click', function(e) { e.stopPropagation(); });
+            // Même principe que top-limit/flop-limit : le serveur renvoie
+            // déjà jusqu'à 200 couleurs (cf. loadTopFlopCouleurs), on
+            // tranche simplement le cache local, sans round-trip.
+            sel.addEventListener('change', function() {
+                updateFiltersFromUI();
+                if (state.top_couleurs_all.length || state.flop_couleurs_all.length) {
+                    _renderTopFlopCouleursFromCache();
+                } else {
+                    loadTopFlopCouleurs();
+                }
+            });
+            sel.addEventListener('input', function() {
+                updateFiltersFromUI();
+                if (state.top_couleurs_all.length || state.flop_couleurs_all.length) {
+                    _renderTopFlopCouleursFromCache();
+                }
+            });
+        }
+    });
+
     ['detail-filter-magasin'].forEach(function(id) {
         var sel = el(id);
         if (sel) {
@@ -5583,6 +6227,21 @@ document.addEventListener('DOMContentLoaded', function() {
     var exportFlopBtn = el('btn-export-flop');
     if (exportFlopBtn) {
         exportFlopBtn.addEventListener('click', function() { _exportTopFlop('flop'); });
+    }
+
+    // Export Excel du Top/Flop Couleurs affiché (DEMANDE UTILISATEUR 2026-10-12).
+    var exportTfcBtn = el('btn-export-tfc');
+    if (exportTfcBtn) {
+        exportTfcBtn.addEventListener('click', function() {
+            var params = new URLSearchParams();
+            var filterParams = getFilterParams();
+            for (var k in filterParams) {
+                if (filterParams[k] !== null && filterParams[k] !== undefined && filterParams[k] !== '') {
+                    params.set(k, filterParams[k]);
+                }
+            }
+            window.open('/mavie/api/top-flop-couleurs/export?' + params.toString(), '_blank');
+        });
     }
 
     var closeTransferBtn = el('close-transfer-btn');
@@ -5797,6 +6456,26 @@ document.addEventListener('DOMContentLoaded', function() {
     if (valorisationOverlay) {
         valorisationOverlay.addEventListener('click', function(e) {
             if (e.target === valorisationOverlay) closeValorisationDetail();
+        });
+    }
+
+    var closeCouleurDetailBtn = el('close-couleur-detail-btn');
+    if (closeCouleurDetailBtn) closeCouleurDetailBtn.addEventListener('click', closeCouleurDetail);
+
+    var couleurDetailOverlay = el('couleur-detail-overlay');
+    if (couleurDetailOverlay) {
+        couleurDetailOverlay.addEventListener('click', function(e) {
+            if (e.target === couleurDetailOverlay) closeCouleurDetail();
+        });
+    }
+
+    var couleurDetailTbody = el('couleur-detail-tbody');
+    if (couleurDetailTbody) {
+        couleurDetailTbody.addEventListener('click', function(e) {
+            var tr = e.target.closest && e.target.closest('tr[data-article]');
+            if (!tr) return;
+            var id = parseInt(tr.getAttribute('data-article'), 10);
+            if (id) openDetail(id, '');
         });
     }
 
@@ -6467,7 +7146,8 @@ function _raExportCsv(rows) {
 // avant d'écrire et n'applique rien si un seul magasin échoue.
 // ══════════════════════════════════════════════════════════════
 
-var sdState = { data: null, checked: {}, noms: {}, bound: false, busy: false };
+var sdState = { data: null, checked: {}, noms: {}, bound: false, busy: false,
+    bxgyAchatId: null, bxgyAchatLabel: '', bxgyAchatMagasins: null };
 
 async function openSoldePanel(articleId, couleur, prerempli) {
     var overlay = el('solde-overlay');
@@ -6475,10 +7155,20 @@ async function openSoldePanel(articleId, couleur, prerempli) {
     _sdBindOnce();
     sdState.checked = {};
     sdState.noms = {};
+    sdState.bxgyAchatId = (prerempli && prerempli.article_achat_id) || null;
+    sdState.bxgyAchatLabel = (prerempli && prerempli.article_achat_label) || '';
+    sdState.bxgyAchatMagasins = (prerempli && prerempli.article_achat_magasins) || null;
     var result = el('sd-result');
     if (result) { result.style.display = 'none'; result.innerHTML = ''; }
     ['sd-prix', 'sd-remise', 'sd-fin', 'sd-code', 'sd-montant'].forEach(function(id) { var e = el(id); if (e) e.value = ''; });
     var nbC = el('sd-nb-cartes'); if (nbC) nbC.value = '1';
+    // Panier progressif appelé avec un mode précis (depuis la carte
+    // Propositions) : le menu Type bascule AVANT le chargement des
+    // magasins, sinon _sdMajChamps masquerait les bons champs trop tard.
+    if (prerempli && prerempli.mode) {
+        var modeSel = el('sd-mode');
+        if (modeSel) modeSel.value = prerempli.mode;
+    }
     _sdMajChamps();
     var debut = el('sd-debut');
     if (debut) debut.value = new Date().toISOString().slice(0, 10);
@@ -6487,10 +7177,52 @@ async function openSoldePanel(articleId, couleur, prerempli) {
     overlay.classList.add('active');
     sdState.couleur = couleur || '';
     await _sdLoad(articleId);
-    // Appelé depuis la page Propositions : on pose la remise conseillée
-    // et on coche les magasins qui ont du stock, pour qu'il ne reste que
-    // le bouton à cliquer.
-    if (prerempli && prerempli.remise > 0) _sdPreremplir(prerempli.remise);
+    // Appelé depuis la page Propositions : on pose la remise (ou le
+    // panier progressif) conseillé et on coche les magasins qui ont du
+    // stock, pour qu'il ne reste que le bouton à cliquer.
+    if (prerempli && prerempli.mode === 'buy_x_get_y') {
+        var fx = el('sd-bxgy-x'), fy = el('sd-bxgy-y'), fr = el('sd-bxgy-remise');
+        if (fx) fx.value = prerempli.bxgy_x || 2;
+        if (fy) fy.value = prerempli.bxgy_y || 1;
+        if (fr) fr.value = prerempli.bxgy_remise || 100;
+        // BUG CORRIGÉ (2026-10-13) : quand l'achat porte sur une AUTRE
+        // référence (partenaire), ne cocher que les magasins où CE
+        // partenaire a aussi du stock — sinon l'offre se retrouvait posée
+        // dans un magasin qui n'a pas de quoi déclencher l'achat
+        // (constaté : SAN1692 proposé à Carrefour Targa alors qu'il y est
+        // à 0, tout le stock étant à Auderby/Marjane).
+        var magasinsPartenaireOk = null;
+        if (sdState.bxgyAchatMagasins) {
+            magasinsPartenaireOk = {};
+            sdState.bxgyAchatMagasins.forEach(function(m) {
+                if (m.stock > 0) magasinsPartenaireOk[m.warehouse_id] = true;
+            });
+        }
+        var magasinsExclus = [];
+        (sdState.data && sdState.data.magasins || []).forEach(function(m) {
+            if ((m.stock || 0) <= 0 || !m.caisses || !m.caisses.length) return;
+            if (magasinsPartenaireOk && !magasinsPartenaireOk[m.warehouse_id]) {
+                magasinsExclus.push(m.magasin || m.libelle || m.shop_field);
+                return;
+            }
+            sdState.checked[m.shop_field] = true;
+        });
+        // DEMANDE UTILISATEUR (2026-10-12) : offerte couplée à une autre
+        // référence à acheter — on le dit clairement avant de valider.
+        var aideEl = el('sd-aide');
+        if (aideEl && sdState.bxgyAchatId) {
+            aideEl.textContent = 'Achetez « ' + sdState.bxgyAchatLabel + ' », recevez « '
+                + (sdState.data ? sdState.data.reference : '') + ' » offert(e) ou à prix réduit.'
+                + (magasinsExclus.length
+                    ? ' (' + _escapeHtml(magasinsExclus.join(', ')) + ' non coché(s) : « '
+                      + _escapeHtml(sdState.bxgyAchatLabel) + ' » n’y est pas en stock.)'
+                    : '');
+        }
+        _sdRenderStores();
+        _sdRefresh();
+    } else if (prerempli && prerempli.remise > 0) {
+        _sdPreremplir(prerempli.remise);
+    }
 }
 
 function _sdPreremplir(remise) {
@@ -6503,7 +7235,7 @@ function _sdPreremplir(remise) {
     // bouton reste desactive malgre la remise affichee.
     var champPrix = el('sd-prix');
     if (champPrix && cat > 0 && remise > 0 && remise < 100) {
-        champPrix.value = (Math.round(cat * (1 - remise / 100) * 100) / 100).toFixed(2);
+        champPrix.value = String(_arrondiPrixSolde(cat * (1 - remise / 100)));
     }
     (data.magasins || []).forEach(function(m) {
         // Un magasin sans caisse ne peut pas recevoir de solde, et un
@@ -6535,6 +7267,25 @@ async function _sdLoad(articleId) {
     set('sd-ref', data.reference + (data.couleur ? ' — ' + data.couleur + ' (' + data.nb_variantes + ' taille' + (data.nb_variantes > 1 ? 's' : '') + ')' : ''));
     set('sd-name', data.nom);
     set('sd-catalogue', formatMAD(data.prix_catalogue_ttc) + ' TTC');
+    var sdImg = el('sd-image');
+    var sdImgMissing = el('sd-image-missing');
+    var sdHasPhoto = !!(data.has_image && data.image_url);
+    if (sdImg) {
+        if (sdHasPhoto) {
+            sdImg.onerror = function() {
+                sdImg.removeAttribute('src');
+                sdImg.style.display = 'none';
+                if (sdImgMissing) sdImgMissing.style.display = 'flex';
+            };
+            sdImg.src = data.image_url;
+            sdImg.style.display = 'block';
+            if (sdImgMissing) sdImgMissing.style.display = 'none';
+        } else {
+            sdImg.removeAttribute('src');
+            sdImg.style.display = 'none';
+            if (sdImgMissing) sdImgMissing.style.display = 'flex';
+        }
+    }
     _sdRenderStores();
     _sdRefresh();
 }
@@ -6543,6 +7294,20 @@ function _sdRenderStores() {
     var tbody = el('sd-tbody');
     var data = sdState.data;
     if (!tbody || !data) return;
+    // BUG CORRIGÉ (2026-10-13) : le stock de l'article OFFERT était déjà
+    // vérifié par magasin, mais pas celui de l'article À ACHETER quand le
+    // panier progressif couple une référence différente — constaté :
+    // « F80692 (NOIR, 39) n'est plus en stock » en caisse à Carrefour
+    // Targa, alors que le panier progressif avait quand même été créé
+    // pour ce magasin. On exclut aussi les magasins où le partenaire
+    // d'achat n'a pas de stock, exactement comme pour l'article offert.
+    var magasinsPartenaireOk = null;
+    if (sdState.bxgyAchatMagasins) {
+        magasinsPartenaireOk = {};
+        sdState.bxgyAchatMagasins.forEach(function(m) {
+            if (m.stock > 0) magasinsPartenaireOk[m.warehouse_id] = true;
+        });
+    }
     var h = '';
     (data.magasins || []).forEach(function(m) {
         var on = !!sdState.checked[m.shop_field];
@@ -6568,17 +7333,33 @@ function _sdRenderStores() {
         var actuelle = m.regle
             ? '<b>' + formatMAD(m.regle.prix_ttc) + '</b>' + (m.regle.date_start ? '<span class="rx-prod">depuis le ' + _raFmtDate(m.regle.date_start) + '</span>' : '')
             : '<span class="rx-muted">—</span>';
+        // BUG CORRIGÉ (2026-10-13) : un magasin sans stock de l'article à
+        // solder/offrir (ou sans caisse) n'a aucune raison d'apparaître dans
+        // la liste — ce n'est pas une proposition valable, donc on ne
+        // l'affiche plus du tout (constaté : panier progressif proposé à
+        // Carrefour Targa pour CHYPRE, uniquement en stock à Menara Mall ;
+        // désactiver la case ne suffisait pas, l'utilisatrice veut qu'elle
+        // n'apparaisse pas).
+        var pasDeStock = !m.stock || m.stock <= 0;
+        var pasDeCaisse = !(m.caisses && m.caisses.length);
+        var pasDePartenaire = !!(magasinsPartenaireOk && !magasinsPartenaireOk[m.warehouse_id]);
+        if (pasDeCaisse || pasDeStock || pasDePartenaire) {
+            // Ne doit jamais rester "coché" en interne (ex. pré-coché avant
+            // que le stock ne soit connu), sinon il partirait quand même
+            // dans la demande bien qu'invisible.
+            delete sdState.checked[m.shop_field];
+            return;
+        }
         h += '<tr class="' + (on ? 'sd-on' : '') + '">'
-           + '<td><input type="checkbox" data-shop="' + _escapeHtml(m.shop_field) + '"' + (on ? ' checked="checked"' : '')
-           + (m.caisses && m.caisses.length ? '' : ' disabled="disabled" title="Aucune caisse : impossible d\'y appliquer une solde"') + '/></td>'
+           + '<td><input type="checkbox" data-shop="' + _escapeHtml(m.shop_field) + '"' + (on ? ' checked="checked"' : '') + '/></td>'
            + '<td><span class="rx-group-name" style="font-size:0.83rem;">' + _escapeHtml(m.magasin) + '</span>'
            + '<span class="rx-prod">' + _escapeHtml(m.societe) + '</span></td>'
-           + '<td class="num">' + (m.stock ? formatNumber(m.stock) : '<span class="rx-muted">0</span>') + '</td>'
+           + '<td class="num">' + formatNumber(m.stock) + '</td>'
            + '<td>' + liste + '</td>'
            + '<td class="num">' + actuelle + '</td>'
            + '</tr>';
     });
-    tbody.innerHTML = h || '<tr><td colspan="5" class="rx-muted" style="text-align:center;">Aucun magasin actif.</td></tr>';
+    tbody.innerHTML = h || '<tr><td colspan="5" class="rx-muted" style="text-align:center;">Aucun magasin avec du stock de cet article.</td></tr>';
 }
 
 function _sdPrix() {
@@ -6595,8 +7376,11 @@ var SD_AIDE = {
     promotion: 'Crée une promotion Remise & Fidélité sur cette référence, dans les caisses choisies.',
     pricelist: 'Écrit le prix soldé dans la liste de prix de chaque magasin.',
     promo_code: 'Remise donnée seulement si le client dit le code en caisse.',
+    coupons: 'Génère plusieurs bons à code unique, chacun valable une fois sur cette référence.',
     gift_card: 'Crée des cartes cadeaux : un code et un montant, utilisables comme paiement.',
     loyalty: 'Le client cumule des points sur ses achats et les échange contre une remise.',
+    buy_x_get_y: 'Achetez X, recevez Y avec une remise dessus (100 % = gratuit) — appliqué tout seul en caisse dès que la quantité est atteinte.',
+    next_order_coupons: 'Achetez cette référence, recevez un bon de remise valable sur la PROCHAINE commande (pas celle-ci).',
 };
 function _sdMode() {
     return (el('sd-mode') || {}).value || 'promotion';
@@ -6612,11 +7396,17 @@ function _sdMajChamps() {
     var btn = el('btn-sd-apply');
     if (btn) btn.textContent = mode === 'gift_card' ? 'Créer les cartes'
         : (mode === 'loyalty' ? 'Créer le programme'
-        : (mode === 'promo_code' ? 'Créer le code' : 'Appliquer la solde'));
+        : (mode === 'promo_code' ? 'Créer le code'
+        : (mode === 'coupons' ? 'Créer les bons'
+        : (mode === 'buy_x_get_y' ? 'Créer le panier progressif'
+        : (mode === 'next_order_coupons' ? 'Créer le bon' : 'Appliquer la solde')))));
     var titre = el('sd-titre');
     if (titre) titre.textContent = mode === 'gift_card' ? 'Cartes cadeaux'
         : (mode === 'loyalty' ? 'Programme de fidélité'
-        : (mode === 'promo_code' ? 'Code promo' : 'Solder une référence'));
+        : (mode === 'promo_code' ? 'Code promo'
+        : (mode === 'coupons' ? 'Bons de réduction'
+        : (mode === 'buy_x_get_y' ? 'Panier progressif'
+        : (mode === 'next_order_coupons' ? 'Bon prochaine commande' : 'Solder une référence')))));
 }
 function _sdNum(id) {
     var e = el(id);
@@ -6631,7 +7421,8 @@ function _sdRefresh() {
     var prix = _sdPrix();
     var prev = el('sd-preview');
     var erreur = '';
-    if (mode === 'gift_card' || mode === 'loyalty' || mode === 'promo_code') {
+    if (mode === 'gift_card' || mode === 'loyalty' || mode === 'promo_code' || mode === 'buy_x_get_y'
+        || mode === 'coupons' || mode === 'next_order_coupons') {
         return _sdRefreshProgramme(mode);
     }
     if (prix !== null) {
@@ -6676,6 +7467,15 @@ async function _sdApply() {
         msg = 'Créer le programme de fidélité dans :\n' + magasinsTxt;
     } else if (mode === 'promo_code') {
         msg = 'Créer le code ' + ((el('sd-code') || {}).value || '').trim() + ' dans :\n' + magasinsTxt;
+    } else if (mode === 'buy_x_get_y') {
+        msg = 'Panier progressif · ' + data.reference + (data.couleur ? ' ' + data.couleur : '')
+            + ' : pour ' + (_sdNum('sd-bxgy-x') || 2) + ' acheté(s), ' + (_sdNum('sd-bxgy-y') || 1)
+            + ' offert(s) à ' + (_sdNum('sd-bxgy-remise') || 100) + ' % de remise, dans :\n' + magasinsTxt;
+    } else if (mode === 'coupons') {
+        msg = 'Créer ' + (_sdNum('sd-coupons-nb') || 1) + ' bon(s) de réduction à ' + formatMAD(prix) + ' TTC sur ' + data.reference + ' ?';
+    } else if (mode === 'next_order_coupons') {
+        msg = 'Bon prochaine commande · achat de ' + data.reference + (data.couleur ? ' ' + data.couleur : '')
+            + ' → ' + (_sdNum('sd-remise') || 0) + ' % sur la commande suivante, dans :\n' + magasinsTxt;
     } else {
         var quoi = mode === 'promotion' ? 'Promotion' : 'Liste de prix';
         msg = quoi + ' · ' + data.reference + (data.couleur ? ' ' + data.couleur : '')
@@ -6697,6 +7497,11 @@ async function _sdApply() {
         points_par_mad: _sdNum('sd-points'),
         points_requis: _sdNum('sd-points-requis'),
         remise_fidelite: _sdNum('sd-remise-fid'),
+        bxgy_x: _sdNum('sd-bxgy-x'),
+        bxgy_y: _sdNum('sd-bxgy-y'),
+        bxgy_remise: _sdNum('sd-bxgy-remise'),
+        bxgy_article_achat_id: sdState.bxgyAchatId || '',
+        coupons_nb: _sdNum('sd-coupons-nb'),
         date_start: (el('sd-debut') || {}).value || '',
         date_end: (el('sd-fin') || {}).value || '',
         magasins: choisis.map(function(m) {
@@ -6719,11 +7524,14 @@ async function _sdApply() {
         box.className = 'sd-result ok';
         var cartes = [];
         (res.resultats || []).forEach(function(r) { (r.cartes || []).forEach(function(c) { if (cartes.indexOf(c) === -1) cartes.push(c); }); });
-        var titres = { gift_card: 'Cartes créées.', loyalty: 'Programme de fidélité créé.', promo_code: 'Code promo créé.' };
+        var titres = { gift_card: 'Cartes créées.', loyalty: 'Programme de fidélité créé.', promo_code: 'Code promo créé.', buy_x_get_y: 'Panier progressif créé.', coupons: 'Bons de réduction créés.', next_order_coupons: 'Bon prochaine commande créé.' };
         box.innerHTML = '<b>' + (titres[mode] || 'Solde appliquée.') + '</b><br/>' + res.resultats.map(function(r) {
             if (r.cartes) return '✓ ' + _escapeHtml(r.magasin) + ' — ' + _escapeHtml(r.liste);
             if (r.fidelite) return '✓ ' + _escapeHtml(r.magasin) + ' — ' + formatNumber(r.points_requis) + ' points = ' + r.remise_pct + ' %';
             if (r.code) return '✓ ' + _escapeHtml(r.magasin) + ' — code ' + _escapeHtml(r.code) + ' · ' + formatNumber(r.remise_pct) + ' %';
+            if (r.bxgy) return '✓ ' + _escapeHtml(r.magasin) + ' — ' + _escapeHtml(r.liste);
+            if (r.coupons) return '✓ ' + _escapeHtml(r.magasin) + ' — ' + formatNumber(r.nb_coupons) + ' bon(s) · ' + formatNumber(r.remise_pct) + ' % — ' + _escapeHtml(r.liste);
+            if (r.bon_prochaine_commande) return '✓ ' + _escapeHtml(r.magasin) + ' — ' + formatNumber(r.remise_pct) + ' % sur la prochaine commande — ' + _escapeHtml(r.liste);
             return '✓ ' + _escapeHtml(r.magasin) + ' — ' + formatMAD(r.prix_ttc) + ' TTC dans « ' + _escapeHtml(r.liste) + ' »'
                 + (r.promotion ? ' (promotion créée, remise ' + formatNumber(r.remise_pct) + ' %)'
                                : (r.liste_creee ? ' (liste créée et ajoutée à la caisse)' : ''))
@@ -6760,6 +7568,26 @@ function _sdRefreshProgramme(mode) {
         if (!montant || montant <= 0) erreur = 'Saisissez le montant de la carte.';
         else if (nb < 1 || nb > 200) erreur = 'Entre 1 et 200 cartes.';
         else texte = formatNumber(nb) + ' carte' + (nb > 1 ? 's' : '') + ' de ' + formatMAD(montant) + '.';
+    } else if (mode === 'buy_x_get_y') {
+        var bx = _sdNum('sd-bxgy-x'), by = _sdNum('sd-bxgy-y'), br = _sdNum('sd-bxgy-remise');
+        if (!bx || bx < 1) erreur = 'La quantité à acheter doit être au moins 1.';
+        else if (!by || by < 1) erreur = 'La quantité offerte doit être au moins 1.';
+        else if (!br || br < 1 || br > 100) erreur = 'La remise doit être entre 1 et 100 %.';
+        else texte = 'Pour ' + bx + ' acheté(s), ' + by + ' offert(s) à '
+            + (br === 100 ? 'gratuit' : ('−' + br + ' %')) + '.';
+    } else if (mode === 'coupons') {
+        var nbBons = _sdNum('sd-coupons-nb') || 0;
+        var prixC = _sdPrix();
+        var catC = data.prix_catalogue_ttc || 0;
+        if (nbBons < 1 || nbBons > 500) erreur = 'Entre 1 et 500 bons.';
+        else if (prixC === null) erreur = 'Saisissez le prix soldé ou la remise.';
+        else if (prixC >= catC) erreur = 'Le prix doit être inférieur à ' + formatMAD(catC) + '.';
+        else texte = formatNumber(nbBons) + ' bon' + (nbBons > 1 ? 's' : '') + ' à code unique → '
+            + formatMAD(prixC) + ' TTC (' + Math.round((1 - prixC / catC) * 100) + ' % de remise) sur cette référence.';
+    } else if (mode === 'next_order_coupons') {
+        var remNoc = _sdNum('sd-remise');
+        if (!remNoc || remNoc < 1 || remNoc > 99) erreur = 'La remise doit être entre 1 et 99 %.';
+        else texte = 'Achat de cette référence → bon de ' + remNoc + ' % sur la prochaine commande.';
     } else {
         var pts = _sdNum('sd-points'), requis = _sdNum('sd-points-requis'), rem = _sdNum('sd-remise-fid');
         if (!pts || !requis || !rem) erreur = 'Remplissez les trois champs.';
@@ -6782,7 +7610,8 @@ function _sdBindOnce() {
 
     var modeSel = el('sd-mode');
     if (modeSel) modeSel.addEventListener('change', function() { _sdMajChamps(); _sdRefresh(); });
-    ['sd-code', 'sd-montant', 'sd-nb-cartes', 'sd-points', 'sd-points-requis', 'sd-remise-fid'].forEach(function(id) {
+    ['sd-code', 'sd-montant', 'sd-nb-cartes', 'sd-points', 'sd-points-requis', 'sd-remise-fid',
+     'sd-bxgy-x', 'sd-bxgy-y', 'sd-bxgy-remise', 'sd-coupons-nb'].forEach(function(id) {
         var e = el(id);
         if (e) e.addEventListener('input', _sdRefresh);
     });
@@ -6796,13 +7625,21 @@ function _sdBindOnce() {
     if (prix) prix.addEventListener('input', function() {
         var cat = (sdState.data || {}).prix_catalogue_ttc || 0;
         var p = _sdPrix();
-        if (remise) remise.value = (p !== null && cat > 0 && p > 0 && p < cat) ? Math.round((1 - p / cat) * 100) : '';
+        if (p !== null && cat > 0 && p > 0 && p < cat) {
+            var r = Math.round((1 - p / cat) * 100);
+            if (remise) remise.value = r;
+            // Le prix réellement appliqué sera calculé côté serveur à
+            // partir de ce pourcentage entier : on réaffiche ce prix-là.
+            prix.value = String(_arrondiPrixSolde(cat * (1 - r / 100)));
+        } else if (remise) {
+            remise.value = '';
+        }
         _sdRefresh();
     });
     if (remise) remise.addEventListener('input', function() {
         var cat = (sdState.data || {}).prix_catalogue_ttc || 0;
         var r = parseFloat(remise.value);
-        if (prix) prix.value = (!isNaN(r) && r > 0 && r < 100 && cat > 0) ? (Math.round(cat * (1 - r / 100) * 100) / 100).toFixed(2) : '';
+        if (prix) prix.value = (!isNaN(r) && r > 0 && r < 100 && cat > 0) ? String(_arrondiPrixSolde(cat * (1 - r / 100))) : '';
         _sdRefresh();
     });
     ['sd-debut', 'sd-fin'].forEach(function(id) { var e = el(id); if (e) e.addEventListener('change', _sdRefresh); });
@@ -7946,7 +8783,7 @@ var spState = { data: null, rows: [], seq: 0, bound: false, sel: {}, remises: {}
 // ── Assistant a questions fermees ──────────────────────────────────
 // Pas de modele de langage : chaque question interroge les memes moteurs
 // que les tableaux. La reponse est chiffree et reproductible.
-var asState = { questions: [], active: null };
+var asState = { questions: [], active: null, momentVenteGranularite: 'jour' };
 
 async function _asCharger() {
     if (asState.questions.length) return;
@@ -8172,6 +9009,17 @@ function _asFermer() {
     });
 }
 
+// DEMANDE UTILISATEUR (2026-10-07) : un filtre de p\u00e9riode visible
+// directement dans la r\u00e9ponse \u00ab Quel moment vend le mieux \u00bb, plut\u00f4t que de
+// d\u00e9pendre du filtre P\u00e9riode tout en haut de la page (pas assez visible ici
+// vu les retours).
+var AS_MOMENT_VENTE_GRANULARITES = [
+    {id: 'jour', label: 'Jour'},
+    {id: 'semaine', label: 'Semaine'},
+    {id: 'mois', label: 'Mois'},
+    {id: 'annee', label: 'Année'},
+];
+
 async function _asRepondre(qid, articleId) {
     var zone = el('as-reponse');
     if (!zone) return;
@@ -8183,6 +9031,9 @@ async function _asRepondre(qid, articleId) {
     var params = _spParams();
     params.question = qid;
     if (articleId) params.article_id = articleId;
+    if (qid === 'moment_vente') {
+        params.granularite = asState.momentVenteGranularite;
+    }
     var r = await rpc('/mavie/api/assistant', params);
     if (!r || r.error) {
         zone.innerHTML = '<div class="as-rep-texte" style="color:#B91C1C;">'
@@ -8191,6 +9042,15 @@ async function _asRepondre(qid, articleId) {
     }
     var h = '<div class="as-rep-titre">' + _escapeHtml(r.titre || '') + '</div>'
           + '<div class="as-rep-texte">' + _escapeHtml(r.resume || '') + '</div>';
+    if (qid === 'moment_vente') {
+        h += '<div class="chart-mode-toggle" style="margin:6px 0 10px;">'
+           + AS_MOMENT_VENTE_GRANULARITES.map(function(p) {
+                 return '<button type="button" class="chart-mode-btn as-mv-granularite'
+                     + (p.id === asState.momentVenteGranularite ? ' active' : '') + '" data-granularite="' + p.id + '">'
+                     + _escapeHtml(p.label) + '</button>';
+             }).join('')
+           + '</div>';
+    }
     // Quand la reponse a un graphique, il remplace le tableau : c'est la
     // meme information, lue sans compter.
     var dessin = (r.graphiques || [r.graphique]).map(function(g) {
@@ -8267,6 +9127,11 @@ async function _asRepondre(qid, articleId) {
         zone.addEventListener('click', function(ev) {
             var e = ev.target.closest && ev.target.closest('.as-clic-el');
             if (e) _asDetOuvrir(e.getAttribute('data-cle'), AS_CTX_SOLDES);
+            var btnP = ev.target.closest && ev.target.closest('.as-mv-granularite');
+            if (btnP) {
+                asState.momentVenteGranularite = btnP.getAttribute('data-granularite');
+                _asRepondre('moment_vente');
+            }
         });
     }
 }
@@ -8282,6 +9147,11 @@ function _spParams() {
         categ_ids: state.categ_ids || [],
         batch_id: state.batch_id,
         shop_field: state.shop_field,
+        // DEMANDE UTILISATEUR (2026-10-07) : l'assistant (dont « Quel moment
+        // vend le mieux ») doit respecter le filtre Période de la barre du
+        // haut, comme le reste du dashboard.
+        date_start: state.date_start,
+        date_end: state.date_end,
         fenetre: v('sp-fenetre', 90),
         stock_min: v('sp-stock-min', 5),
         remise1: v('sp-remise1', 30),
@@ -8343,6 +9213,279 @@ async function loadPropositions() {
     spState.data = data;
     spState.rows = data.rows || [];
     _spRender();
+    _ppRender();
+}
+
+// ── Panier progressif : une autre tactique que baisser le prix ──────────
+// Reutilise spState.rows (deja charge pour la carte Soldes), pas de nouvel
+// appel serveur. Inspire de ce qui se pratique en grande distribution (au
+// Maroc comme ailleurs) sur le stock qui ne tourne pas : plutot que
+// d'enchainer les baisses de prix, un lot (« achetez-en un, le 2e offert »)
+// ou un 2e a moitie prix font souvent ecouler sans devaluer l'article aux
+// yeux du client. Demande utilisatrice 2026-10-08 : ne pas se limiter à ce
+// qui est DEJA solde — toute reference reellement dormante (meme urgence
+// que la carte Soldes) est candidate, et pas seulement en escalade d'une
+// remise qui a echoue.
+//   - « urgent » (dort en magasin ET au depot) ou deja solde sans effet :
+//     le cas le plus severe -> BOGO classique, achetez-en un, le 2e offert.
+//   - « forte » (dort, pas encore essaye au depot) : palier plus doux,
+//     2e a moitie prix.
+// DEMANDE UTILISATEUR (2026-10-12) : l'offerte (qui dort) n'est pas
+// obligée d'etre couplee a elle-meme — une AUTRE reference qui se vend
+// bien peut servir de declencheur d'achat, l'offerte restant TOUJOURS la
+// moins chere des deux (sinon le magasin perd de l'argent a chaque vente).
+// Priorite a la meme categorie (deux articles du meme rayon se marient
+// mieux en rayon/caisse), repli sur le reste du catalogue sinon.
+function _ppMeilleurPartenaire(candidat) {
+    var prixCandidat = candidat.prix_ttc || 0;
+    // BUG CORRIGÉ (2026-10-13) : un partenaire avec du stock au niveau
+    // RÉSEAU mais 0 pile dans le(s) magasin(s) où l'offerte dort n'a aucun
+    // sens — personne ne peut déclencher l'achat là où l'offre est posée
+    // (constaté : « achetez SAN1692 » proposé alors que Carrefour Targa en
+    // avait 0, tout le stock étant à Auderby/Marjane). Le partenaire doit
+    // avoir du stock dans AU MOINS UN magasin où le candidat en a aussi.
+    var magasinsCandidat = {};
+    (candidat.magasins || []).forEach(function(m) {
+        if (m.stock > 0) magasinsCandidat[m.warehouse_id] = true;
+    });
+    if (!Object.keys(magasinsCandidat).length) return null;
+
+    var memeCategorie = [];
+    var autres = [];
+    (spState.rows || []).forEach(function(r) {
+        if (r.article_id === candidat.article_id) return;
+        if (r.urgence === 'urgent' || r.urgence === 'forte' || r.jamais_vendu) return;
+        if ((r.prix_ttc || 0) < prixCandidat) return;
+        if (!r.vendu) return;
+        var dispoAuMemeMagasin = (r.magasins || []).some(function(m) {
+            return m.stock > 0 && magasinsCandidat[m.warehouse_id];
+        });
+        if (!dispoAuMemeMagasin) return;
+        (r.categorie && r.categorie === candidat.categorie ? memeCategorie : autres).push(r);
+    });
+    var pool = memeCategorie.length ? memeCategorie : autres;
+    if (!pool.length) return null;
+    pool.sort(function(a, b) { return (b.vendu || 0) - (a.vendu || 0); });
+    return pool[0];
+}
+
+// article_id du partenaire -> son détail magasins (stock par entrepôt),
+// pour qu'au moment d'ouvrir le panneau Solder on ne coche QUE les
+// magasins où le partenaire a aussi du stock (voir openSoldePanel).
+var ppPartenaireMagasins = {};
+
+// DEMANDE UTILISATEUR (2026-10-13) : la date de fin officielle d'une
+// remise est presque toujours fixée très loin (ex. janvier 2027 sur cette
+// base de test) — attendre qu'elle « expire » pour la compter comme un
+// échec ne se produira donc quasiment jamais. Une remise encore active
+// mais qui n'a rien vendu depuis PP_ECHEC_JOURS jours est une preuve tout
+// aussi solide que le prix seul ne suffit pas.
+var PP_ECHEC_JOURS = 14;
+function _ppPreuveEchec(r) {
+    return !!(r.remise_expiree || (r.deja_solde
+        && (r.jamais_vendu || (r.jours_sans_vente || 0) >= PP_ECHEC_JOURS)));
+}
+
+function _ppCandidats() {
+    // DEMANDE UTILISATEUR (2026-10-13) : liste resserrée à une poignée de
+    // cas vraiment prioritaires — gros stock dormant (≥ PP_STOCK_MIN), au
+    // lieu des centaines de candidats urgent/forte sans distinction. Les
+    // articles déjà soldés (remise déjà tentée, toujours pas vendu) sont
+    // remis en tête : c'est justement le signal le plus fort qu'il faut
+    // une autre tactique que le prix (revient sur l'exclusion précédente,
+    // qui était l'inverse de ce qui était voulu).
+    var PP_STOCK_MIN = 50;
+    var PP_LISTE_MAX = 50;
+    var tries = (spState.rows || []).filter(function(r) {
+        return (r.urgence === 'urgent' || r.urgence === 'forte') && (r.stock || 0) >= PP_STOCK_MIN;
+    }).map(function(r) {
+        // DEMANDE UTILISATEUR (2026-10-13) : une SEULE suggestion par
+        // ligne, choisie automatiquement — pas les deux au choix de
+        // l'utilisatrice. Le palier dépend du stock et des ventes : preuve
+        // d'échec de la remise en place (terminée OU encore active mais
+        // sans vente depuis PP_ECHEC_JOURS jours), ou jamais vendu, ou
+        // stock très important (≥ 2×PP_STOCK_MIN) → palier fort (2e
+        // offert) ; sinon palier modéré (2e à moitié prix).
+        var severe = _ppPreuveEchec(r) || (r.stock || 0) >= 2 * PP_STOCK_MIN;
+        var c = severe
+            ? { row: r, tier: 'bogo', bxgy_x: 1, bxgy_y: 1, bxgy_remise: 100 }
+            : { row: r, tier: 'demi', bxgy_x: 2, bxgy_y: 1, bxgy_remise: 50 };
+        c.partenaire = _ppMeilleurPartenaire(r);
+        if (c.partenaire) ppPartenaireMagasins[c.partenaire.article_id] = c.partenaire.magasins || [];
+        return c;
+    }).sort(function(a, b) {
+        // Priorité : preuve d'échec de la remise (la plus forte) > remise
+        // en cours sans preuve encore > rien en place.
+        var pa = _ppPreuveEchec(a.row) ? 2 : (a.row.deja_solde ? 1 : 0);
+        var pb = _ppPreuveEchec(b.row) ? 2 : (b.row.deja_solde ? 1 : 0);
+        if (pa !== pb) return pb - pa;
+        return (b.row.stock || 0) - (a.row.stock || 0);
+    });
+    // BUG CORRIGÉ (2026-10-13) : le tri plaçait tous les « déjà soldés »
+    // avant les autres, et comme ils sont presque tous à gros stock (donc
+    // palier fort), les 50 premiers étaient TOUJOURS du 100 % — aucun 50 %
+    // n'atteignait jamais l'écran malgré son existence plus loin dans la
+    // liste. On réserve désormais la moitié des places à chaque palier.
+    var bogo = tries.filter(function(c) { return c.tier === 'bogo'; });
+    var demi = tries.filter(function(c) { return c.tier === 'demi'; });
+    var moitie = Math.floor(PP_LISTE_MAX / 2);
+    var nbBogo = Math.min(bogo.length, Math.max(moitie, PP_LISTE_MAX - demi.length));
+    var nbDemi = PP_LISTE_MAX - nbBogo;
+    return bogo.slice(0, nbBogo).concat(demi.slice(0, nbDemi));
+}
+
+function _ppRender() {
+    var cnt = el('pp-cnt');
+    var candidats = _ppCandidats();
+    if (cnt) cnt.textContent = candidats.length ? formatNumber(candidats.length) + ' candidate(s)' : 'aucune';
+    var corps = el('pp-body');
+    if (!corps) return;
+    if (!candidats.length) {
+        corps.innerHTML = '<div class="rb-empty">Rien ici pour l’instant — aucune référence assez dormante pour le justifier.</div>';
+        return;
+    }
+    var h = '<div class="rx-scroll"><table class="rx-table"><thead><tr>'
+          + '<th>Référence</th><th class="num">Stock</th>'
+          + '<th class="num">Remise déjà en place</th>'
+          + '<th class="num" title="Jours depuis la dernière vente">Sans vente</th>'
+          + '<th>Suggestion</th><th></th>'
+          + '</tr></thead><tbody>';
+    candidats.forEach(function(c) {
+        var r = c.row;
+        var badge = c.tier === 'bogo'
+            ? '<span class="pp-tier pp-tier-gratuit">Achetez-en un, le 2e offert</span>'
+            : '<span class="pp-tier pp-tier-demi">2e à moitié prix</span>';
+        // La remise en place vient d'une remise déjà posée : exceptionnellement
+        // négative quand la ligne de prix saisie majore plutôt qu'elle ne
+        // réduit (donnée existante) — on n'impose pas un second signe dans
+        // ce cas, sinon « −12 % » devient « −−12 % ».
+        var remiseAff = r.deja_solde ? (r.remise_en_place || r.remise || 0) : null;
+        var remiseStatut = r.remise_expiree
+            ? '<div style="font-size:0.72rem;color:#B91C1C;font-weight:700;margin-top:2px;">terminée, invendu</div>'
+            : (_ppPreuveEchec(r)
+                ? '<div style="font-size:0.72rem;color:#B91C1C;font-weight:700;margin-top:2px;">en cours, sans effet</div>'
+                : (r.deja_solde ? '<div style="font-size:0.72rem;color:#92400E;margin-top:2px;">en cours</div>' : ''));
+        // DEMANDE UTILISATEUR (2026-10-12) : proposer, en plus du couplage
+        // avec elle-même, un couplage avec une référence différente qui se
+        // vend bien (toujours plus chère ou égale, pour ne jamais offrir
+        // plus cher que ce qui est acheté).
+        var coupleBtn = '';
+        if (c.partenaire) {
+            coupleBtn = '<button type="button" class="rx-btn rx-btn-sm btn-pp-propose" style="margin-top:4px;" '
+                + 'data-article="' + r.article_id + '" data-x="1" data-y="' + c.bxgy_y + '" data-remise="' + c.bxgy_remise + '" '
+                + 'data-achat-id="' + c.partenaire.article_id + '" data-achat-ref="' + _escapeHtml(c.partenaire.reference) + '" '
+                + 'title="Achetez ' + _escapeHtml(c.partenaire.reference) + ', recevez ' + _escapeHtml(r.reference) + ' offerte">'
+                + 'Avec ' + _escapeHtml(c.partenaire.reference) + '</button>';
+        }
+        // DEMANDE UTILISATRICE (2026-10-13) : avant de se déplacer en
+        // magasin, voir dans quel magasin les DEUX articles (achat +
+        // offert) ont du stock, et quelle variante précise y est dispo.
+        var stockBtn = '<button type="button" class="rx-btn rx-btn-sm rx-btn-ghost btn-pp-stock" style="margin-top:4px;" '
+            + 'data-offert-id="' + r.article_id + '"'
+            + (c.partenaire ? ' data-achat-id="' + c.partenaire.article_id + '"' : '') + '>'
+            + '📍 Voir le stock</button>';
+        h += '<tr>'
+           + '<td><span class="rx-ref" data-article="' + r.article_id + '" data-name="'
+             + _escapeHtml(r.produit) + '">' + _escapeHtml(r.reference) + '</span></td>'
+           + '<td class="num">' + formatNumber(r.stock) + '</td>'
+           + '<td class="num' + (remiseAff === null ? ' rx-muted' : '') + '"'
+             + (remiseAff !== null ? ' style="color:#B45309;font-weight:700;"' : '') + '>'
+             + (remiseAff === null ? '—' : ((remiseAff < 0 ? '+' : '−') + formatNumber(Math.abs(remiseAff)) + ' %'))
+             + remiseStatut + '</td>'
+           + '<td class="num">' + (r.jamais_vendu ? 'jamais vendu' : formatNumber(r.jours_sans_vente) + ' j') + '</td>'
+           + '<td>' + badge + '</td>'
+           + '<td><button type="button" class="rx-btn rx-btn-sm btn-pp-propose" data-article="' + r.article_id
+             + '" data-x="' + c.bxgy_x + '" data-y="' + c.bxgy_y + '" data-remise="' + c.bxgy_remise + '">'
+             + (c.partenaire ? 'Même référence' : 'Proposer') + '</button>'
+             + coupleBtn + stockBtn + '</td>'
+           + '</tr>';
+    });
+    h += '</tbody></table></div>';
+    corps.innerHTML = h;
+}
+
+// DEMANDE UTILISATRICE (2026-10-13) : popup « Voir le stock » — détail par
+// magasin ET par variante (couleur/taille) des DEUX articles d'un panier
+// progressif, pour savoir avant de se déplacer où les poser et quelle
+// variante choisir sur place.
+var ppStockBound = false;
+function _ppStockFermer() {
+    var o = el('pp-stock-overlay');
+    if (o) o.classList.remove('active');
+}
+function _ppStockBindOnce() {
+    if (ppStockBound) return;
+    ppStockBound = true;
+    var fermer = el('close-pp-stock-btn');
+    if (fermer) fermer.addEventListener('click', _ppStockFermer);
+    var fond = el('pp-stock-overlay');
+    if (fond) fond.addEventListener('click', function(ev) {
+        if (ev.target === fond) _ppStockFermer();
+    });
+}
+async function _ppStockOuvrir(offertId, achatId) {
+    var overlay = el('pp-stock-overlay');
+    if (!overlay) return;
+    _ppStockBindOnce();
+    var corps = el('pp-stock-body');
+    if (corps) corps.innerHTML = '<div class="rb-empty">Chargement…</div>';
+    overlay.classList.add('active');
+    var d = await rpc('/mavie/api/panier-progressif-stock', {
+        offert_tmpl_id: offertId, achat_tmpl_id: achatId || null,
+    });
+    if (!corps) return;
+    if (d.error) { corps.innerHTML = '<div class="rb-empty">' + _escapeHtml(d.error) + '</div>'; return; }
+    var titreEl = el('pp-stock-titre');
+    if (titreEl) {
+        titreEl.textContent = d.achat
+            ? 'Achetez « ' + d.achat.reference + ' », recevez « ' + d.offert.reference + ' »'
+            : '« ' + d.offert.reference + ' » — même référence';
+    }
+    var magasins = d.magasins || [];
+    if (!magasins.length) {
+        corps.innerHTML = '<div class="rb-empty">Aucun magasin actif.</div>';
+        return;
+    }
+    var nbOk = magasins.filter(function(m) { return m.utilisable; }).length;
+    // DEMANDE UTILISATRICE (2026-10-13) : un seul tableau (magasin, couleur,
+    // pointure) au lieu d'un bloc par magasin — trop long, pas lisible.
+    // Une ligne par variante en stock ; le magasin et la société ne
+    // s'affichent qu'une fois par groupe (rowspan).
+    var h = '<div style="font-size:0.84rem;color:#475569;margin-bottom:10px;">'
+          + (nbOk
+              ? '<b style="color:#15803D;">' + nbOk + '</b> magasin(s) où les deux articles sont en stock — en tête du tableau.'
+              : '<b style="color:#B91C1C;">Aucun magasin n’a les deux articles en stock en même temps.</b>')
+          + '</div>'
+          + '<div class="rx-scroll"><table class="rx-table"><thead><tr>'
+          + '<th>Magasin</th>'
+          + (d.achat ? '<th>Article</th>' : '')
+          + '<th>Couleur</th><th>Pointure</th><th class="num">Stock</th>'
+          + '</tr></thead><tbody>';
+    magasins.forEach(function(m) {
+        var lignes = (m.offert_variantes || []).map(function(v) {
+            return { type: 'offert', couleur: v.couleur, pointure: v.pointure, stock: v.stock };
+        }).concat((m.achat_variantes || []).map(function(v) {
+            return { type: 'achat', couleur: v.couleur, pointure: v.pointure, stock: v.stock };
+        }));
+        if (!lignes.length) lignes = [{ type: null, couleur: '—', pointure: '—', stock: 0 }];
+        var magasinCell = '<td rowspan="' + lignes.length + '">'
+            + '<span class="' + (m.utilisable ? 'pps-magasin-ok' : 'pps-magasin-non') + '">' + _escapeHtml(m.magasin) + '</span>'
+            + '<span class="rx-prod">' + _escapeHtml(m.societe) + '</span></td>';
+        lignes.forEach(function(l, i) {
+            h += '<tr class="' + (m.utilisable ? '' : 'pps-row-non') + '">'
+               + (i === 0 ? magasinCell : '')
+               + (d.achat ? '<td>' + (l.type
+                    ? '<span class="pps-type ' + (l.type === 'offert' ? 'pps-type-offert' : 'pps-type-achat') + '">'
+                      + (l.type === 'offert' ? 'Offert' : 'À acheter') + '</span>'
+                    : '—') + '</td>' : '')
+               + '<td>' + _escapeHtml(l.couleur) + '</td>'
+               + '<td>' + _escapeHtml(l.pointure) + '</td>'
+               + '<td class="num">' + (l.type ? formatNumber(l.stock) : '0') + '</td>'
+               + '</tr>';
+        });
+    });
+    h += '</tbody></table></div>';
+    corps.innerHTML = h;
 }
 
 // Ce que chaque choix du filtre affiche. La ligne suit le choix en cours,
@@ -8603,7 +9746,9 @@ function _spRender() {
              + ' Ajustez-la avant de solder si vous le jugez utile.">'
              + _spOptionsRemise(rem) + '</select></td>'
            + '<td class="num" data-row-prix="' + r.article_id + '">'
-             + formatMAD(_spPrixSolde(r)) + '</td>'
+             + '<input type="number" class="sp-prix-manuel" step="0.01" min="0" '
+             + 'data-article="' + r.article_id + '" value="' + _spPrixSolde(r)
+             + '" title="Prix soldé : modifiable directement, la remise ci-contre se recalcule automatiquement."/></td>'
            + '<td><button type="button" class="sp-btn-solder" data-article="' + r.article_id
              + '" data-remise="' + rem
              + '" title="Ouvre le panneau d\u00e9j\u00e0 rempli : remise pos\u00e9e et magasins concern\u00e9s coch\u00e9s">\ud83c\udff7\ufe0f Solder</button></td>'
@@ -9391,20 +10536,20 @@ async function _trCreer(lignes, bon) {
     var echecs = [];
     for (var i = 0; i < cles.length; i++) {
         var lot = bons[cles[i]];
-        var okCouple = 0;
-        for (var j = 0; j < lot.length; j++) {
-            var r = lot[j];
-            // Le stock reel par variante : une reference se decline en
-            // couleurs et tailles, et c'est la variante qui se transfere.
-            var res = await rpc('/mavie/api/transfer-create', {
-                product_tmpl_id: r.article_id,
-                source_shop_field: r.source_field,
-                dest_shop_field: r.dest_field,
-                lines: [{ product_id: r.variant_id, qty: r.quantite }] });
-            if (res && res.error) echecs.push(r.reference + ' : ' + res.error);
-            else okCouple += 1;
+        // DEMANDE UTILISATEUR (2026-10-12) : un seul bon par paire de
+        // magasins, regroupant TOUTES ses references retenues — avant, un
+        // appel separe par reference creait autant de bons que de
+        // references dans la meme paire. product_tmpl_id est omis : ce bon
+        // n'est plus restreint a une seule reference.
+        var res = await rpc('/mavie/api/transfer-create', {
+            source_shop_field: lot[0].source_field,
+            dest_shop_field: lot[0].dest_field,
+            lines: lot.map(function(r) { return { product_id: r.variant_id, qty: r.quantite }; }) });
+        if (res && res.error) {
+            echecs.push(lot[0].source + ' → ' + lot[0].destination + ' : ' + res.error);
+        } else {
+            faits += 1;
         }
-        if (okCouple) faits += 1;
     }
     var msg = faits + ' bon(s) de transfert cr\u00e9\u00e9(s) sur ' + cles.length + '.';
     if (echecs.length) {
@@ -9619,8 +10764,24 @@ function _spRemise(r) {
     return (o === undefined || o === null) ? r.remise : o;
 }
 
+// Arrondi au demi-dirham : le prix affiché se termine toujours en ,00 ou
+// ,50 (demande utilisateur 2026-10-07), même logique que _arrondi_prix_solde
+// côté serveur (dashboard.py) — l'aperçu doit annoncer le prix qui sera
+// vraiment posé, pas un prix aux centimes que personne ne demande.
+// Arrondi à l'entier (demande utilisateur, confirmée sur plusieurs
+// exemples le 2026-10-07 : 198,55 -> 199, 170,70 -> 171, 250,50 -> 250,
+// 280 à -18 % (229,60) -> 230) — même règle que _arrondi_prix_solde côté
+// serveur (dashboard.py). Un essai au demi-dirham entre-temps est revenu
+// en arrière, il ne correspondait pas à ces exemples.
+function _arrondiPrixSolde(p) {
+    var n = Math.floor(p);
+    var reste = Math.round((p - n) * 100) / 100;
+    return reste <= 0.5 ? n : n + 1;
+}
+
 function _spPrixSolde(r) {
-    return Math.round(r.prix_ttc * (100 - _spRemise(r))) / 100;
+    var brut = r.prix_ttc * (100 - _spRemise(r)) / 100;
+    return _arrondiPrixSolde(brut);
 }
 
 // D'ou vient le palier propose. On le dit dans l'infobulle : un conseil
@@ -9983,6 +11144,42 @@ function _spBindOnce() {
             if (!ouvert) _sjCharger();
         });
     }
+    var ppBloc = el('pp-bloc');
+    if (ppBloc) {
+        var teteP = ppBloc.querySelector('.rb-head');
+        if (teteP) teteP.addEventListener('click', function() {
+            ppBloc.setAttribute('data-open', ppBloc.getAttribute('data-open') === '1' ? '0' : '1');
+        });
+    }
+    var corpsP = el('pp-body');
+    if (corpsP) corpsP.addEventListener('click', function(ev) {
+        var propose = ev.target.closest && ev.target.closest('.btn-pp-propose');
+        if (propose) {
+            var aid = parseInt(propose.getAttribute('data-article'), 10);
+            var px = parseInt(propose.getAttribute('data-x'), 10) || 2;
+            var py = parseInt(propose.getAttribute('data-y'), 10) || 1;
+            var remise = parseInt(propose.getAttribute('data-remise'), 10) || 100;
+            var achatId = parseInt(propose.getAttribute('data-achat-id'), 10) || null;
+            var achatRef = propose.getAttribute('data-achat-ref') || '';
+            if (aid) openSoldePanel(aid, '', {
+                mode: 'buy_x_get_y', bxgy_x: px, bxgy_y: py, bxgy_remise: remise,
+                article_achat_id: achatId, article_achat_label: achatRef,
+                article_achat_magasins: achatId ? (ppPartenaireMagasins[achatId] || []) : null,
+            });
+            return;
+        }
+        var stock = ev.target.closest && ev.target.closest('.btn-pp-stock');
+        if (stock) {
+            var offertId = parseInt(stock.getAttribute('data-offert-id'), 10);
+            var achatIdS = parseInt(stock.getAttribute('data-achat-id'), 10) || null;
+            if (offertId) _ppStockOuvrir(offertId, achatIdS);
+            return;
+        }
+        var refP = ev.target.closest && ev.target.closest('.rx-ref');
+        if (!refP) return;
+        var idP = parseInt(refP.getAttribute('data-article'), 10);
+        if (idP) openDetail(idP, refP.getAttribute('data-name') || refP.textContent);
+    });
     var corpsJ = el('sj-body');
     if (corpsJ) corpsJ.addEventListener('click', function(ev) {
         var ref = ev.target.closest && ev.target.closest('.rx-ref');
@@ -9992,14 +11189,45 @@ function _spBindOnce() {
     });
     var corps = el('sp-body');
     if (corps) corps.addEventListener('change', function(ev) {
+        // Saisie manuelle du prix soldé : on recalcule la remise % à partir
+        // du prix catalogue et on la reporte sur le menu déroulant, qui
+        // accueille cette valeur même si elle n'est pas un palier standard.
+        var inputPrix = ev.target.closest && ev.target.closest('.sp-prix-manuel');
+        if (inputPrix) {
+            var ap = parseInt(inputPrix.getAttribute('data-article'), 10);
+            var rp = (spState.rows.filter(function(x) { return x.article_id === ap; }) || [])[0];
+            if (!rp) return;
+            var prixSaisi = parseFloat((inputPrix.value || '0').replace(',', '.'));
+            if (!(prixSaisi > 0) || !(rp.prix_ttc > 0) || prixSaisi >= rp.prix_ttc) {
+                inputPrix.value = String(_spPrixSolde(rp));
+                return;
+            }
+            var remiseCalculee = Math.round((1 - prixSaisi / rp.prix_ttc) * 100);
+            spState.remises[ap] = remiseCalculee;
+            // Le prix réellement appliqué sera calculé côté serveur à partir
+            // de ce pourcentage entier : on réaffiche ce prix-là, pour que
+            // ce qui est écrit soit ce qui sera vraiment posé.
+            inputPrix.value = String(_spPrixSolde(rp));
+            var selp = document.querySelector('.sp-remise-sel[data-article="' + ap + '"]');
+            if (selp) selp.innerHTML = _spOptionsRemise(remiseCalculee);
+            var bsp = document.querySelector('.sp-btn-solder[data-article="' + ap + '"]');
+            if (bsp) bsp.setAttribute('data-remise', remiseCalculee);
+            spState.sel[ap] = true;
+            var cp = document.querySelector('.sp-chk[data-article="' + ap + '"]');
+            if (cp) cp.checked = true;
+            var detp = el('sp-det-' + ap);
+            if (detp) detp.removeAttribute('data-charge');
+            _spRecap();
+            return;
+        }
         var s = ev.target.closest && ev.target.closest('.sp-remise-sel');
         if (!s) return;
         var a = parseInt(s.getAttribute('data-article'), 10);
         var v = parseInt(s.value, 10);
         spState.remises[a] = v;
         var r = (spState.rows.filter(function(x) { return x.article_id === a; }) || [])[0];
-        var cellule = document.querySelector('[data-row-prix="' + a + '"]');
-        if (r && cellule) cellule.textContent = formatMAD(_spPrixSolde(r));
+        var champPrix = document.querySelector('[data-row-prix="' + a + '"] .sp-prix-manuel');
+        if (r && champPrix) champPrix.value = String(_spPrixSolde(r));
         var bs = document.querySelector('.sp-btn-solder[data-article="' + a + '"]');
         if (bs) bs.setAttribute('data-remise', v);
         // Une remise qu'on ajuste, c'est une reference qu'on veut traiter :

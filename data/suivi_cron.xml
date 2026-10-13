@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- DEMANDE UTILISATEUR (2026-10-08) : alerter tout seul, sans qu'il
+         faille ouvrir la page Suivi, quand un bon traîne trop longtemps ou
+         qu'un écart envoyé/reçu vient d'être constaté. Boîte Odoo
+         uniquement (jamais d'email, base de test) — voir
+         InterInternalTransferExt._cron_suivi_alertes. -->
+    <record id="ir_cron_mavie_suivi_alertes" model="ir.cron">
+        <field name="name">MaVie Dashboard : alertes Suivi des transferts</field>
+        <field name="model_id" ref="mavie_dashboard.model_inter_internal_transfer"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_suivi_alertes()</field>
+        <field name="interval_number">1</field>
+        <field name="interval_type">days</field>
+        <field name="numbercall">-1</field>
+        <field name="active">True</field>
+    </record>
+</odoo>

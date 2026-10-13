@@ -22,6 +22,11 @@
             <field name="tag">mavie_dashboard.action_propositions</field>
         </record>
 
+        <record id="action_mavie_dashboard_suivi_client" model="ir.actions.client">
+            <field name="name">Suivi</field>
+            <field name="tag">mavie_dashboard.action_suivi</field>
+        </record>
+
         <!-- MENUS -->
         <menuitem id="menu_mavie_dashboard_root_v2"
                   name="Dashboard"
@@ -50,5 +55,11 @@
                   parent="menu_mavie_dashboard_root_v2"
                   action="action_mavie_dashboard_soldes_client"
                   sequence="40"/>
+
+        <menuitem id="menu_mavie_dashboard_suivi_v2"
+                  name="Suivi"
+                  parent="menu_mavie_dashboard_root_v2"
+                  action="action_mavie_dashboard_suivi_client"
+                  sequence="50"/>
     </data>
 </odoo>

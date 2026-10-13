@@ -1063,6 +1063,27 @@
                     display: flex;
                     animation: fadeInOverlay 0.22s ease;
                 }
+
+                #pp-stock-overlay {
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(15,23,42,0.4);
+                    z-index: 9700;
+                    display: none;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 16px;
+                }
+                #pp-stock-overlay.active {
+                    display: flex;
+                    animation: fadeInOverlay 0.22s ease;
+                }
+                .pps-magasin-ok { color: #15803D; font-weight: 700; }
+                .pps-magasin-non { color: #94A3B8; }
+                .pps-row-non td { color: #94A3B8; }
+                .pps-type { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.72rem; font-weight: 700; }
+                .pps-type-offert { background: #DCFCE7; color: #15803D; }
+                .pps-type-achat { background: #DBEAFE; color: #1D4ED8; }
                 .as-det-tete { display:flex; align-items:center; gap:10px;
                     margin-bottom:6px; padding-right:30px; }
                 .as-det-tete h3 { margin:0; color:#0F172A; font-size:1.12rem;
@@ -1205,7 +1226,8 @@
                 #valorisation-overlay,
                 #ecarts-overlay,
                 #stock-recon-overlay,
-                #ecart-detail-overlay {
+                #ecart-detail-overlay,
+                #couleur-detail-overlay {
                     position: fixed;
                     inset: 0;
                     background: rgba(15,23,42,0.4);
@@ -1229,7 +1251,8 @@
                 #valorisation-overlay.active,
                 #ecarts-overlay.active,
                 #stock-recon-overlay.active,
-                #ecart-detail-overlay.active {
+                #ecart-detail-overlay.active,
+                #couleur-detail-overlay.active {
                     display: flex;
                     animation: fadeInOverlay 0.22s ease;
                 }
@@ -1966,6 +1989,65 @@
                 .sp-det-aide { font-size:0.78rem; color:#64748B; margin-bottom:8px; }
                 .sp-f-aide { font-size:0.78rem; color:#64748B; align-self:center; }
                 .rb-num-bleu { background:#1D4ED8; }
+                .rb-num-amber { background:#D97706; }
+                /* Suggestion panier progressif : 2e gratuit (plus agressif)
+                   ou 2e a moitie prix. */
+                .pp-tier { font-size:0.7rem; font-weight:700; letter-spacing:.02em;
+                    border-radius:4px; padding:2px 7px; white-space:nowrap; display:inline-block; }
+                .pp-tier-gratuit { background:#FEE2E2; color:#B91C1C; }
+                .pp-tier-demi { background:#FEF3C7; color:#92400E; }
+                /* Page Suivi : ligne de bon dépliable + détail article par
+                   article (demande utilisatrice 2026-10-08). */
+                .su-row { cursor:pointer; }
+                .su-row:hover { background:#F8FAFC; }
+                .su-caret { display:inline-block; transition:transform var(--transition); color:#94A3B8; }
+                .su-row[data-open="1"] .su-caret { transform:rotate(90deg); }
+                .su-detail-wrap { padding:0 8px 14px 34px; background:#FAFBFC; }
+                .su-detail-table { width:100%; border-collapse:collapse; font-size:0.8rem; background:#FFFFFF;
+                    border:1px solid #E2E8F0; border-radius:8px; overflow:hidden; }
+                .su-detail-table th { background:#F1F5F9; text-align:left; padding:6px 8px; font-weight:700; color:#475569; }
+                .su-detail-table td { padding:6px 8px; border-top:1px solid #F1F5F9; }
+                .su-detail-table tr.su-anomalie td { background:#FEF2F2; }
+                .su-check { font-weight:700; }
+                .su-check-ok { color:#047857; }
+                .su-check-ko { color:#B91C1C; }
+                .su-valide-btn { font-size:0.74rem; padding:3px 9px; border-radius:6px; border:1px solid #A7F3D0;
+                    background:#ECFDF5; color:#065F46; cursor:pointer; font-weight:600; }
+                .su-valide-btn:hover { background:#D1FAE5; }
+                .su-valide-ok { font-size:0.76rem; color:#065F46; font-weight:600; }
+                .su-alerte { font-size:0.76rem; color:#B91C1C; font-weight:600; }
+                .su-attente { font-size:0.76rem; color:#94A3B8; }
+                .su-th-tri { cursor:pointer; user-select:none; }
+                .su-th-tri:hover { color:#4C1D95; }
+                .su-tri-fleche { display:inline-block; width:12px; margin-left:2px; color:#4C1D95; }
+                .su-toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+                    justify-content:space-between; margin-bottom:10px; }
+                .su-filtres { display:flex; flex-wrap:wrap; gap:6px; }
+                .su-filtre-btn { font-size:0.78rem; padding:5px 11px; border-radius:999px;
+                    border:1px solid #E2E8F0; background:#FFFFFF; color:#475569; cursor:pointer;
+                    font-weight:600; white-space:nowrap; }
+                .su-filtre-btn:hover { background:#F8FAFC; }
+                .su-filtre-btn.active { background:#0F172A; border-color:#0F172A; color:#FFFFFF; }
+                .su-recherche { min-width:220px; }
+                .su-classement { margin-bottom:14px; padding:12px 14px; border-radius:10px;
+                    background:#FFF7ED; border:1px solid #FED7AA; }
+                .su-classement-titre { font-size:0.82rem; font-weight:700; color:#7C2D12; margin-bottom:6px; }
+                .su-classement-list { display:flex; flex-wrap:wrap; gap:8px; }
+                .su-classement-item { font-size:0.78rem; background:#FFFFFF; border:1px solid #FED7AA;
+                    border-radius:7px; padding:4px 10px; color:#7C2D12; }
+                .su-classement-item b { color:#B91C1C; }
+                .su-classement-violet { background:#F5F3FF; border-color:#DDD6FE; }
+                .su-classement-violet .su-classement-titre { color:#4C1D95; }
+                .su-classement-violet .su-classement-item { border-color:#DDD6FE; color:#4C1D95; }
+                .su-classement-violet .su-classement-item b { color:#6D28D9; }
+                .su-note-form { display:flex; gap:6px; align-items:center; margin-top:4px; }
+                .su-note-form input { flex:1; font-size:0.78rem; padding:4px 8px; border:1px solid #E2E8F0; border-radius:6px; }
+                .su-note-form button { font-size:0.74rem; padding:4px 10px; border-radius:6px; border:1px solid #CBD5E1;
+                    background:#FFFFFF; cursor:pointer; font-weight:600; }
+                .su-note-ok { font-size:0.76rem; color:#475569; font-style:italic; }
+                .su-note-edit { font-size:0.7rem; color:#64748B; cursor:pointer; text-decoration:underline; margin-left:6px; }
+                .su-stuck { font-size:0.7rem; color:#B45309; background:#FEF3C7; border-radius:4px;
+                    padding:1px 6px; margin-left:6px; white-space:nowrap; }
                 /* Fleche source -> destination d'un transfert. */
                 .tr-fleche { color:#1D4ED8; font-weight:700; padding:0 6px; }
                 .tr-mag { font-weight:600; color:#0F172A; }
@@ -2866,6 +2948,53 @@
                     </div>
                 </div>
 
+                <!-- DEMANDE UTILISATEUR (2026-10-07) : savoir quelles couleurs
+                     se vendent, toutes références confondues. -->
+                <div id="section-top-flop-couleurs">
+                    <div class="section-card" style="margin-bottom:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                        <span style="font-weight:600;color:#6D28D9;">🎨 Top / Flop Couleurs</span>
+                        <button type="button" id="btn-export-tfc" class="btn-transfer-open" title="Exporter le Top/Flop Couleurs affiché en Excel (.xlsx)">📊 Excel</button>
+                    </div>
+                    <div class="grid-2col">
+                    <div class="section-card">
+                        <div class="section-title">
+                            <span>🎨 Top Couleurs</span>
+                            <input type="number" id="top-couleurs-limit" value="10" min="1" max="200" class="limit-input"/>
+                            <span class="title-line"></span>
+                        </div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Couleur</th>
+                                    <th title="Quantité vendue en caisse (POS), toutes références de cette couleur.">Qté vendue</th>
+                                    <th title="Montant TTC encaissé en caisse, toutes références de cette couleur.">CA Vendu (TTC)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="top-couleurs-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div class="section-card">
+                        <div class="section-title">
+                            <span>🎨 Flop Couleurs</span>
+                            <input type="number" id="flop-couleurs-limit" value="10" min="1" max="200" class="limit-input"/>
+                            <span class="title-line"></span>
+                        </div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Couleur</th>
+                                    <th title="Quantité vendue en caisse (POS), toutes références de cette couleur.">Qté vendue</th>
+                                    <th title="Montant TTC encaissé en caisse, toutes références de cette couleur.">CA Vendu (TTC)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="flop-couleurs-tbody"></tbody>
+                        </table>
+                    </div>
+                    </div>
+                </div>
+
                 <div class="section-card full-width" id="section-abc">
                     <div class="section-title">🔬 Analyse ABC (Pareto)<span class="title-line"></span></div>
                     <div id="abc-analysis-content"></div>
@@ -2890,6 +3019,56 @@
                      et ses couleurs dessous, avec Catégorie, Prix, Qté en dépôt
                      et trois boutons d'action. Rempli par loadActions()
                      (dashboard.js). -->
+                <!-- ══════════ PAGE SUIVI (menu Dashboard → Suivi) ══════════
+                     DEMANDE UTILISATEUR (2026-10-07) : suivre les transferts
+                     après leur création — ce qu'un magasin a envoyé, ce que
+                     l'autre a reçu, côte à côte, bon par bon, avec l'écart
+                     visible. Remplie par loadSuivi() (dashboard.js). -->
+                <div class="section-card full-width rx" id="suivi-page" style="display:none;">
+                    <div class="rx-head">
+                        <div>
+                            <div class="rx-title">Suivi des transferts</div>
+                            <div class="rx-sub">Ce qui a été envoyé, ce qui a été reçu, bon par bon.</div>
+                        </div>
+                        <div style="display:flex;gap:8px;">
+                            <button type="button" id="btn-suivi-export" class="btn-transfer-open">📊 Exporter Excel</button>
+                            <button type="button" id="btn-suivi-refresh" class="btn-transfer-open">↻ Rafraîchir</button>
+                        </div>
+                    </div>
+                    <div id="suivi-resume" class="rx-sub" style="margin:6px 0 10px;"></div>
+
+                    <div class="su-toolbar">
+                        <div class="su-filtres" id="suivi-filtres">
+                            <button type="button" class="su-filtre-btn active" data-filtre="tous">Tous</button>
+                            <button type="button" class="su-filtre-btn" data-filtre="a_verifier">À vérifier</button>
+                            <button type="button" class="su-filtre-btn" data-filtre="anomalies">Anomalies</button>
+                            <button type="button" class="su-filtre-btn" data-filtre="valides">Validés</button>
+                            <button type="button" class="su-filtre-btn" data-filtre="attente">En attente de réception</button>
+                        </div>
+                        <div style="display:flex;gap:8px;">
+                            <select id="suivi-f-magasin" class="rx-select"><option value="">Tous les magasins</option></select>
+                            <input type="search" id="suivi-recherche" class="rx-select rx-search" placeholder="Rechercher un bon, un magasin…" autocomplete="off"/>
+                        </div>
+                    </div>
+
+                    <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+                        <thead>
+                            <tr style="background:#F8FAFC;text-align:left;">
+                                <th style="padding:8px;width:20px;"></th>
+                                <th style="padding:8px;">Bon</th>
+                                <th style="padding:8px;">Trajet</th>
+                                <th style="padding:8px;">État</th>
+                                <th class="su-th-tri" data-tri="envoye" style="padding:8px;text-align:center;">Pièces envoyées<span class="su-tri-fleche"></span></th>
+                                <th style="padding:8px;text-align:center;">Pièces reçues</th>
+                                <th class="su-th-tri" data-tri="ecart" style="padding:8px;text-align:center;">Écart<span class="su-tri-fleche"></span></th>
+                                <th style="padding:8px;">Vérification</th>
+                                <th class="su-th-tri" data-tri="date" style="padding:8px;">Créé le<span class="su-tri-fleche"></span></th>
+                            </tr>
+                        </thead>
+                        <tbody id="suivi-tbody"></tbody>
+                    </table>
+                </div>
+
                 <!-- ══════════ PAGE PROPOSITIONS ══════════
                      Ce que le tableau de bord propose de faire : les soldes
                      aujourd'hui, les transferts entre magasins ensuite. Un
@@ -3043,6 +3222,26 @@
 
                     <div class="rx-foot" id="sp-foot" style="margin-bottom:22px;"></div>
 
+                    <!-- Panier progressif : ce qui est DEJA solde mais ne
+                         vend toujours pas. Propose d'escalader vers 2e
+                         gratuit / 2e a moitie prix plutot que de rabaisser
+                         encore le prix (demande utilisatrice 2026-10-08).
+                         Reutilise spState.rows (deja charge pour la carte
+                         Soldes) : pas de nouvel appel serveur. -->
+                    <div class="rb" id="pp-bloc" data-open="0">
+                        <div class="rb-head">
+                            <span class="rb-num rb-num-amber">2</span>
+                            <div class="rb-titles">
+                                <div class="rb-title">Panier progressif <span class="rb-title-hint">— une autre tactique que baisser le prix</span></div>
+                                <div class="rb-sub">Ce qui dort, soldé ou non. Achetez-en un le 2e offert, ou le 2e à moitié prix.</div>
+                            </div>
+                            <div class="rb-count" id="pp-cnt">—</div>
+                            <span class="rb-caret">▾</span>
+                        </div>
+                        <div class="rb-body" id="pp-body"></div>
+                    </div>
+                    <div class="rx-foot" id="pp-foot" style="margin-bottom:22px;"></div>
+
                     <!-- Ce qui a ete POSE, a ne pas confondre avec la
                          section Historique du tableau de bord, qui liste
                          les VENTES faites sous le prix catalogue. Une
@@ -3050,7 +3249,7 @@
                          suite, et la-bas seulement quand elle vend. -->
                     <div class="rb" id="sj-bloc" data-open="0">
                         <div class="rb-head">
-                            <span class="rb-num rb-num-violet">2</span>
+                            <span class="rb-num rb-num-violet">3</span>
                             <div class="rb-titles">
                                 <div class="rb-title">Remises posées <span class="rb-title-hint">— le journal de ce que vous avez soldé</span></div>
                                 <div class="rb-sub">Ce que vous avez soldé, et ce que ça a vendu depuis.</div>
@@ -3464,9 +3663,13 @@
                 <div class="detail-panel sd-panel">
                     <button class="close-detail-btn" id="close-solde-btn" title="Fermer">✕</button>
 
-                    <div class="sd-head">
-                        <div class="rx-title" id="sd-titre">Solder une référence</div>
-                        <div class="rx-sub"><b id="sd-ref">—</b> · <span id="sd-name">—</span> · prix de vente <b id="sd-catalogue">—</b></div>
+                    <div class="sd-head" style="display:flex;align-items:center;gap:14px;">
+                        <img id="sd-image" src="" alt="Image produit" style="display:none;width:72px;height:72px;border-radius:10px;object-fit:cover;border:1px solid #E2E8F0;"/>
+                        <div id="sd-image-missing" style="display:none;width:72px;height:72px;border-radius:10px;border:1px dashed #CBD5E1;background:#F8FAFC;color:#94A3B8;font-size:0.65rem;font-weight:600;text-align:center;line-height:1.2;align-items:center;justify-content:center;padding:4px;flex-shrink:0;">Aucune photo</div>
+                        <div>
+                            <div class="rx-title" id="sd-titre">Solder une référence</div>
+                            <div class="rx-sub"><b id="sd-ref">—</b> · <span id="sd-name">—</span> · prix de vente <b id="sd-catalogue">—</b></div>
+                        </div>
                     </div>
 
                     <!-- Un seul pop-up pour tout (demande utilisatrice
@@ -3480,22 +3683,29 @@
                                     <option value="promotion">Promotion</option>
                                     <option value="pricelist">Liste de prix</option>
                                     <option value="promo_code">Code promo</option>
+                                    <option value="coupons">Bons de réduction</option>
                                     <option value="gift_card">Carte cadeau</option>
                                     <option value="loyalty">Fidélité</option>
+                                    <option value="buy_x_get_y">Panier progressif</option>
+                                    <option value="next_order_coupons">Bon prochaine commande</option>
                                 </select>
                             </span>
                         </label>
-                        <label class="rx-field" data-modes="promotion pricelist promo_code">
+                        <label class="rx-field" data-modes="promotion pricelist promo_code coupons">
                             <span class="rx-field-label">Prix soldé (TTC)</span>
                             <span class="rx-input"><input type="number" id="sd-prix" step="0.01" min="0"/><em>MAD</em></span>
                         </label>
-                        <label class="rx-field" data-modes="promotion pricelist promo_code">
+                        <label class="rx-field" data-modes="promotion pricelist promo_code coupons next_order_coupons">
                             <span class="rx-field-label">Ou remise</span>
                             <span class="rx-input"><input type="number" id="sd-remise" step="1" min="1" max="99"/><em>%</em></span>
                         </label>
                         <label class="rx-field" data-modes="promo_code">
                             <span class="rx-field-label">Code à saisir en caisse</span>
                             <span class="rx-input"><input type="text" id="sd-code" placeholder="ex. SOLDE20" autocomplete="off"/></span>
+                        </label>
+                        <label class="rx-field" data-modes="coupons">
+                            <span class="rx-field-label">Nombre de bons à générer</span>
+                            <span class="rx-input"><input type="number" id="sd-coupons-nb" step="1" min="1" max="500" value="10"/></span>
                         </label>
                         <label class="rx-field" data-modes="gift_card">
                             <span class="rx-field-label">Montant de la carte</span>
@@ -3517,11 +3727,23 @@
                             <span class="rx-field-label">Remise obtenue</span>
                             <span class="rx-input"><input type="number" id="sd-remise-fid" step="1" min="1" max="99" value="10"/><em>%</em></span>
                         </label>
-                        <label class="rx-field" data-modes="promotion pricelist promo_code gift_card loyalty">
+                        <label class="rx-field" data-modes="buy_x_get_y">
+                            <span class="rx-field-label">Quantité à acheter</span>
+                            <span class="rx-input"><input type="number" id="sd-bxgy-x" step="1" min="1" value="2"/></span>
+                        </label>
+                        <label class="rx-field" data-modes="buy_x_get_y">
+                            <span class="rx-field-label">Quantité offerte</span>
+                            <span class="rx-input"><input type="number" id="sd-bxgy-y" step="1" min="1" value="1"/></span>
+                        </label>
+                        <label class="rx-field" data-modes="buy_x_get_y">
+                            <span class="rx-field-label">Remise sur l'offerte <span class="rx-help-inline">(100 % = gratuit)</span></span>
+                            <span class="rx-input"><input type="number" id="sd-bxgy-remise" step="1" min="1" max="100" value="100"/><em>%</em></span>
+                        </label>
+                        <label class="rx-field" data-modes="promotion pricelist promo_code coupons gift_card loyalty buy_x_get_y next_order_coupons">
                             <span class="rx-field-label">Début</span>
                             <span class="rx-input"><input type="date" id="sd-debut"/></span>
                         </label>
-                        <label class="rx-field" data-modes="promotion pricelist promo_code gift_card loyalty">
+                        <label class="rx-field" data-modes="promotion pricelist promo_code coupons gift_card loyalty buy_x_get_y next_order_coupons">
                             <span class="rx-field-label">Fin <span class="rx-help-inline">(facultatif)</span></span>
                             <span class="rx-input"><input type="date" id="sd-fin"/></span>
                         </label>
@@ -3871,6 +4093,22 @@
                 </div>
             </div>
 
+            <!-- DEMANDE UTILISATRICE (2026-10-13) : avant de partir sur
+                 place poser un panier progressif, voir dans quel magasin
+                 les DEUX articles (à acheter et offert) ont du stock, et
+                 quelle variante précise (couleur/taille) y est disponible. -->
+            <div id="pp-stock-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-pp-stock-btn" title="Fermer">✕</button>
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding-right:30px;">
+                        <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700; display:flex; align-items:center; gap:8px;">
+                            <span>📍</span> <span id="pp-stock-titre">Stock par magasin</span>
+                        </h3>
+                    </div>
+                    <div id="pp-stock-body"></div>
+                </div>
+            </div>
+
             <div id="dormant-overlay">
                 <div class="ruptures-panel">
                     <button class="close-detail-btn" id="close-dormant-btn" title="Fermer">✕</button>
@@ -3927,6 +4165,34 @@
                                 </tr>
                             </thead>
                             <tbody id="valorisation-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ══════════════════════════════════════════════════════
+                 DÉTAIL D'UNE COULEUR (clic dans Top/Flop Couleurs)
+            ═══════════════════════════════════════════════════════ -->
+            <div id="couleur-detail-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-couleur-detail-btn" title="Fermer">✕</button>
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding-right:30px;">
+                        <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700; display:flex; align-items:center; gap:8px;">
+                            <span>🎨</span> Couleur — <span id="couleur-detail-name">—</span>
+                        </h3>
+                    </div>
+                    <div id="couleur-detail-summary" style="font-size:0.85rem; color:#64748B; margin-bottom:12px;"></div>
+                    <div style="max-height:55vh; overflow-y:auto;">
+                        <table style="width:100%; border-collapse:collapse;">
+                            <thead>
+                                <tr style="border-bottom:2px solid #E2E8F0; text-align:left; background:#F1F5F9; position:sticky; top:0; z-index:10;">
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Référence</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Produit</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Qté vendue</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">CA Vendu (TTC)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="couleur-detail-tbody"></tbody>
                         </table>
                     </div>
                 </div>

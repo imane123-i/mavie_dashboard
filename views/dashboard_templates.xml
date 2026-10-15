@@ -2382,6 +2382,11 @@
                 .ac-table tr.ac-var td.ac-color-cell { padding-left:24px; }
                 .ac-table tr.ac-grp td { background:var(--surface2); color:var(--brand-dark); font-weight:700; font-size:0.84rem; cursor:default; }
                 .ac-table tr.ac-grp td span { font-weight:500; color:var(--text-muted); margin-left:10px; }
+                /* DEMANDE UTILISATRICE (2026-10-15) : Photo/Référence restent visibles au défilement horizontal. */
+                .ac-table td.ac-sticky-col { position:sticky; z-index:3; background:#FFFFFF; overflow:hidden; text-overflow:ellipsis; box-shadow:1px 0 0 0 var(--border); }
+                .ac-table th.ac-sticky-col { position:sticky; z-index:7; overflow:hidden; text-overflow:ellipsis; box-shadow:1px 0 0 0 var(--border); }
+                .ac-table tr.ac-ref td.ac-sticky-col { background:#FAF7FF; }
+                .ac-table tr.ac-ref:hover td.ac-sticky-col { background:#F3E8FF; }
                 .ac-rank { color:var(--brand); font-weight:700; }
                 .ac-caret { display:inline-block; width:14px; color:var(--brand); transition:transform var(--transition); }
                 tr.ac-ref.closed .ac-caret { transform:rotate(-90deg); }

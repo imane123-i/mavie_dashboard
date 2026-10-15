@@ -10149,6 +10149,63 @@ class MaVieDashboardController(http.Controller):
         stock, vendu sur la fenêtre, et proposition d'envoi depuis le dépôt."""
         return self._compute_reassort_article(kw)
 
+    def _reassort_depot_et_besoin(self, vids, warehouses_ids, mfl_id, debut, fin, fenetre, jours):
+        """(stock au dépôt, besoin total tous magasins) pour un ensemble de
+        variantes — même formule que _compute_reassort_article, mais sans le
+        détail par magasin : sert uniquement à la ventilation par taille
+        (demande utilisatrice 2026-10-15 : « le réassort depuis Action ne
+        donne pas les tailles »). Fonction séparée exprès, pour ne pas
+        toucher le calcul principal (partagé avec le bon PDF)."""
+        if not vids:
+            return 0, 0
+        params = {'vids': vids, 'wh': warehouses_ids or [-1],
+                  'debut': debut, 'fin': fin}
+        request.env.cr.execute("""
+            WITH stock AS (
+                SELECT w.id AS wh_id, SUM(sq.quantity) AS q
+                  FROM stock_quant sq
+                  JOIN stock_location sl ON sl.id = sq.location_id
+                  JOIN stock_warehouse w ON w.id = ANY(%(wh)s)
+                  JOIN stock_location wl ON wl.id = w.lot_stock_id
+                 WHERE sq.product_id = ANY(%(vids)s)
+                   AND sl.parent_path LIKE wl.parent_path || '%%'
+                 GROUP BY 1
+            ), vendu AS (
+                SELECT spt.warehouse_id AS wh_id, SUM(pol.qty) AS q
+                  FROM pos_order_line pol
+                  JOIN pos_order po ON po.id = pol.order_id
+                  JOIN pos_session ps ON ps.id = po.session_id
+                  JOIN pos_config pc ON pc.id = ps.config_id
+                  JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                 WHERE pol.product_id = ANY(%(vids)s)
+                   AND po.state IN ('paid', 'done', 'invoiced')
+                   AND po.date_order BETWEEN %(debut)s AND %(fin)s
+                 GROUP BY 1
+            )
+            SELECT w.id, COALESCE(s.q, 0), COALESCE(v.q, 0)
+              FROM stock_warehouse w
+              LEFT JOIN stock s ON s.wh_id = w.id
+              LEFT JOIN vendu v ON v.wh_id = w.id
+             WHERE w.id = ANY(%(wh)s)
+        """, params)
+        besoin_total = 0
+        for wh_id, stock, vendu in request.env.cr.fetchall():
+            stock = int(round(stock or 0))
+            vendu = int(round(vendu or 0))
+            vitesse = vendu / float(fenetre) if vendu else 0.0
+            besoin_total += max(0, int(math.ceil(vitesse * jours - max(stock, 0) - 1e-9)))
+        depot = 0
+        if mfl_id:
+            request.env.cr.execute("""
+                SELECT COALESCE(SUM(sq.quantity), 0)
+                  FROM stock_quant sq
+                  JOIN stock_location sl ON sl.id = sq.location_id
+                 WHERE sq.product_id = ANY(%(vids)s)
+                   AND sl.usage = 'internal' AND sl.company_id = %(mfl)s
+            """, {'vids': vids, 'mfl': mfl_id})
+            depot = int(round(request.env.cr.fetchone()[0] or 0))
+        return depot, besoin_total
+
     def _compute_reassort_article(self, kw):
         """Le calcul de la fenêtre de réassort, partagé avec le bon PDF :
         les deux doivent annoncer exactement les mêmes quantités."""
@@ -10272,9 +10329,40 @@ class MaVieDashboardController(http.Controller):
                 m['propose'] = envoi
                 reste -= envoi
 
+            # DEMANDE UTILISATRICE (2026-10-15) : « quand je veux faire le
+            # reassort depuis action il me donne pas les tailles » — la page
+            # Action n'a que la couleur (pas de ligne par pointure comme le
+            # bloc Réassort), donc cette fenêtre ouverte depuis Action
+            # agrégeait toutes les tailles sans jamais les montrer. On
+            # calcule ici, en plus, une ligne par taille — seulement quand
+            # aucune taille précise n'a été demandée (sinon ce calcul ne
+            # servirait à rien).
+            tailles = []
+            if not taille and couleur:
+                jours_t = (plafond_jours if kw.get('base') == 'plafond'
+                           else (p['cible'] if kw.get('base') == 'cible' else p['delai']))
+                par_taille = {}
+                for v in self._solde_variantes_couleur(tmpl, couleur):
+                    t = (resolve_variant_color_size(v)[1] or '').strip()
+                    if t and t != '—':
+                        par_taille.setdefault(t, []).append(v.id)
+                for t, vids in par_taille.items():
+                    d_t, b_t = self._reassort_depot_et_besoin(
+                        vids, warehouses.ids, mfl.id if mfl else 0,
+                        params['debut'], params['fin'], p['fenetre'], jours_t)
+                    tailles.append({'taille': t, 'depot': d_t, 'besoin_total': b_t})
+
+                def _cle_taille(r):
+                    try:
+                        return (0, float(r['taille'].replace(',', '.')))
+                    except (TypeError, ValueError):
+                        return (1, r['taille'])
+                tailles.sort(key=_cle_taille)
+
             fournisseur = self._reassort_fournisseur(tmpl)
             return {
                 'taille': taille,
+                'tailles': tailles,
                 'jours_couverture': (plafond_jours if kw.get('base') == 'plafond'
                                      else (p['cible'] if kw.get('base') == 'cible'
                                            else p['delai'])),

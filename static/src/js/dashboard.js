@@ -8141,21 +8141,51 @@ function _acCell(cle, r, estRef) {
     return '';
 }
 
+// DEMANDE UTILISATRICE (2026-10-15) : « quand je scroll a droite je doit
+// voir aussi les references et les photos » — ces 3 colonnes restent
+// visibles au défilement horizontal (largeur fixe, obligatoire pour que
+// les décalages `left` s'empilent correctement).
+var AC_STICKY_LARGEUR = { rang: 40, photo: 56, ref: 130 };
+
+function _acStickyOffsets(cols) {
+    var off = {}, acc = 0;
+    cols.forEach(function(c) {
+        var l = AC_STICKY_LARGEUR[c[0]];
+        if (l === undefined) return;
+        off[c[0]] = acc;
+        acc += l;
+    });
+    return off;
+}
+
+function _acStickyAttrs(cle) {
+    var l = AC_STICKY_LARGEUR[cle];
+    if (l === undefined) return '';
+    var left = acState._stickyOffsets && acState._stickyOffsets[cle];
+    if (left === undefined) left = 0;
+    return ' ac-sticky-col" style="left:' + left + 'px;width:' + l + 'px;min-width:'
+         + l + 'px;max-width:' + l + 'px;"';
+}
+
 function _acLignesRef(r, cols) {
     // Repliée par défaut (demande utilisatrice 2026-09-22 : « le tableau
     // reste comme ça, et si je clique sur une référence j'ai ses variantes »).
     var ferme = !acState.ouvertes[r.id];
     var h = '<tr class="ac-ref' + (ferme ? ' closed' : '') + '" data-id="' + r.id + '">';
     cols.forEach(function(c) {
-        h += '<td class="' + (c[3] ? 'num' : '') + '">' + _acCell(c[0], r, true) + '</td>';
+        var sticky = AC_STICKY_LARGEUR[c[0]] !== undefined;
+        h += '<td class="' + (c[3] ? 'num' : '') + (sticky ? _acStickyAttrs(c[0]) : '"') + '>'
+           + _acCell(c[0], r, true) + '</td>';
     });
     h += '</tr>';
     if (!ferme) {
         (r.variantes || []).forEach(function(vr) {
             h += '<tr class="ac-var" data-parent="' + r.id + '" data-couleur="' + _escapeHtml(vr.couleur) + '">';
             cols.forEach(function(c) {
+                var sticky = AC_STICKY_LARGEUR[c[0]] !== undefined;
                 var cls = (c[3] ? 'num' : '') + (c[0] === 'couleur' ? ' ac-color-cell' : '');
-                h += '<td class="' + cls + '">' + _acCell(c[0], vr, false) + '</td>';
+                h += '<td class="' + cls + (sticky ? _acStickyAttrs(c[0]) : '"') + '>'
+                   + _acCell(c[0], vr, false) + '</td>';
             });
             h += '</tr>';
         });
@@ -8165,10 +8195,13 @@ function _acLignesRef(r, cols) {
 
 function _acRender() {
     var cols = _acColonnesVisibles();
+    acState._stickyOffsets = _acStickyOffsets(cols);
     var thead = el('ac-thead');
     if (thead) {
         thead.innerHTML = cols.map(function(c) {
-            return '<th class="' + (c[3] ? 'num' : '') + '">' + _escapeHtml(c[1]) + '</th>';
+            var sticky = AC_STICKY_LARGEUR[c[0]] !== undefined;
+            return '<th class="' + (c[3] ? 'num' : '') + (sticky ? _acStickyAttrs(c[0]) : '"') + '>'
+                 + _escapeHtml(c[1]) + '</th>';
         }).join('');
     }
     var count = el('ac-count');
@@ -8594,13 +8627,21 @@ function _raArticleRender() {
     if (sub) {
         var propose = Object.keys(raArticle.qtes).reduce(
             function(a, k) { return a + (raArticle.qtes[k] || 0); }, 0);
-        sub.textContent = (data.nom || '')
-            + (data.taille ? ' · pointure ' + data.taille : '')
+        sub.innerHTML = _escapeHtml(data.nom || '')
+            + (data.taille ? ' · pointure ' + _escapeHtml(data.taille) : '')
             + ' · ' + formatNumber(data.depot) + ' pièces au dépôt'
             + ' · besoin ' + formatNumber(data.besoin_total) + ' pcs pour tenir '
             + formatNumber(data.jours_couverture || data.fenetre) + ' jours'
             + ' · proposition déjà remplie : ' + formatNumber(propose) + ' pcs'
-            + (data.fournisseur ? ' · fournisseur ' + data.fournisseur : '');
+            + (data.fournisseur ? ' · fournisseur ' + _escapeHtml(data.fournisseur) : '')
+            + (data.taille && data.couleur
+                ? ' · <a href="#" id="ac-ra-toutes-tailles" class="td-link">← toutes les tailles</a>' : '');
+        var lienToutes = el('ac-ra-toutes-tailles');
+        if (lienToutes) lienToutes.addEventListener('click', function(ev) {
+            ev.preventDefault();
+            var article = data._article;
+            if (article) openActionReassort(article, data._couleur || '');
+        });
     }
     if (!body) return;
     var aEnvoyer = Object.keys(raArticle.qtes).reduce(function(a, k) { return a + (raArticle.qtes[k] || 0); }, 0);
@@ -8609,6 +8650,32 @@ function _raArticleRender() {
           + '<div class="ac-ra-kpi"><b>' + formatNumber(data.besoin_total) + '</b><span>besoin des magasins</span></div>'
           + '<div class="ac-ra-kpi"><b>' + formatNumber(data.manque_depot) + '</b><span>manquant au dépôt</span></div>'
           + '</div>';
+    // DEMANDE UTILISATRICE (2026-10-15) : « depuis action il me donne pas
+    // les tailles » — ce bloc n'existe que quand la fenêtre a été ouverte
+    // sans pointure précise (page Action) ; cliquer une taille rouvre la
+    // même fenêtre scopée à cette seule pointure, comme depuis le bloc
+    // Réassort.
+    if ((data.tailles || []).length) {
+        h += '<div style="margin-bottom:14px;">'
+           + '<div style="font-size:0.78rem;font-weight:700;color:#64748B;text-transform:uppercase;margin-bottom:6px;">Par taille</div>'
+           + '<div style="display:flex;flex-wrap:wrap;gap:6px;">'
+           + data.tailles.map(function(t) {
+                var manque = Math.max(0, t.besoin_total - t.depot);
+                var couleurFond = manque > 0 ? '#FEF2F2' : '#F8FAFC';
+                var couleurBord = manque > 0 ? '#FECACA' : '#E2E8F0';
+                return '<button type="button" class="ac-ra-taille-btn" data-taille="'
+                     + _escapeHtml(t.taille) + '" style="border:1px solid ' + couleurBord
+                     + ';background:' + couleurFond + ';border-radius:8px;padding:5px 10px;'
+                     + 'cursor:pointer;text-align:left;font-family:inherit;">'
+                     + '<div style="font-weight:700;color:#0F172A;">' + _escapeHtml(t.taille) + '</div>'
+                     + '<div style="font-size:0.74rem;color:#64748B;">' + formatNumber(t.depot) + ' dépôt · '
+                     + (manque > 0
+                         ? '<span style="color:#B91C1C;font-weight:600;">manque ' + formatNumber(manque) + '</span>'
+                         : formatNumber(t.besoin_total) + ' besoin')
+                     + '</div></button>';
+             }).join('')
+           + '</div></div>';
+    }
     h += '<div class="ac-table-wrap" style="max-height:44vh;"><table class="ac-table"><thead><tr>'
        + '<th>Magasin</th><th>Société</th><th class="num" title="Stock de ce magasin, pas celui du dépôt">Stock magasin</th>'
        + '<th class="num">Vendu (' + data.fenetre + ' j)</th>'
@@ -8649,6 +8716,13 @@ function _raArticleRender() {
         inp.addEventListener('input', function() {
             raArticle.qtes[inp.getAttribute('data-ra-wh')] = Math.max(0, parseInt(inp.value, 10) || 0);
             _raMajActions();
+        });
+    });
+    body.querySelectorAll('.ac-ra-taille-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            var article = data._article;
+            if (!article) return;
+            openActionReassort(article, data._couleur || '', btn.getAttribute('data-taille'));
         });
     });
     var btnA = el('btn-ra-achat');

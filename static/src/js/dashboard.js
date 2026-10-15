@@ -30,6 +30,7 @@ var state = {
     date_start: null,
     date_end: null,
     shop_field: null,
+    shop_fields: [],
     collection_id: null,
     categ_ids: [],
     batch_id: null,
@@ -173,19 +174,8 @@ async function loadFilters() {
 
         state.shops = data.shops || [];
         state.online_shops = data.online_shops || [];
-        var magasinSelect = el('filter-magasin');
-        if (magasinSelect && data.shops && data.shops.length > 0) {
-            while (magasinSelect.options.length > 1) magasinSelect.remove(1);
-            _appendShopOptions(magasinSelect, data.shops, data.online_shops);
-            magasinSelect.disabled = false;
-        } else if (magasinSelect) {
-            var opt = document.createElement('option');
-            opt.value = '';
-            opt.textContent = 'Aucun magasin configuré';
-            magasinSelect.appendChild(opt);
-        }
-
-        // Catégories : menu à cocher, plusieurs choix possibles.
+        // Magasin et Catégorie : menus à cocher, plusieurs choix possibles.
+        _remplirMagasins(data.shops || [], data.online_shops || []);
         _remplirCategories(data.categories || []);
 
         var batchSelect = el('filter-batch');
@@ -422,7 +412,6 @@ function _majIndiceDates() {
 
 function updateFiltersFromUI() {
     var colEl  = el('filter-collection');
-    var shopEl = el('filter-magasin');
     var catEl  = el('filter-category');
     var batEl  = el('filter-batch');
     var topLimitEl = el('top-limit');
@@ -433,9 +422,9 @@ function updateFiltersFromUI() {
     var period = _computePeriodDates();
 
     state.collection_id = (colEl  && colEl.value)  ? colEl.value  : null;
-    state.shop_field    = (shopEl && shopEl.value)  ? shopEl.value : null;
-    // Le filtre catégorie accepte plusieurs valeurs : state.categ_ids
-    // est tenu à jour par le menu à cocher (_remplirCategories).
+    // Les filtres Magasin et Catégorie acceptent plusieurs valeurs :
+    // state.shop_fields/categ_ids sont tenus à jour par leur menu à cocher
+    // (_remplirMagasins / _remplirCategories), pas ici.
     state.batch_id      = (batEl  && batEl.value)   ? batEl.value  : null;
     state.date_start    = period.start;
     state.date_end      = period.end;
@@ -563,9 +552,137 @@ function _majCategories() {
     }
 }
 
+// ── Filtre Magasin : menu à cocher ─────────────────────────────────────
+// Plusieurs magasins peuvent être sélectionnés (demande du 2026-10-15),
+// même mécanique que le menu Catégorie ci-dessus.
+function _remplirMagasins(shops, onlineShops) {
+    var liste = el('filter-shop-list');
+    var bouton = el('filter-shop-btn');
+    var panneau = el('filter-shop-panel');
+    if (!liste || !bouton || !panneau) return;
+
+    liste.innerHTML = '';
+    function ligne(field, texte) {
+        var label = document.createElement('label');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = field;
+        cb.addEventListener('change', _majMagasins);
+        var txt = document.createElement('span');
+        txt.textContent = texte;
+        label.appendChild(cb);
+        label.appendChild(txt);
+        liste.appendChild(label);
+    }
+    (shops || []).forEach(function(s) { ligne(s.field, s.name); });
+    if (onlineShops && onlineShops.length) {
+        var entete = document.createElement('div');
+        entete.className = 'filter-multi-group-label';
+        entete.textContent = '🌐 Magasins en ligne';
+        liste.appendChild(entete);
+        onlineShops.forEach(function(s) {
+            ligne(s.field, s.name + (s.company ? ' — ' + s.company : ''));
+        });
+    }
+
+    if (!bouton.dataset.lie) {
+        bouton.dataset.lie = '1';
+        bouton.addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (panneau.classList.contains('open')) {
+                _fermerMagasins();
+            } else {
+                _shopSelectionOuverture = (state.shop_fields || []).join(',');
+                panneau.classList.add('open');
+            }
+        });
+        panneau.addEventListener('click', function(e) { e.stopPropagation(); });
+        document.addEventListener('click', _fermerMagasins);
+        var tout = el('filter-shop-all');
+        var rien = el('filter-shop-none');
+        if (tout) tout.addEventListener('click', function() { _cocherMagasins(true); });
+        if (rien) rien.addEventListener('click', function() { _cocherMagasins(false); });
+        var appliquer = el('filter-shop-apply');
+        if (appliquer) {
+            appliquer.addEventListener('click', function(e) {
+                e.stopPropagation();
+                _fermerMagasins();
+            });
+        }
+    }
+    _majMagasins();
+}
+
+var _shopSelectionOuverture = '';
+
+function _fermerMagasins() {
+    var panneau = el('filter-shop-panel');
+    if (!panneau || !panneau.classList.contains('open')) return;
+    panneau.classList.remove('open');
+    if ((state.shop_fields || []).join(',') !== _shopSelectionOuverture) {
+        _shopSelectionOuverture = (state.shop_fields || []).join(',');
+        loadKPIs();
+    }
+}
+
+function _cocherMagasins(valeur) {
+    var liste = el('filter-shop-list');
+    if (!liste) return;
+    Array.prototype.forEach.call(liste.querySelectorAll('input'), function(cb) {
+        cb.checked = valeur;
+    });
+    _majMagasins();
+}
+
+function _majMagasins() {
+    var liste = el('filter-shop-list');
+    var bouton = el('filter-shop-btn');
+    if (!liste) return;
+    var choisis = [];
+    var noms = [];
+    Array.prototype.forEach.call(liste.querySelectorAll('input'), function(cb) {
+        if (cb.checked) {
+            choisis.push(cb.value);
+            var sp = cb.parentNode.querySelector('span');
+            noms.push(sp ? sp.textContent : cb.value);
+        }
+    });
+    var total = liste.querySelectorAll('input').length;
+    state.shop_fields = (choisis.length && choisis.length < total) ? choisis
+        : (choisis.length === total ? [] : choisis);
+    // Compat : les écrans qui n'ont pas encore leur propre filtre magasin
+    // multiple (Soldes, Transferts, fiche produit) continuent à lire
+    // state.shop_field — un seul magasin coché le leur donne encore,
+    // 0 ou plusieurs retombent sur « aucun filtre » plutôt que d'en
+    // choisir un au hasard.
+    state.shop_field = (state.shop_fields.length === 1) ? state.shop_fields[0] : null;
+    if (bouton) {
+        if (!state.shop_fields.length) {
+            bouton.textContent = 'Tous les magasins';
+            bouton.title = '';
+        } else if (state.shop_fields.length === 1) {
+            bouton.textContent = noms[0];
+            bouton.title = noms[0];
+        } else {
+            bouton.textContent = state.shop_fields.length + ' magasins';
+            bouton.title = noms.join(', ');
+        }
+    }
+    var indice = el('filter-shop-hint');
+    if (indice) {
+        var enAttente = (state.shop_fields || []).join(',') !== _shopSelectionOuverture;
+        indice.textContent = enAttente
+            ? (choisis.length ? choisis.length + ' coché' + (choisis.length > 1 ? 's' : '')
+               : 'Aucun coché') + ' — pas encore appliqué'
+            : 'Cochez, puis Appliquer';
+        indice.style.color = enAttente ? '#B45309' : '#64748B';
+    }
+}
+
 function getFilterParams() {
     return {
         shop_field:    state.shop_field,
+        shop_fields:   state.shop_fields || [],
         collection_id: state.collection_id,
         categ_ids:     state.categ_ids || [],
         batch_id:      state.batch_id,
@@ -1393,7 +1510,9 @@ function _mflRefsTable(refs, direct) {
           + '</tr></thead><tbody>';
     refs.forEach(function(r) {
         h += '<tr>'
-           + '<td><strong>' + _escapeHtml(r.reference) + '</strong></td>'
+           + '<td><strong class="mfl-ref-clic" data-article="' + r.article_id
+             + '" data-name="' + _escapeHtml(r.produit) + '" style="cursor:pointer;text-decoration:underline;">'
+             + _escapeHtml(r.reference) + '</strong></td>'
            + '<td>' + _escapeHtml(r.produit) + '</td>'
            + '<td><span class="mfl-color">' + _escapeHtml(r.couleur) + '</span></td>'
            + '<td class="mfl-tailles">' + _escapeHtml(r.tailles || '—') + '</td>'
@@ -1436,7 +1555,11 @@ async function _mflChargerDirectes(mag, key) {
 function _mflMagBody(mag, key) {
     var h = '';
     var refs = mag.references || [];
-    if (refs.length) h += _mflBonsLine(mag) + _mflRefsTable(refs, false);
+    // DEMANDE UTILISATRICE (2026-10-15) : retiré — le détail des bons de
+    // vente (numéros, bons écartés, bons sans prix) noyait le tableau sous
+    // trop de texte par magasin ; _mflBonsLine reste disponible si besoin
+    // ailleurs, juste plus appelée ici.
+    if (refs.length) h += _mflRefsTable(refs, false);
     if (!mag.qty_direct) return h;
     var directs = mag.references_directes || [];
     var bons = mag.bons_directs || [];
@@ -1462,54 +1585,6 @@ function _mflMagBody(mag, key) {
     return h;
 }
 
-function _mflBonsLine(mag) {
-    // Les bons de vente derrière le magasin. Sur « Magasin non identifié »,
-    // c'est la réponse à « comment tu sais que c'est dispatché s'il n'y a
-    // pas de magasin ? » : le bon de vente est confirmé et sa livraison
-    // validée, donc la marchandise est bien sortie de l'entrepôt ; ce qui
-    // manque, c'est la réception côté magasin (aucun bon d'achat miroir),
-    // donc personne ne l'a fait entrer quelque part.
-    var bons = mag.bons || [];
-    if (!bons.length) return '';
-    var txt = (mag.nb_bons > bons.length)
-        ? bons.join(', ') + '… (' + formatNumber(mag.nb_bons) + ' bons)'
-        : 'Bon' + (bons.length > 1 ? 's' : '') + ' de vente : ' + bons.join(', ');
-    // Odoo, lui, compte TOUS les bons rattachés au magasin. Quand
-    // certains n'apportent rien au tableau, le lecteur trouve plus de
-    // bons dans Odoo que sur cette ligne (constaté sur ELITE 06 : 18
-    // contre 15). On dit pourquoi plutôt que de laisser chercher.
-    var ec = mag.bons_ecartes || 0;
-    if (ec > 0) {
-        var sansLiv = mag.bons_sans_livraison || 0;
-        var motifs = [];
-        if (sansLiv) motifs.push(formatNumber(sansLiv) + ' sans livraison');
-        if (ec - sansLiv > 0) motifs.push(formatNumber(ec - sansLiv)
-            + ' sans bon d’achat fournisseur');
-        txt += ' · ' + formatNumber(ec) + ' bon' + (ec > 1 ? 's' : '')
-            + ' écarté' + (ec > 1 ? 's' : '') + ' (' + motifs.join(', ')
-            + ') — Odoo en compte donc ' + formatNumber(mag.nb_bons + ec) + '.';
-    }
-    // Une colonne « Montant TTC » entièrement à 0,00 se lit comme une
-    // panne du tableau. C'est la saisie qui manque : sur Elite Auderby,
-    // 21 des 23 bons n'ont aucun prix et emportent 13 243 des 13 373
-    // pièces. On le dit ici plutôt que de laisser croire à un bug.
-    var sp = mag.bons_sans_prix || 0;
-    if (sp > 0) {
-        txt += ' · ⚠️ ' + formatNumber(sp) + ' de ces ' + formatNumber(mag.nb_bons)
-            + ' bons ont été saisis sans prix dans Odoo'
-            + (mag.qty_sans_prix ? ' : ' + formatNumber(mag.qty_sans_prix)
-               + ' pièces ressortent donc à 0,00 MAD' : '') + '.';
-    }
-    var h = '<div class="mfl-note" style="margin:2px 0 8px;">' + _escapeHtml(txt);
-    if (!mag.warehouse_id) {
-        h += ' — sortie de l\'entrepôt validée (bon de livraison), mais aucun '
-           + 'magasin ne l\'a réceptionnée : pas de bon d\'achat miroir dans la '
-           + 'société, donc pas d\'entrepôt de destination. La pièce compte dans '
-           + 'le dispatché, sans magasin connu.';
-    }
-    return h + '</div>';
-}
-
 function _mflBindOnce() {
     if (mflState.bound) return;
     mflState.bound = true;
@@ -1522,6 +1597,15 @@ function _mflBindOnce() {
                 var k = socHead.getAttribute('data-soc');
                 mflState.open[k] = !mflState.open[k];
                 _mflToggle(socHead, host.querySelector('[data-body-soc="' + _mflAttr(k) + '"]'), mflState.open[k]);
+                return;
+            }
+            // DEMANDE UTILISATRICE (2026-10-15) : référence cliquable dans
+            // le dispatch, ouvre la fiche produit standard (même pop-up
+            // que partout ailleurs dans le dashboard).
+            var refClic = ev.target.closest && ev.target.closest('.mfl-ref-clic');
+            if (refClic) {
+                var aid = parseInt(refClic.getAttribute('data-article'), 10);
+                if (aid) openDetail(aid, refClic.getAttribute('data-name') || '');
                 return;
             }
             var magHead = ev.target.closest && ev.target.closest('.mfl-mag-head');
@@ -3620,21 +3704,16 @@ function _renderDormantList(searchFilter) {
             _setRetour('detail-overlay', openDormant);
         };
 
+        tr.appendChild(_photoCell(p));
+
         var tdRef = document.createElement('td');
         tdRef.textContent = p.ref || '—';
+        tdRef.title = p.name || '';
         tdRef.style.padding = '10px';
         tdRef.style.color = '#64748B';
         tdRef.style.fontWeight = '600';
         tdRef.style.fontSize = '0.85rem';
         tr.appendChild(tdRef);
-
-        var tdName = document.createElement('td');
-        tdName.textContent = p.name || '—';
-        tdName.style.padding = '10px';
-        tdName.style.fontWeight = '600';
-        tdName.style.color = '#0F172A';
-        tdName.style.fontSize = '0.85rem';
-        tr.appendChild(tdName);
 
         var tdMagasin = document.createElement('td');
         tdMagasin.style.padding = '10px';
@@ -3773,22 +3852,44 @@ async function openDepotStock() {
         depotStockState.charge = true;
         var sub = el('depot-stock-sub');
         if (sub) {
-            var archivesNonAchetees = data.total_archives - data.total_archives_achetees;
-            sub.textContent = 'Liste (articles actifs) : ' + formatNumber(data.total)
-                + ' = ' + formatNumber(data.total_achetees) + ' achetées par le dépôt et '
-                + formatNumber(data.total_non_achetees_actifs) + ' non achetées'
-                + ' · Archivés (non listés) : ' + formatNumber(data.total_archives)
-                + ' = ' + formatNumber(data.total_archives_achetees) + ' achetées et '
-                + formatNumber(archivesNonAchetees) + ' non achetées'
-                + ' · Total Odoo, tous articles : ' + formatNumber(data.total)
-                + ' − ' + formatNumber(-data.total_archives) + ' = ' + formatNumber(data.total + data.total_archives)
-                + ' · Carte : ' + formatNumber(data.total_achetees) + ' + '
-                + formatNumber(data.total_archives_achetees) + ' = '
-                + formatNumber(data.total_achetees + data.total_archives_achetees)
-                + ' (achetées, actifs et archivés)'
-                + ' · ' + formatNumber(data.nb_references) + ' références actives'
-                + (data.total_negatif ? ' · ⚠️ ' + formatNumber(data.total_negatif)
-                   + ' en stock négatif (sorti sans jamais entrer)' : '');
+            // DEMANDE UTILISATRICE (2026-10-15) : « beaucoup d'écriture et
+            // c'est pas logique » — refondu en lignes séparées (plus de
+            // phrase unique en texte brut). Puis « je ne dois pas avoir les
+            // références archivées dans le calcul » — elles sont désormais
+            // exclues à la source (côté serveur, _modforlife_purchased_variants
+            // et cette même requête), donc la carte ne porte plus que sur
+            // les références actives achetées par le dépôt ; le stock
+            // archivé résiduel, s'il y en a, est juste rappelé à part, sans
+            // entrer dans aucun total.
+            // DEMANDE UTILISATRICE (2026-10-15) : « j'ai dans le stock que
+            // 6 445, c'est ça que je dois afficher » — comparé au total
+            // Odoo natif (Inventaire → Valorisation de stock). Les deux
+            // chiffres restent distincts et tous les deux affichés : la
+            // carte garde le périmètre acheté (6 850, nécessaire pour que
+            // l'équation acheté − dispatché = stock reste lisible), et le
+            // stock physique réel total (toutes références, y compris
+            // celles jamais achetées par ce dépôt) est rappelé juste en
+            // dessous, bien distinct.
+            var stockPhysiqueTotal = (data.total || 0) + (data.total_archives || 0);
+            var html = '<div style="font-weight:700;color:#0F172A;margin-bottom:6px;">'
+                + 'Carte « Stock entrepôt » : ' + formatNumber(data.total_achetees) + ' pièces'
+                + '</div>'
+                + '<div style="color:#64748B;margin-bottom:6px;">'
+                + 'Références actives achetées par le dépôt uniquement — les références archivées ne comptent plus dans ce calcul.'
+                + '</div>'
+                + '<div style="background:#F0F9FF;border:1px solid #BAE6FD;border-radius:8px;padding:8px 10px;margin-bottom:10px;">'
+                + '<strong>Stock physique réel de l\'entrepôt (toutes références, Odoo) : '
+                + formatNumber(stockPhysiqueTotal) + ' pièces</strong>'
+                + '</div>'
+                + '<div style="display:grid;grid-template-columns:auto auto;gap:3px 10px;font-size:0.82rem;">'
+                + (data.total_non_achetees_actifs ? '<div class="rx-muted">Stock jamais acheté par ce dépôt résiduel (hors calcul, non listé)</div><div>'
+                   + formatNumber(data.total_non_achetees_actifs) + ' pièces</div>' : '')
+                + (data.total_archives ? '<div class="rx-muted">Stock archivé résiduel (hors calcul, non listé)</div><div>'
+                   + formatNumber(data.total_archives) + ' pièces</div>' : '')
+                + (data.total_negatif ? '<div class="rx-muted">⚠️ Stock négatif, références achetées ici (sorti sans jamais entrer)</div><div style="color:#B91C1C;font-weight:600;">'
+                   + formatNumber(data.total_negatif) + ' pièces</div>' : '')
+                + '</div>';
+            sub.innerHTML = html;
         }
     }
     var recherche = el('search-depot-stock');
@@ -3995,7 +4096,6 @@ function _renderStockDashboard(data) {
     lastRupturesCount = data.ruptures_count || 0;
     lastDormantCount = data.dormant_count || 0;
 
-    _renderStockAlerts(data.alertes_stock);
     _renderRotationCollection(data.rotation_collection);
     _renderGmroiCategorie(data.gmroi_categorie, data.valeur_cost_couverture);
     state.proches_rupture_30j_cache = data.proches_rupture_30j || [];
@@ -4293,55 +4393,6 @@ function closeCouleurDetail() {
     if (overlay) overlay.classList.remove('active');
 }
 
-function _renderStockAlerts(alertes) {
-    var container = el('stock-alerts-list');
-    if (!container) return;
-    container.innerHTML = '';
-
-    if (!alertes || alertes.length === 0) {
-        container.innerHTML = '<div style="text-align:center;color:#94A3B8;padding:20px;">Aucune alerte</div>';
-        return;
-    }
-
-    var dotColors = { danger: '#EF4444', warning: '#F59E0B', info: '#3B82F6', success: '#10B981' };
-
-    alertes.forEach(function(a) {
-        var div = document.createElement('div');
-        div.className = 'alert-card-item alert-item-' + a.type;
-
-        var msgBlock = document.createElement('div');
-        msgBlock.className = 'alert-msg-block';
-
-        var dot = document.createElement('span');
-        dot.className = 'alert-dot';
-        dot.style.color = dotColors[a.type] || '#94A3B8';
-        dot.textContent = '●';
-        msgBlock.appendChild(dot);
-
-        var msgSpan = document.createElement('span');
-        msgSpan.textContent = a.message;
-        msgBlock.appendChild(msgSpan);
-
-        div.appendChild(msgBlock);
-
-        var locSpan = document.createElement('span');
-        locSpan.className = 'alert-location';
-        locSpan.textContent = a.magasin || '';
-        div.appendChild(locSpan);
-
-        if (a.id) {
-            var tBtn = document.createElement('button');
-            tBtn.className = 'btn-transfer-row-icon';
-            tBtn.title = 'Proposer un transfert';
-            tBtn.textContent = '🔄';
-            tBtn.onclick = function() { openTransferPanel(a.id, a.name || '', null, a.shop_field); };
-            div.appendChild(tBtn);
-        }
-
-        container.appendChild(div);
-    });
-}
-
 function _renderRotationCollection(rotation) {
     var container = el('stock-rotation-list');
     if (!container) return;
@@ -4446,7 +4497,7 @@ async function openEcarts() {
     tbody.innerHTML = '';
     var loadingRow = document.createElement('tr');
     var loadingCell = document.createElement('td');
-    loadingCell.colSpan = 5;
+    loadingCell.colSpan = 6;
     loadingCell.textContent = 'Analyse des mouvements de stock…';
     loadingCell.style.cssText = 'text-align:center;padding:24px;color:#94A3B8;';
     loadingRow.appendChild(loadingCell);
@@ -4491,7 +4542,7 @@ function _renderEcartsList(searchFilter) {
     if (!list.length) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 5;
+        td.colSpan = 6;
         td.textContent = searchFilter
             ? 'Aucun écart ne correspond à votre recherche.'
             : 'Aucun écart d\'inventaire détecté sur ce périmètre.';
@@ -4519,16 +4570,17 @@ function _renderEcartsList(searchFilter) {
             return td;
         }
 
-        tr.appendChild(cell(a.ref || '—', '#64748B', '600'));
-        var nomCell = cell(a.name || '—', '#0F172A', '600');
+        tr.appendChild(_photoCell(a));
+
+        var refCell = cell(a.ref || '—', '#64748B', '600');
+        refCell.title = a.name || '';
         if (a.archive) {
-            nomCell.textContent = (a.name || '—') + ' ';
             var badge = document.createElement('span');
             badge.textContent = 'article archivé';
             badge.style.cssText = 'margin-left:6px;padding:1px 6px;border-radius:4px;background:#E2E8F0;color:#475569;font-size:0.72rem;font-weight:600;';
-            nomCell.appendChild(badge);
+            refCell.appendChild(badge);
         }
-        tr.appendChild(nomCell);
+        tr.appendChild(refCell);
         tr.appendChild(cell(a.company || '—', '#475569'));
         tr.appendChild(cell(a.magasin || '—', '#475569'));
         tr.appendChild(cell(a.achat_depot ? 'Oui' : 'Non', a.achat_depot ? '#047857' : '#B91C1C', '600'));
@@ -5575,7 +5627,7 @@ function _renderHistory() {
         ? ['Date', 'Ticket', 'Magasin', 'Réf', 'Produit', 'Qté',
            'Prix catalogue (TTC)', 'Remise', 'Prix payé (TTC)']
         : ['Bon', 'Date', 'État', 'Opération', 'Société source', 'Magasin source',
-           'Société cible', 'Magasin cible', 'Type', 'Réf.', 'Qté', 'Notification'];
+           'Société cible', 'Magasin cible', 'Type', 'Réf.', 'Qté'];
     columns.forEach(function(label) {
         var th = document.createElement('th');
         th.textContent = label;
@@ -5693,7 +5745,6 @@ function _renderHistory() {
                                 r.intra_societe ? '#7C3AED' : '#64748B'));
             tr.appendChild(cell(formatNumber(r.nb_references), null, null, 'center'));
             tr.appendChild(cell(formatNumber(r.qty), null, '700', 'center'));
-            tr.appendChild(_notifTestCell(r));
         }
 
         tbody.appendChild(tr);
@@ -5730,36 +5781,6 @@ function _historyEtatEtapes(r) {
                 + (fait ? '✓' : '○') + ' ' + _escapeHtml(e.label) + '</span>';
         }).join('')
         + '</div>';
-}
-
-// renvoie la notification de CE bon à soi-même, avec un bandeau rouge
-// « ceci est un test », sans déranger les responsables de magasin.
-function _notifTestCell(r) {
-    var td = document.createElement('td');
-    td.style.cssText = 'padding:9px 8px;';
-    var btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'btn-transfer-open';
-    btn.style.cssText = 'padding:3px 10px;font-size:0.75rem;margin:0;';
-    btn.textContent = '✉️ Me l\'envoyer en test';
-    btn.title = 'Vous envoie cette notification à vous seule, en test.';
-    btn.addEventListener('click', async function(ev) {
-        ev.stopPropagation();
-        btn.disabled = true;
-        btn.textContent = 'Envoi…';
-        var res = await rpc('/mavie/api/transfer-notif-test', { transfer_id: r.id });
-        btn.disabled = false;
-        btn.textContent = '✉️ Me l\'envoyer en test';
-        if (!res || res.error) {
-            window.alert('Erreur : ' + ((res && res.error) || 'inconnue'));
-            return;
-        }
-        window.alert('Envoyé à ' + res.destinataire + ' : ' + res.messages
-            + ' message' + (res.messages > 1 ? 's' : '') + '.\n'
-            + 'Regardez la cloche dans Odoo.\nLes magasins n\'ont rien reçu.');
-    });
-    td.appendChild(btn);
-    return td;
 }
 
 function _buildExportParams(extra) {
@@ -6019,7 +6040,7 @@ document.addEventListener('DOMContentLoaded', function() {
         chartModeShopBtn.addEventListener('click', function() { setSalesChartMode('shop'); });
     }
 
-    ['filter-collection', 'filter-magasin', 'filter-batch'].forEach(function(id) {
+    ['filter-collection', 'filter-batch'].forEach(function(id) {
         var sel = el(id);
         if (sel) {
             sel.addEventListener('change', function() {
@@ -8488,10 +8509,10 @@ function _acBindOnce() {
     var trOv = el('ac-transferts-overlay');
     if (trOv) trOv.addEventListener('click', function(e) { if (e.target === trOv) closeHistoriqueTransferts(); });
 
-    var closeRa = el('close-ac-reassort-btn');
-    if (closeRa) closeRa.addEventListener('click', closeActionReassort);
-    var raOv = el('ac-reassort-overlay');
-    if (raOv) raOv.addEventListener('click', function(e) { if (e.target === raOv) closeActionReassort(); });
+    // Câblé une seule fois, sans condition, par _raWireClose() — voir sa
+    // note : ce popup s'ouvre aussi depuis la page Dépôt/Réassort, qui
+    // n'appelle jamais _acBindOnce().
+    _raWireClose();
 }
 
 // ── Réassort d'une référence, depuis la page Action ──
@@ -8501,10 +8522,30 @@ function _acBindOnce() {
 // bon d'achat fournisseur si le dépôt manque, bons de vente inter-sociétés
 // sinon.
 var raArticle = { data: null, qtes: {} };
+var _raCloseWired = false;
+
+// BUG CORRIGÉ (2026-10-15) : « le bouton ✕ ne marche pas » — vrai, mais
+// seulement pour qui ouvre ce popup depuis la page Dépôt/Réassort (société
+// dépôt) sans être jamais passé par la page Action : le clic sur ✕ n'était
+// câblé que dans _acBindOnce(), elle-même appelée uniquement par
+// loadActions(). Le dépôt n'affiche pas la page Action (pas de vente en
+// caisse), donc _acBindOnce() n'avait jamais tourné et ✕ ne faisait rien —
+// la flèche ← fonctionnait, elle, car câblée séparément et sans condition
+// par _initBoutonsRetour(). On câble donc ✕ ici aussi, une seule fois,
+// quel que soit le point d'entrée.
+function _raWireClose() {
+    if (_raCloseWired) return;
+    var closeRa = el('close-ac-reassort-btn');
+    if (closeRa) closeRa.addEventListener('click', closeActionReassort);
+    var raOv = el('ac-reassort-overlay');
+    if (raOv) raOv.addEventListener('click', function(e) { if (e.target === raOv) closeActionReassort(); });
+    _raCloseWired = true;
+}
 
 async function openActionReassort(r, couleur, taille, base, whId) {
     var ov = el('ac-reassort-overlay');
     if (!ov) return;
+    _raWireClose();
     var refEl = el('ac-ra-ref');
     if (refEl) refEl.textContent = r.ref + (couleur ? ' — ' + couleur : '')
         + (taille ? ' — ' + taille : '');
@@ -9147,6 +9188,7 @@ function _spParams() {
         categ_ids: state.categ_ids || [],
         batch_id: state.batch_id,
         shop_field: state.shop_field,
+        shop_fields: state.shop_fields || [],
         // DEMANDE UTILISATEUR (2026-10-07) : l'assistant (dont « Quel moment
         // vend le mieux ») doit respecter le filtre Période de la barre du
         // haut, comme le reste du dashboard.
@@ -9593,6 +9635,10 @@ function _spOperation() {
         if (cs) Array.prototype.forEach.call(cs.querySelectorAll('input[type=checkbox]'), function(cb) {
             cb.checked = ((o && o.categories) || []).indexOf(parseInt(cb.value, 10)) >= 0;
         });
+        var ms = el('sp-op-magasins');
+        if (ms) Array.prototype.forEach.call(ms.querySelectorAll('input[type=checkbox]'), function(cb) {
+            cb.checked = ((o && o.magasins) || []).indexOf(cb.value) >= 0;
+        });
         f.style.display = f.style.display === 'none' ? '' : 'none';
     });
 }
@@ -9607,8 +9653,22 @@ async function _spChargerCategories() {
     }).join('');
 }
 
+// Même principe que les catégories : une liste de cases à cocher, remplie
+// une fois, sans aucun filtre appliqué tant qu'on n'a pas cliqué sur
+// « Enregistrer » — cocher un magasin ne doit rien recalculer tout seul.
+async function _spChargerMagasins() {
+    var ms = el('sp-op-magasins');
+    if (!ms) return;
+    var d = await rpc('/mavie/api/soldes-magasins', {});
+    ms.innerHTML = ((d && d.magasins) || []).map(function(m) {
+        return '<label class="sp-op-cat"><input type="checkbox" value="' + _escapeHtml(m.shop_field) + '"/> '
+            + _escapeHtml(m.nom) + '</label>';
+    }).join('');
+}
+
 function _spOperationBindOnce() {
     _spChargerCategories();
+    _spChargerMagasins();
     var ok = el('btn-sp-op-ok');
     if (ok) ok.addEventListener('click', async function() {
         var r = await rpc('/mavie/api/solde-operation', {
@@ -9620,6 +9680,11 @@ function _spOperationBindOnce() {
                 var cs = el('sp-op-categ');
                 return cs ? Array.prototype.filter.call(cs.querySelectorAll('input[type=checkbox]'),
                     function(cb) { return cb.checked; }).map(function(cb) { return parseInt(cb.value, 10); }) : [];
+            })(),
+            magasins: (function() {
+                var ms = el('sp-op-magasins');
+                return ms ? Array.prototype.filter.call(ms.querySelectorAll('input[type=checkbox]'),
+                    function(cb) { return cb.checked; }).map(function(cb) { return cb.value; }) : [];
             })() });
         if (r && r.error) { window.alert(r.error); return; }
         spOperation = r;
@@ -9961,6 +10026,7 @@ function _trParams() {
         categ_ids: state.categ_ids || [],
         batch_id: state.batch_id,
         shop_field: state.shop_field,
+        shop_fields: state.shop_fields || [],
         fenetre: v('tr-fenetre', 90),
         cible: v('tr-cible', 60),
         min_qte: v('tr-min-qte', 3),
@@ -10140,6 +10206,19 @@ function _trArticlesMagasin(bons, magasin) {
         + '</tbody></table>';
 }
 
+async function _trAnnulerBon(bonId, bonNom) {
+    if (!window.confirm('Annuler le transfert ' + bonNom + ' ?\n\n'
+        + 'Les deux magasins (source et destination) seront prévenus dans leur '
+        + 'boîte Odoo. Aucune marchandise n’a encore bougé pour ce bon, rien '
+        + 'à remettre en stock.')) return;
+    var res = await rpc('/mavie/api/transfer-cancel', { transfer_id: parseInt(bonId, 10) });
+    if (!res || res.error) {
+        window.alert('L’annulation a échoué : ' + ((res && res.error) || 'erreur inconnue'));
+        return;
+    }
+    await _trChargerBons();
+}
+
 function _trRenderBons() {
     var zone = el('tr-foot');
     if (!zone) return;
@@ -10185,7 +10264,12 @@ function _trRenderBons() {
                    + '</td><td>' + _escapeHtml(_trQuand(b.recu) || '—')
                    + '</td><td>' + formatNumber(b.pieces) + '</td><td>' + formatNumber(b.vendu || 0)
                    + '</td><td><a href="/mavie/transfer-bon-pdf/' + b.id
-                   + '" target="_blank" rel="noopener">PDF</a></td></tr>';
+                   + '" target="_blank" rel="noopener">PDF</a>'
+                   + (b.state !== 'done' && b.state !== 'cancelled' && b.state !== 'cancel'
+                      ? ' · <a href="#" class="tr-bon-annuler" data-bon-id="' + b.id
+                        + '" data-bon-nom="' + _escapeHtml(b.name) + '" style="color:#B91C1C;">Annuler</a>'
+                      : '')
+                   + '</td></tr>';
           }).join('')
         + '</tbody></table>';
     if (trBonsMagasin) {
@@ -10206,6 +10290,12 @@ function _trRenderBons() {
     if (!zone.dataset.bonsLies) {
         zone.dataset.bonsLies = '1';
         zone.addEventListener('click', function(ev) {
+            var annulerLien = ev.target.closest && ev.target.closest('.tr-bon-annuler');
+            if (annulerLien) {
+                ev.preventDefault();
+                _trAnnulerBon(annulerLien.getAttribute('data-bon-id'), annulerLien.getAttribute('data-bon-nom'));
+                return;
+            }
             if (ev.target.closest && ev.target.closest('a')) return;
             var ligne = ev.target.closest && ev.target.closest('tr.tr-bon-ligne');
             if (!ligne) return;
@@ -10694,6 +10784,7 @@ function _sjRender(d) {
     }
     var h = '<div class="rx-scroll"><table class="rx-table"><thead><tr>'
           + '<th>R\u00e9f\u00e9rence</th><th>Magasin</th><th>Soci\u00e9t\u00e9</th>'
+          + '<th title="Nom de l\u2019op\u00e9ration en cours au moment de la pose, si elle a \u00e9t\u00e9 d\u00e9clar\u00e9e \u2014 vide pour une solde normale">Op\u00e9ration</th>'
           + '<th class="num" title="Prix de l\u2019\u00e9tiquette TTC">Catalogue</th>'
           + '<th class="num">Prix sold\u00e9</th><th class="num">Remise</th>'
           + '<th class="num" title="Date de d\u00e9but de la r\u00e8gle de prix">Depuis</th>'
@@ -10717,6 +10808,9 @@ function _sjRender(d) {
              + _escapeHtml(r.magasin)
              + (r.partagee ? ' <span class=\"mfl-code\">partagée</span>' : '') + '</td>'
            + '<td class="rx-muted">' + _escapeHtml(r.societe) + '</td>'
+           + '<td>' + (r.operation
+               ? '<span class="mfl-code">' + _escapeHtml(r.operation) + '</span>'
+               : '<span class="rx-muted">—</span>') + '</td>'
            + '<td class="num">' + formatMAD(r.prix_catalogue) + '</td>'
            + '<td class="num" style="font-weight:700;">' + formatMAD(r.prix_solde) + '</td>'
            + '<td class="num" style="color:#B45309;font-weight:700;">\u2212'

@@ -708,6 +708,24 @@ class MaVieDashboardController(http.Controller):
         base = request.env['ir.config_parameter'].sudo().get_param('web.base.url') or ''
         return base.rstrip('/') + path
 
+    def _avec_photos(self, lignes, size='image_128'):
+        """Ajoute image_url/has_image à une liste de lignes {'id': tmpl_id, ...}.
+
+        Même résolution par lot que Top/Flop (_image_availability) : une
+        seule requête pour toute la liste. Tant qu'aucune photo n'est
+        disponible (produit ni Base Pivot), has_image reste False et
+        l'écran affiche le cadre « pas de photo » — le jour où les photos
+        seront accessibles, ces lignes afficheront l'image sans changement
+        de code côté client.
+        """
+        ids = {l['id'] for l in lignes if l.get('id')}
+        sources = self._image_availability(ids, size=size)
+        for l in lignes:
+            src = sources.get(l.get('id'))
+            l['image_url'] = self._image_url(l['id'], src, size=size)
+            l['has_image'] = bool(src)
+        return lignes
+
     # ─────────────────────────────────────────────────────────────
     # PRIX AFFICHÉS EN TTC
     #
@@ -922,13 +940,13 @@ class MaVieDashboardController(http.Controller):
         if kw.get('date_end'):
             domain.append(('order_id.date_order', '<=', kw['date_end'] + ' 23:59:59'))
 
-        if kw.get('shop_field'):
-            scope = self._get_shop_scope(kw['shop_field'])
-            if scope:
-                if scope['company_id']:
-                    domain.append(('order_id.company_id', '=', scope['company_id']))
-                if scope['pos_config_ids'] is not None:
-                    domain.append(('order_id.session_id.config_id', 'in', scope['pos_config_ids']))
+        scopes = self._get_shop_scopes(kw)
+        if scopes:
+            company_ids, config_ids = self._shop_scopes_pos_filters(scopes)
+            if company_ids:
+                domain.append(('order_id.company_id', 'in', company_ids))
+            if config_ids is not None:
+                domain.append(('order_id.session_id.config_id', 'in', config_ids))
         else:
             # Pas de magasin précis choisi dans le dashboard : on retombe sur
             # la/les société(s) cochée(s) dans le sélecteur standard Odoo.
@@ -981,26 +999,30 @@ class MaVieDashboardController(http.Controller):
         # sélectionné. On réplique ici le même filtre que pour les ventes
         # POS : société via order_id.company_id, magasin via le picking
         # (bon de réception) rattaché à l'entrepôt du magasin.
-        if kw.get('shop_field'):
+        scopes = self._get_shop_scopes(kw)
+        if scopes:
             # Un point de vente en ligne partage l'entrepôt de son magasin
             # physique : les achats affichés sont donc ceux de cet entrepôt
             # (il n'existe pas d'approvisionnement propre au canal en ligne).
-            scope = self._get_shop_scope(kw['shop_field'])
-            if scope:
-                if scope['company_id']:
-                    domain.append(('order_id.company_id', '=', scope['company_id']))
-                # L'entrepôt du magasin n'est ajouté que s'il reçoit
-                # réellement des bons d'achat. Sur Elite, les 118 bons des
-                # magasins sont tous réceptionnés dans l'entrepôt GÉNÉRIQUE
-                # de la société (« SQUARE TARGA »), jamais dans celui de la
-                # boutique : ce filtre vidait donc la Qté achetée dès qu'on
-                # choisissait un magasin, et la fiche produit affichait
-                # « aucune commande fournisseur » avec des « — » partout.
-                # Sur MaVie, où les bons visent bien l'entrepôt du magasin
-                # (MARINA AGADIR : 299 bons), le filtre s'applique comme
-                # avant.
-                if scope['warehouse'] and self._entrepot_recoit_des_achats(scope['warehouse'].id):
-                    domain.append(('order_id.picking_type_id.warehouse_id', '=', scope['warehouse'].id))
+            company_ids = sorted({s['company_id'] for s in scopes if s.get('company_id')})
+            if company_ids:
+                domain.append(('order_id.company_id', 'in', company_ids))
+            # L'entrepôt du magasin n'est ajouté que s'il reçoit
+            # réellement des bons d'achat. Sur Elite, les 118 bons des
+            # magasins sont tous réceptionnés dans l'entrepôt GÉNÉRIQUE
+            # de la société (« SQUARE TARGA »), jamais dans celui de la
+            # boutique : ce filtre vidait donc la Qté achetée dès qu'on
+            # choisissait un magasin, et la fiche produit affichait
+            # « aucune commande fournisseur » avec des « — » partout.
+            # Sur MaVie, où les bons visent bien l'entrepôt du magasin
+            # (MARINA AGADIR : 299 bons), le filtre s'applique comme
+            # avant.
+            warehouse_ids = sorted({
+                s['warehouse'].id for s in scopes
+                if s.get('warehouse') and self._entrepot_recoit_des_achats(s['warehouse'].id)
+            })
+            if warehouse_ids:
+                domain.append(('order_id.picking_type_id.warehouse_id', 'in', warehouse_ids))
         else:
             # Pas de magasin précis choisi dans le dashboard : on retombe sur
             # la/les société(s) cochée(s) dans le sélecteur standard Odoo.
@@ -1208,6 +1230,38 @@ class MaVieDashboardController(http.Controller):
         entries.sort(key=lambda e: (e['company'], e['name']))
         return entries
 
+    def _get_shop_scopes(self, kw):
+        """Les scopes de TOUS les magasins cochés dans le filtre MAGASIN.
+
+        DEMANDE UTILISATRICE (2026-10-15) : le filtre devient à choix
+        multiple, comme Catégorie. `kw['shop_fields']` (liste, le nouveau
+        filtre) a priorité sur `kw['shop_field']` (un seul choix, gardé
+        pour les écrans qui ont leur propre sélecteur de magasin et
+        n'envoient pas encore de liste — ex. le panneau Solder, la page
+        Action via son filtre Lieux).
+        """
+        champs = kw.get('shop_fields')
+        if not champs:
+            champs = [kw['shop_field']] if kw.get('shop_field') else []
+        scopes = []
+        for champ in champs:
+            s = self._get_shop_scope(champ)
+            if s:
+                scopes.append(s)
+        return scopes
+
+    def _shop_scopes_pos_filters(self, scopes):
+        """(company_ids, config_ids) pour les domaines POS/ventes, fusion
+        de plusieurs scopes. `config_ids` vaut None si au moins un magasin
+        du choix n'a pas d'entrepôt (donc pas de caisses à restreindre) :
+        on retombe alors sur le filtre société seul pour tous, plutôt que
+        de risquer d'exclure les ventes d'un magasin par erreur."""
+        company_ids = sorted({s['company_id'] for s in scopes if s.get('company_id')})
+        if any(s.get('pos_config_ids') is None for s in scopes):
+            return company_ids, None
+        config_ids = sorted({cid for s in scopes for cid in (s.get('pos_config_ids') or [])})
+        return company_ids, config_ids
+
     def _get_shop_scope(self, shop_field):
         """Résout un choix du filtre magasin en périmètre technique.
 
@@ -1401,7 +1455,14 @@ class MaVieDashboardController(http.Controller):
                 magasin_by_tid[tid] = default_label
             return magasin_by_tid
 
-        variant_rows = request.env['product.product'].sudo().search_read(
+        # active_test=False : une variante archivée peut encore détenir du
+        # stock résiduel (constaté : YY-109, 2 unités sur une variante
+        # archivée) — l'ignorer fait apparaître un magasin incomplet ou
+        # "Réseau" par défaut alors que le stock total affiché, lui, inclut
+        # bien ces unités (calculé ailleurs avec active_test=False).
+        variant_rows = request.env['product.product'].sudo().with_context(
+            active_test=False
+        ).search_read(
             [('product_tmpl_id', 'in', product_tmpl_ids)],
             ['id', 'product_tmpl_id']
         )
@@ -1467,7 +1528,9 @@ class MaVieDashboardController(http.Controller):
         if not product_tmpl_ids:
             return result
 
-        variant_rows = request.env['product.product'].sudo().search_read(
+        variant_rows = request.env['product.product'].sudo().with_context(
+            active_test=False
+        ).search_read(
             [('product_tmpl_id', 'in', product_tmpl_ids)], ['id', 'product_tmpl_id']
         )
         tmpl_by_variant = {v['id']: v['product_tmpl_id'][0] for v in variant_rows if v.get('product_tmpl_id')}
@@ -1950,16 +2013,17 @@ class MaVieDashboardController(http.Controller):
                 ('location_id.usage', '=', 'internal'),
             ]
             quant_domain_base += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
-            shop_field = kw.get('shop_field')
-            shop_scope = self._get_shop_scope(shop_field)
-            if shop_field:
-                if shop_scope:
-                    if shop_scope['company_id']:
-                        quant_domain_base.append(('company_id', '=', shop_scope['company_id']))
-                    if shop_scope['warehouse'] and shop_scope['warehouse'].lot_stock_id:
-                        quant_domain_base.append(
-                            ('location_id', 'child_of', shop_scope['warehouse'].lot_stock_id.id)
-                        )
+            shop_scopes = self._get_shop_scopes(kw)
+            if shop_scopes:
+                scope_company_ids = sorted({s['company_id'] for s in shop_scopes if s.get('company_id')})
+                if scope_company_ids:
+                    quant_domain_base.append(('company_id', 'in', scope_company_ids))
+                # child_of accepte une liste d'ids parents (OR) : un magasin
+                # du choix multiple suffit pour qu'un quant soit retenu.
+                lot_stock_ids = [s['warehouse'].lot_stock_id.id for s in shop_scopes
+                                 if s.get('warehouse') and s['warehouse'].lot_stock_id]
+                if lot_stock_ids:
+                    quant_domain_base.append(('location_id', 'child_of', lot_stock_ids))
             else:
                 # Pas de magasin précis choisi : on retombe sur la/les
                 # société(s) cochée(s) dans le sélecteur standard Odoo.
@@ -1967,7 +2031,13 @@ class MaVieDashboardController(http.Controller):
                 if context_company_ids:
                     quant_domain_base.append(('company_id', 'in', context_company_ids))
             if product_tmpl_ids is not None:
-                q_variants = request.env['product.product'].sudo().search_read(
+                # active_test=False : une variante archivée garde son stock
+                # résiduel (cf. YY-109) — l'exclure ici désaccorderait le
+                # stock affiché en mode filtré par société de celui affiché
+                # sans filtre, qui lui tient déjà compte des archivées.
+                q_variants = request.env['product.product'].sudo().with_context(
+                    active_test=False
+                ).search_read(
                     [('product_tmpl_id', 'in', product_tmpl_ids)],
                     ['id']
                 )
@@ -2007,8 +2077,9 @@ class MaVieDashboardController(http.Controller):
             # (cas DIGITAL SHOP, entrepôt 20) — sans quoi le filtre
             # renverrait 0 partout alors que ce point de vente a bien du
             # stock et des ventes.
-            if shop_scope and shop_scope['kind'] == 'online' and shop_scope['warehouse']:
-                scoped_warehouses |= shop_scope['warehouse']
+            for s in shop_scopes:
+                if s.get('kind') == 'online' and s.get('warehouse'):
+                    scoped_warehouses |= s['warehouse']
             retail_lot_stock_ids = scoped_warehouses.mapped('lot_stock_id').ids
 
             quant_domain = quant_domain_base
@@ -2036,7 +2107,17 @@ class MaVieDashboardController(http.Controller):
             quant_pids = [g['product_id'][0] for g in quant_grouped if g.get('product_id')]
             stock_by_tmpl = {}
             if quant_pids:
-                q_prods = request.env['product.product'].sudo().search_read(
+                # active_test=False : une variante archivée peut garder du
+                # stock résiduel sur un modèle resté actif (constaté :
+                # YY-109, 2 unités sur une variante archivée, stock réel 66
+                # et non 64). Sans ce contexte, ces unités n'étaient
+                # rattachées à aucun tid et disparaissaient de stock_by_tmpl
+                # — la même correction que la table de valorisation
+                # (quant_val_grouped ci-dessous) applique déjà pour la même
+                # raison.
+                q_prods = request.env['product.product'].sudo().with_context(
+                    active_test=False
+                ).search_read(
                     [('id', 'in', quant_pids)],
                     ['id', 'product_tmpl_id']
                 )
@@ -2128,13 +2209,32 @@ class MaVieDashboardController(http.Controller):
             if is_filtered:
                 relevant_tmpl_ids = set(product_tmpl_ids)
             else:
-                # Vérifié en base : les 53 références suivies dans Base Pivot
-                # ont TOUTES au moins une activité native (vente, achat ou
-                # stock) — l'union avec mv.article.base ne changeait donc
-                # jamais cet univers, elle est retirée sans impact.
-                relevant_tmpl_ids = set(sales_by_tmpl.keys()) | set(purchase_by_tmpl.keys()) | set(stock_by_tmpl.keys())
+                # BUG CORRIGÉ (2026-10-14) : limiter l'univers aux seules
+                # références ayant déjà vendu, été achetées OU avec un
+                # mouvement de stock enregistré laissait de côté toute
+                # référence jamais mouvementée dans ce système — un article
+                # jamais vendu ET jamais reçu peut pourtant être réellement à
+                # 0 en stock (le commentaire précédent sur les 53 références
+                # Base Pivot restait vrai pour ce sous-ensemble suivi, mais
+                # pas pour le catalogue entier). Vérifié en base : 2 423
+                # références sont réellement à 0 sur tout le catalogue actif,
+                # alors que ce panneau n'en comptait que 36.
+                #
+                # type='product' est indispensable ici, pas cosmétique : sans
+                # lui, 2 220 des 2 423 étaient en fait UNE SEULE fiche
+                # technique (« REMISE PROMOTIONNELLE », type=service, sans
+                # aucune variante, recréée par Odoo à chaque remise posée) —
+                # elle n'a jamais de stock par nature, donc « toujours en
+                # rupture » sans rien y signifier. Seules les vraies fiches
+                # catalogue (vérifié : 100 % des références avec
+                # base_pivot_reference) ont type='product'.
+                relevant_tmpl_ids = set(request.env['product.template'].sudo().search(
+                    self._sachet_exclude_domain('collection_id')
+                    + [('sale_ok', '=', True), ('type', '=', 'product')]
+                ).ids)
 
             all_ruptures = []
+            tmpl_by_id = {}
             if relevant_tmpl_ids:
                 tmpl_data = request.env['product.template'].sudo().search_read(
                     [('id', 'in', list(relevant_tmpl_ids))],
@@ -2148,9 +2248,20 @@ class MaVieDashboardController(http.Controller):
                 # les alertes. tmpl_by_id ne contient que les actives : on
                 # s'appuie dessus plutôt que sur relevant_tmpl_ids, qui les
                 # inclut depuis qu'on lit aussi les variantes archivées.
+                #
+                # DEMANDE UTILISATEUR (2026-10-14) : un article jamais
+                # réceptionné ET jamais vendu n'est pas « en rupture » — il
+                # n'a simplement jamais été mis en stock (constaté : un lot
+                # d'articles créés le même jour dans Base Pivot, jamais
+                # commandés depuis, prix catalogue à 0 pour certains). La
+                # rupture suppose qu'il y a EU du stock à un moment : reçu
+                # (qty_received, purchase_by_tmpl) ou vendu (preuve qu'il a
+                # physiquement existé en rayon), peu importe lequel des deux.
                 for tid in tmpl_by_id:
                     stock = int(stock_by_tmpl.get(tid, 0))
-                    if stock <= 0:
+                    deja_recu = purchase_by_tmpl.get(tid, 0) > 0
+                    deja_vendu = sales_by_tmpl.get(tid, {}).get('qty', 0) > 0
+                    if stock <= 0 and (deja_recu or deja_vendu):
                         t = tmpl_by_id.get(tid, {})
                         ref = (
                             t.get('base_pivot_reference')
@@ -2173,8 +2284,19 @@ class MaVieDashboardController(http.Controller):
             # absent d'une seule boutique — le cas qui intéresse le magasin —
             # n'apparaissait nulle part. On ajoute le compte par magasin, le
             # total toutes boutiques confondues reste affiché à côté.
+            #
+            # BUG CORRIGÉ (2026-10-14) : sales_by_tmpl seul laissait passer
+            # les mêmes fiches fantômes que ruptures_count avant correction
+            # (« Gift Card », « Top-up eWallet », « REMISE PROMOTIONNELLE » —
+            # type=service, sans stock par nature) ainsi que des références
+            # archivées (3019, 3019-1, H8-533) : elles n'ont de stock nulle
+            # part et apparaissaient donc « en rupture » dans chaque magasin.
+            # Vérifié en base : 6 références fantômes/archivées généraient 36
+            # couples (référence × magasin) en trop. tmpl_by_id, déjà filtré
+            # sur le catalogue actif réel (type='product', sale_ok=True),
+            # élimine ces cas en intersection avec les références vendues.
             ruptures_magasin = self._ruptures_par_magasin(
-                set(sales_by_tmpl.keys()), kw)
+                set(sales_by_tmpl.keys()) & set(tmpl_by_id.keys()), kw)
             ruptures_list = sorted(all_ruptures, key=lambda a: a['qty_sold'], reverse=True)[:500]
 
             # DEMANDE UTILISATRICE (2026-09-25) : « je dois avoir TOUTES les
@@ -2187,6 +2309,15 @@ class MaVieDashboardController(http.Controller):
             # Le filtre purchase_ok est retiré : sur Elite il ne laissait que
             # 1 380 fiches sur 3 570, alors que les autres se vendent bien.
             references_actives = len(relevant_tmpl_ids)
+            # BUG CORRIGÉ (2026-10-14) : contrairement à relevant_tmpl_ids
+            # (déjà filtré sale_ok=True/type='product'), ce comptage n'avait
+            # pas le même filtre — la carte « Références » affichait donc
+            # 3634 (catalogue + fiches fantômes « REMISE PROMOTIONNELLE »,
+            # « Gift Card », etc.) au lieu du vrai catalogue vendable, et
+            # total_active_skus (dénominateur de taux_rupture, précision
+            # inventaire, écarts d'inventaire) diluait ces taux d'autant.
+            # Vérifié : 33 ruptures / 3634 affichait 0,9 % au lieu du vrai
+            # 33 / 1351 = 2,4 %. Même filtre que relevant_tmpl_ids partout.
             if is_filtered and product_tmpl_ids:
                 # ProductTemplate est ici en active_test=False (le filtre
                 # doit retrouver les achats des articles archivés) : on
@@ -2194,10 +2325,12 @@ class MaVieDashboardController(http.Controller):
                 # sans filtre.
                 references_count = ProductTemplate.search_count(
                     self._sachet_exclude_domain('collection_id')
-                    + [('id', 'in', product_tmpl_ids), ('active', '=', True)])
+                    + [('id', 'in', product_tmpl_ids), ('active', '=', True),
+                       ('sale_ok', '=', True), ('type', '=', 'product')])
             else:
                 references_count = ProductTemplate.search_count(
-                    self._sachet_exclude_domain('collection_id'))
+                    self._sachet_exclude_domain('collection_id')
+                    + [('sale_ok', '=', True), ('type', '=', 'product')])
 
             # DEMANDE UTILISATRICE (2026-09-26) : la carte Références compte
             # tout le catalogue (3 570), les taux doivent se calculer sur la
@@ -2286,7 +2419,17 @@ class MaVieDashboardController(http.Controller):
             sold_90d_tmpl_ids = set()
             qty_90d_by_tmpl = {}
             if pids_90d:
-                p90_prods = request.env['product.product'].sudo().search_read(
+                # BUG CORRIGÉ (2026-10-14) : sans active_test=False, une
+                # variante archivée qui a pourtant vendu dans les 90 derniers
+                # jours (constaté : YY-109, variante TAUPE/36, 1 vente) était
+                # ignorée — son modèle restait actif (stock=66) mais
+                # apparaissait à tort comme « jamais vendu », donc classé
+                # dans le mauvais panier (reçu récemment / jamais vendu) au
+                # lieu de « vend très lentement ». Même pattern que le bug
+                # CA par Arrivage corrigé plus tôt sur cette même recherche.
+                p90_prods = request.env['product.product'].sudo().with_context(
+                    active_test=False
+                ).search_read(
                     [('id', 'in', pids_90d)],
                     ['product_tmpl_id']
                 )
@@ -2837,7 +2980,9 @@ class MaVieDashboardController(http.Controller):
                 # et non parce qu'elles ne vendent rien du tout.
                 'dormant_lents_count': lents_count,
                 'dormant_seuil_couverture': self.COUVERTURE_DORMANTE_JOURS,
-                'dormant_list': sorted(dormant_products, key=lambda x: x['stock'], reverse=True)[:500],
+                'dormant_list': self._avec_photos(
+                    sorted(dormant_products, key=lambda x: x['stock'], reverse=True)[:500]
+                ),
                 'precision_inventaire': precision_inventaire,
                 'ecarts_inventaire_pct': ecarts_inventaire_pct,
                 'ecarts_refs_count': ecarts_refs_count,
@@ -3116,6 +3261,14 @@ class MaVieDashboardController(http.Controller):
         filters, params = self._modforlife_purchase_sql(
             mod_for_life, retail_companies, product_tmpl_ids,
             date_start, date_end, stockables=True)
+        # DEMANDE UTILISATRICE (2026-10-15) : « je ne dois pas avoir les
+        # références archivées dans le calcul » — pt.active exclut
+        # maintenant le périmètre des références archivées, ici à la
+        # source. Comme scope_variant_ids (achats, dispatché, stock) et
+        # _modforlife_balance (l'écart détaillé) en dérivent tous, retirer
+        # les archivées ici suffit à les retirer partout, de façon
+        # cohérente : plus de fausse alerte d'écart causée par un article
+        # dont seul le stock (et non l'achat) aurait été exclu.
         request.env.cr.execute("""
             SELECT pol.product_id, {QTY}
               FROM purchase_order_line pol
@@ -3127,6 +3280,7 @@ class MaVieDashboardController(http.Controller):
              WHERE po.state IN ('purchase', 'done')
                AND po.company_id = %(mfl)s
                AND NOT (po.partner_id = ANY(%(rp)s))
+               AND pt.active
                {FILTERS}
              GROUP BY 1
             HAVING {QTY} > 0
@@ -3635,11 +3789,19 @@ class MaVieDashboardController(http.Controller):
             depot = self._societe_depot()
             if not depot:
                 return {'error': "Société dépôt introuvable."}
+            # DEMANDE UTILISATRICE (2026-10-15) : les références archivées
+            # ne doivent plus compter dans le calcul — pt.active exclut leurs
+            # achats ici, comme dans _modforlife_purchased_variants (même
+            # règle des deux côtés, sinon la carte du dashboard et ce
+            # pop-up auraient encore raconté deux histoires différentes).
             request.env.cr.execute("""
                 SELECT DISTINCT pol.product_id
                   FROM purchase_order_line pol
                   JOIN purchase_order po ON po.id = pol.order_id
+                  JOIN product_product pp ON pp.id = pol.product_id
+                  JOIN product_template pt ON pt.id = pp.product_tmpl_id
                  WHERE po.company_id = %s AND po.state IN ('purchase', 'done')
+                   AND pt.active
             """, (depot.id,))
             achetees = {r[0] for r in request.env.cr.fetchall()}
 
@@ -3665,14 +3827,23 @@ class MaVieDashboardController(http.Controller):
             variantes = request.env['product.product'].sudo().with_context(
                 active_test=False).browse([r[0] for r in brut])
             noms = {v.id: v for v in variantes}
+            # DEMANDE UTILISATRICE (2026-10-15) : « supprime ce qui est
+            # jamais acheté par le dépôt... cette partie est seulement de
+            # dépôt, ce qui est entrée et sortie de dépôt » — le dépôt
+            # n'achète/ne dispatche qu'une partie du catalogue ; le reste
+            # (retours de magasins, etc., jamais acheté sur bon par ce
+            # dépôt) n'a rien à faire dans sa liste de stock. Seul le total
+            # résiduel est gardé, à titre informatif, comme pour le stock
+            # archivé juste en dessous.
             rows = []
             total = total_achetees = total_negatif = 0.0
             for pid, ref, produit, actif, emplacement, qte in brut:
-                v = noms.get(pid)
                 qte = float(qte or 0.0)
                 total += qte
-                if pid in achetees:
-                    total_achetees += qte
+                if pid not in achetees:
+                    continue
+                v = noms.get(pid)
+                total_achetees += qte
                 if qte < 0:
                     total_negatif += qte
                 rows.append({
@@ -3684,7 +3855,7 @@ class MaVieDashboardController(http.Controller):
                         v.product_template_attribute_value_ids.mapped('name')) if v else '',
                     'emplacement': emplacement or '—',
                     'qty': int(round(qte)),
-                    'achetee': pid in achetees,
+                    'achetee': True,
                     'archive': not actif,
                 })
             # Articles archivés : hors de la liste, mais comptés dans la carte.
@@ -4669,13 +4840,22 @@ class MaVieDashboardController(http.Controller):
             if not rows:
                 return {'daily': [], 'by_shop': []}
 
+            # BUG CORRIGÉ (2026-10-14) : recherche sans active_test=False, donc
+            # un produit ARCHIVÉ depuis sa vente disparaissait purement et
+            # simplement du graphique (ni compté dans son arrivage, ni dans
+            # « Non rattaché ») au lieu de simplement ne pas trouver
+            # d'arrivage — constaté en base : 27 lignes vendues (4 228 MAD,
+            # 28 pièces) sur 18 produits archivés, manquantes par rapport au
+            # CA réel total des ventes POS sur la période.
             pids = list({r[0] for r in rows if r[0]})
-            prods = request.env['product.product'].sudo().search_read(
+            prods = request.env['product.product'].sudo().with_context(
+                active_test=False).search_read(
                 [('id', 'in', pids)], ['id', 'product_tmpl_id']
             )
             prod_to_tmpl = {p['id']: p['product_tmpl_id'][0] for p in prods if p.get('product_tmpl_id')}
 
-            tmpls = request.env['product.template'].sudo().search_read(
+            tmpls = request.env['product.template'].sudo().with_context(
+                active_test=False).search_read(
                 [('id', 'in', list(set(prod_to_tmpl.values())))], ['id', 'arrivage_id']
             )
             tmpl_to_arrivage = {
@@ -4774,8 +4954,16 @@ class MaVieDashboardController(http.Controller):
             # progressif/fidélité (type service, sale_ok=False) — sans quoi
             # ils ressortaient dans la recherche dès que leur nom généré
             # contenait la référence cherchée (ex. « 3251.0 »).
+            # BUG CORRIGÉ (2026-10-14) : sale_ok=True seul ne suffit pas —
+            # « REMISE PROMOTIONNELLE » (fiche technique recréée à chaque
+            # remise posée, 2221 exemplaires) a sale_ok=True mais
+            # type='service' ; une recherche sur « remise »/« promo »
+            # ne renvoyait plus que des doublons de cette fiche. type=
+            # 'product' exclut ces fiches sans variante physique, comme
+            # relevant_tmpl_ids dans /mavie/api/kpis.
             products = ProductTemplate.search([
                 ('sale_ok', '=', True),
+                ('type', '=', 'product'),
                 '|', '|', '|',
                 ('name', 'ilike', query),
                 ('default_code', 'ilike', query),
@@ -6180,48 +6368,7 @@ class MaVieDashboardController(http.Controller):
         fname = re.sub(r'[^\w.-]+', '_', f"Bon_transfert_{transfer.name}") + '.pdf'
         return (fname, pdf)
 
-    # Bandeau des notifications de TEST : impossible de le confondre avec un
-    # vrai bon à préparer.
-    BANDEAU_TEST = (
-        '<div style="background:#DC2626;color:#FFFFFF;font-size:16px;font-weight:800;'
-        'padding:14px 16px;border-radius:8px;margin-bottom:14px;text-align:center;">'
-        '⚠️ CECI EST UN TEST — NE FAITES RIEN<br/>'
-        '<span style="font-weight:600;font-size:13px;">Les magasins n\'ont rien reçu.</span></div>'
-    )
-
-    @http.route('/mavie/api/transfer-notif-test', type='json', auth='user', methods=['POST'], csrf=False)
-    def api_transfer_notif_test(self, **kw):
-        """DEMANDE UTILISATRICE (2026-09-23) : voir à quoi ressemble la
-        notification d'un transfert sans déranger les responsables de
-        magasin. On renvoie EXACTEMENT le même message (bon PDF compris),
-        mais au seul utilisateur connecté et coiffé d'un bandeau rouge
-        « ceci est un test ». Rien n'est créé ni modifié dans Odoo."""
-        try:
-            transfer = request.env['inter.internal.transfer'].sudo().browse(
-                int(kw.get('transfer_id') or 0)).exists()
-            if not transfer:
-                return {'error': 'Transfert introuvable.'}
-            mappings = self._get_active_shop_mappings()
-
-            def mapping_de(location):
-                wh = location.warehouse_id
-                return mappings.filtered(lambda m: m.warehouse_id == wh)[:1] if wh else mappings.browse()
-
-            source = mapping_de(transfer.location_source_id)
-            dest = mapping_de(transfer.location_target_id)
-            if not source or not dest:
-                return {'error': "Ce bon ne pointe pas sur deux magasins connus du dashboard."}
-            notified, warning = self._notify_transfer_responsible(
-                transfer, source, dest, test_partner=request.env.user.partner_id)
-            return {'ok': True, 'transfert': transfer.name, 'destinataire': request.env.user.name,
-                    'messages': len(notified.get('source') or []) + len(notified.get('dest') or []),
-                    'warning': warning}
-        except Exception as e:
-            _logger.error(f"Erreur api_transfer_notif_test: {str(e)}", exc_info=True)
-            return {'error': str(e)}
-
-    def _notify_transfer_responsible(self, transfer, source_mapping, dest_mapping,
-                                     test_partner=None):
+    def _notify_transfer_responsible(self, transfer, source_mapping, dest_mapping):
         """Notifie les responsables des deux magasins dans Odoo UNIQUEMENT
         (boîte de réception, jamais d'email — voir mail_thread_ext.py), bon de
         transfert PDF en pièce jointe.
@@ -6240,13 +6387,9 @@ class MaVieDashboardController(http.Controller):
 
         source_managers = source_mapping._get_store_managers()
         dest_all = dest_mapping._get_store_managers()
-        if test_partner:
-            # Mode test : personne d'autre ne reçoit rien, et les deux
-            # messages (préparer / réceptionner) partent à l'utilisateur.
-            source_managers = dest_all = request.env.user
         # Un même utilisateur responsable des deux magasins ne reçoit que la
         # notification « à préparer », qui contient déjà tout.
-        dest_managers = dest_all if test_partner else dest_all - source_managers
+        dest_managers = dest_all - source_managers
 
         notified = {'source': [], 'dest': []}
         warnings = [
@@ -6318,34 +6461,20 @@ class MaVieDashboardController(http.Controller):
             f"<strong>{source_label}</strong> → <strong>{dest_label}</strong></p>"
             f'<p><a href="{lien_direct}" target="_blank">→ Ouvrir et valider ce bon</a></p>'
         )
-        if test_partner:
-            route_txt = self.BANDEAU_TEST + route_txt
         items_txt = f"<ul>{''.join(lines_txt)}</ul>"
         # Boîte de réception Odoo uniquement, même pour les utilisateurs réglés
         # sur « Notification par email » (demande utilisateur).
         mail_thread = request.env['mail.thread'].sudo().with_context(
             mavie_notify_inbox_only=True,
-            # Mode test : l'utilisatrice est à la fois à l'origine du message et
-            # sa destinataire. Odoo n'envoie jamais à l'utilisateur courant
-            # (`real_author_id` dans mail_thread._notify_get_recipients), d'où
-            # « je n'ai rien reçu » le 2026-09-23 : on lève ce garde-fou, mais
-            # seulement pour le test.
-            mail_notify_author=bool(test_partner),
+            mail_notify_author=False,
         )
-        # Mode test : l'utilisatrice est destinataire. Odoo ne notifie jamais
-        # l'auteur de son propre message — sans changer d'auteur, le message
-        # était créé mais n'apparaissait pas dans la cloche (constaté le
-        # 2026-09-23 : « je n'ai rien reçu »). On le fait donc signer par
-        # OdooBot.
-        extra = {'author_id': request.env.ref('base.partner_root').id} if test_partner else {}
-
         # Markup() : sans ça, Odoo traite le corps comme du texte brut et
         # échappe les balises — le responsable reçoit « &lt;p&gt;… » au lieu
         # du message mis en forme.
         if source_managers:
             mail_thread.message_notify(
                 partner_ids=source_managers.mapped('partner_id').ids,
-                subject=('[TEST] ' if test_partner else '') + f"Transfert {transfer.name} à préparer — {_label(source_mapping)}",
+                subject=f"Transfert {transfer.name} à préparer — {_label(source_mapping)}",
                 body=Markup(
                     f"{route_txt}"
                     f"<p>Marchandise {where_txt}. Le bon de transfert est joint en PDF.</p>"
@@ -6354,13 +6483,12 @@ class MaVieDashboardController(http.Controller):
                 model=model,
                 res_id=res_id,
                 attachments=attachments,
-                **extra,
             )
             notified['source'] = source_managers.mapped('name')
         if dest_managers:
             mail_thread.message_notify(
                 partner_ids=dest_managers.mapped('partner_id').ids,
-                subject=('[TEST] ' if test_partner else '') + f"Transfert {transfer.name} à réceptionner — {_label(dest_mapping)}",
+                subject=f"Transfert {transfer.name} à réceptionner — {_label(dest_mapping)}",
                 body=Markup(
                     f"{route_txt}"
                     f"<p>Marchandise en route vers votre magasin : à contrôler à la "
@@ -6370,7 +6498,6 @@ class MaVieDashboardController(http.Controller):
                 model=model,
                 res_id=res_id,
                 attachments=attachments,
-                **extra,
             )
             notified['dest'] = dest_managers.mapped('name')
 
@@ -6390,13 +6517,104 @@ class MaVieDashboardController(http.Controller):
                         f"<p>Marchandise {where_txt}. Bon de transfert en PDF ci-joint.</p>"
                         f"{items_txt}"
                     ),
-                    subject=('[TEST] ' if test_partner else '') + f"Transfert {transfer.name}",
+                    subject=f"Transfert {transfer.name}",
                     subtype_xmlid='mail.mt_note',
                     attachments=attachments,
                 )
         except Exception as e:  # une note manquante ne doit jamais bloquer
             _logger.warning("Note sur le bon de transfert impossible : %s", e)
         return notified, ' '.join(warnings) or None
+
+    def _notify_transfer_cancelled(self, transfer, source_mapping, dest_mapping):
+        """Prévient les deux magasins qu'un transfert a été annulé — même
+        mécanisme que _notify_transfer_responsible (boîte Odoo uniquement,
+        jamais d'email)."""
+        def _label(mapping):
+            return mapping.warehouse_id.name or mapping.shop_label or mapping.shop_field if mapping else '—'
+
+        source_managers = source_mapping._get_store_managers() if source_mapping else request.env['res.users']
+        dest_all = dest_mapping._get_store_managers() if dest_mapping else request.env['res.users']
+        dest_managers = dest_all - source_managers
+        notified = {'source': [], 'dest': []}
+        if not source_managers and not dest_managers:
+            return notified, None
+
+        mail_thread = request.env['mail.thread'].sudo().with_context(
+            mavie_notify_inbox_only=True, mail_notify_author=False)
+        body = Markup(
+            f"<p><strong>Transfert {escape(transfer.name)}</strong> annulé : "
+            f"<strong>{escape(_label(source_mapping))}</strong> → "
+            f"<strong>{escape(_label(dest_mapping))}</strong></p>"
+            f"<p>Aucune marchandise n'a bougé : il n'y a rien à faire ni à "
+            f"contrôler, ce bon est sans effet.</p>"
+        )
+        if source_managers:
+            mail_thread.message_notify(
+                partner_ids=source_managers.mapped('partner_id').ids,
+                subject=f"Transfert {transfer.name} annulé — {_label(source_mapping)}",
+                body=body, model='inter.internal.transfer', res_id=transfer.id,
+            )
+            notified['source'] = source_managers.mapped('name')
+        if dest_managers:
+            mail_thread.message_notify(
+                partner_ids=dest_managers.mapped('partner_id').ids,
+                subject=f"Transfert {transfer.name} annulé — {_label(dest_mapping)}",
+                body=body, model='inter.internal.transfer', res_id=transfer.id,
+            )
+            notified['dest'] = dest_managers.mapped('name')
+        try:
+            transfer.with_context(mail_notify_author=False).message_post(
+                body=body, subject=f"Transfert {transfer.name} annulé",
+                subtype_xmlid='mail.mt_note')
+        except Exception as e:  # une note manquante ne doit jamais bloquer
+            _logger.warning("Note d'annulation sur le bon de transfert impossible : %s", e)
+        return notified, None
+
+    @http.route('/mavie/api/transfer-cancel', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_transfer_cancel(self, **kw):
+        """Annule un transfert pas encore terminé — visible immédiatement
+        dans les deux magasins, source et destination, puisque c'est le
+        MÊME enregistrement qui fait foi des deux côtés.
+
+        Vérifié dans le code de transfert_interne (qu'on ne peut pas
+        modifier) : aucun mouvement de stock n'a lieu avant
+        action_validate(), qui seul fait passer l'état à 'done'. Annuler
+        avant cet état n'a donc jamais de mouvement à défaire — tout au
+        plus une réservation à relâcher (le picking du cas même société,
+        état 'transmitted').
+        """
+        try:
+            transfer_id = int(kw.get('transfer_id') or 0)
+            transfer = request.env['inter.internal.transfer'].sudo().browse(transfer_id)
+            if not transfer.exists():
+                return {'error': 'Transfert introuvable.'}
+            if transfer.state == 'cancelled':
+                return {'error': 'Ce transfert est déjà annulé.'}
+            if transfer.state == 'done':
+                return {'error': "Ce transfert est déjà terminé (marchandise reçue) : "
+                                  "il ne peut plus être annulé depuis ici."}
+
+            mappings = self._get_active_shop_mappings()
+            source_wh = transfer.location_source_id.warehouse_id
+            dest_wh = transfer.location_target_id.warehouse_id
+            source_mapping = mappings.filtered(
+                lambda m: m.warehouse_id and source_wh and m.warehouse_id.id == source_wh.id)[:1]
+            dest_mapping = mappings.filtered(
+                lambda m: m.warehouse_id and dest_wh and m.warehouse_id.id == dest_wh.id)[:1]
+
+            if transfer.picking_id and transfer.picking_id.state not in ('done', 'cancel'):
+                transfer.picking_id.action_cancel()
+
+            transfer.write({'state': 'cancelled'})
+            notified, warning = self._notify_transfer_cancelled(transfer, source_mapping, dest_mapping)
+
+            _vider_cache_dashboard()
+            _logger.info("Transfert %s annulé par %s", transfer.name, request.env.user.login)
+            return {'ok': True, 'notified': notified, 'warning': warning}
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_transfer_cancel: %s", e, exc_info=True)
+            request.env.cr.rollback()
+            return {'error': str(e)}
 
     @http.route('/mavie/api/transfer-suggestions', type='json', auth='user', methods=['POST'], csrf=False)
     def api_transfer_suggestions(self, **kw):
@@ -7460,7 +7678,7 @@ class MaVieDashboardController(http.Controller):
 
         anomalies.sort(key=lambda a: a['qty_negative'])
         return {
-            'anomalies': anomalies[:limit],
+            'anomalies': self._avec_photos(anomalies[:limit]),
             'count': len(anomalies),
             'refs_count': len({a['id'] for a in anomalies}),
             'qty_manquante': int(sum(a['qty_negative'] for a in anomalies)),
@@ -7876,19 +8094,24 @@ class MaVieDashboardController(http.Controller):
     def _suivi_verif_stock_inter(self, tr):
         """Pour un transfert entre sociétés (circuit avoir + commande
         d'achat, hors de portée du dashboard) : croise ce que le bon dit
-        avoir envoyé avec le stock RÉEL actuel du magasin destinataire,
-        référence par référence.
+        avoir envoyé avec ce qui a RÉELLEMENT été crédité au magasin
+        destinataire DEPUIS LA CRÉATION DE CE BON (mouvements de stock
+        'done', datés après tr.create_date), référence par référence —
+        ni avec le stock actuel (qui baisse à chaque vente), ni avec
+        d'anciens mouvements sans rapport (un réassort antérieur du même
+        article ne prouve rien sur CE transfert-ci).
 
         Renvoie (verdict, détail) :
           - 'introuvable' : au moins une référence n'a JAMAIS eu le
             moindre mouvement de stock à cet emplacement — le signe le
             plus net d'un article qui n'a pas été reconnu/retrouvé par
             l'autre circuit.
-          - 'insuffisant' : le stock actuel du magasin destinataire est
-            inférieur à ce qui a été envoyé, pour au moins une référence —
-            plus faible comme preuve (l'article peut avoir été revendu
-            depuis), mais vaut la peine d'être regardé.
-          - 'ok' : rien d'anormal détecté sur le stock actuel.
+          - 'insuffisant' : la quantité réellement créditée à cet
+            emplacement est inférieure à ce qui a été envoyé, pour au
+            moins une référence — un vrai écart de réception, pas un
+            effet de vente puisque ce total ne diminue jamais après coup.
+          - 'ok' : tout ce qui a été envoyé a bien été crédité (même si
+            tout ou partie a été revendu depuis).
           - None : rien à vérifier (bon sans ligne, ou emplacement cible
             non résolu).
 
@@ -7904,7 +8127,6 @@ class MaVieDashboardController(http.Controller):
         """
         if not tr.location_target_id or not tr.line_ids:
             return None, None
-        Quant = request.env['stock.quant'].sudo()
         MoveLine = request.env['stock.move.line'].sudo()
         soucis = []
         jamais_vu = []
@@ -7913,23 +8135,43 @@ class MaVieDashboardController(http.Controller):
                 # Ligne à quantité nulle (résidu de saisie) : rien n'a été
                 # envoyé, donc rien à vérifier côté réception.
                 continue
-            existe = MoveLine.search_count([
+            lignes = MoveLine.search([
                 ('product_id', '=', l.product_id.id),
                 ('location_dest_id', 'child_of', tr.location_target_id.id),
                 ('state', '=', 'done'),
+                # BUG CORRIGÉ (2026-10-15) : sans cette borne, un réassort ou
+                # un achat fournisseur SANS RAPPORT avec ce transfert,
+                # survenu n'importe quand avant, comptait comme preuve de
+                # réception — constaté : TI/2026/00079 (3 pièces envoyées)
+                # validable à tort grâce à 5 pièces créditées le 2026-09-06,
+                # un mois avant la création du bon, par un tout autre
+                # réapprovisionnement. Seuls les mouvements POSTÉRIEURS à la
+                # création du transfert peuvent en être la preuve.
+                ('date', '>=', tr.create_date),
             ])
-            dispo = Quant._get_available_quantity(l.product_id, tr.location_target_id)
             ref = (l.product_id.product_tmpl_id.base_pivot_reference
                    or l.product_id.default_code or l.product_id.display_name or '—')
-            if not existe:
+            if not lignes:
                 jamais_vu.append(ref)
-            elif dispo < l.quantity:
-                soucis.append('%s (envoyé %s, %s en stock)' % (ref, int(l.quantity), int(dispo)))
+                continue
+            # Comparer au STOCK ACTUEL (un stock.quant, qui baisse à chaque
+            # vente) plutôt qu'à la quantité réellement CRÉDITÉE depuis la
+            # création du bon bloquait aussi la validation d'un article
+            # pourtant bien arrivé puis revendu depuis — cas réel :
+            # TI/2026/00051, 1 pièce créditée ET vendue à Elite Auderby,
+            # donc 0 en stock, refusé alors que la réception était complète.
+            # On compare donc au total réellement crédité depuis la
+            # création du bon (la piste d'audit des mouvements, jamais
+            # réduite par une vente), qui ne bouge plus une fois l'article
+            # arrivé.
+            credite = sum(lignes.mapped('quantity'))
+            if credite < l.quantity:
+                soucis.append('%s (envoyé %s, %s reçu)' % (ref, int(l.quantity), int(credite)))
         if jamais_vu:
             return 'introuvable', ('Jamais vu en stock à %s : %s' %
                                     (tr.recepteur_display or tr.company_target_id.name, ', '.join(jamais_vu)))
         if soucis:
-            return 'insuffisant', ('Stock actuel inférieur à l\'envoi à %s : %s' %
+            return 'insuffisant', ('Quantité réellement créditée inférieure à l\'envoi à %s : %s' %
                                     (tr.recepteur_display or tr.company_target_id.name, ', '.join(soucis)))
         return 'ok', None
 
@@ -8389,7 +8631,20 @@ class MaVieDashboardController(http.Controller):
             if valide:
                 if tr.picking_id and tr.picking_id.state == 'done':
                     envoye = sum(tr.line_ids.mapped('quantity'))
-                    recu = sum(tr.picking_id.move_line_ids.mapped('quantity'))
+                    # BUG CORRIGÉ (2026-10-15) : ne regarder que tr.picking_id
+                    # ignore ses reliquats (backorders) — un bon collecté en
+                    # plusieurs fois (constaté : TI/2026/00049, 1 pièce sur
+                    # CE/INT/00001 + 1 sur son reliquat CE/INT/00002) était vu
+                    # « reçu : 2, écart 0 » dans le tableau (qui suit déjà
+                    # toute la chaîne, _suivi_pickings_resolus) mais refusé à
+                    # la validation, qui ne comptait que le picking d'origine.
+                    # Même méthode que le tableau, pour que les deux soient
+                    # d'accord.
+                    pickings, resolu = self._suivi_pickings_resolus(tr.picking_id)
+                    if not resolu:
+                        return {'error': "Un maillon de la chaîne de réception est encore ouvert "
+                                          "(ni fait, ni annulé) : impossible de valider pour l'instant."}
+                    recu = sum(pickings.filtered(lambda p: p.state == 'done').move_line_ids.mapped('quantity'))
                     if abs(envoye - recu) > 1e-6:
                         return {'error': 'Écart détecté (%s envoyé(s), %s reçu(s)) : impossible de valider.'
                                          % (int(envoye), int(recu))}
@@ -8855,11 +9110,16 @@ class MaVieDashboardController(http.Controller):
         mappings = self._get_active_shop_mappings().filtered(
             lambda m: m.warehouse_id and m.warehouse_id.company_id.id not in non_retail
         )
-        if kw.get('shop_field'):
-            scope = self._get_shop_scope(kw['shop_field'])
-            if scope and scope.get('warehouse'):
-                wh = scope['warehouse']
-                return wh, {wh.id: scope.get('label') or wh.name}
+        scopes = self._get_shop_scopes(kw)
+        if scopes:
+            whs = request.env['stock.warehouse'].sudo()
+            labels = {}
+            for s in scopes:
+                if s.get('warehouse'):
+                    whs |= s['warehouse']
+                    labels[s['warehouse'].id] = s.get('label') or s['warehouse'].name
+            if whs:
+                return whs, labels
         warehouses = mappings.mapped('warehouse_id')
         context_ids = [c for c in self._get_context_company_ids() if c not in non_retail]
         if context_ids:
@@ -9054,7 +9314,13 @@ class MaVieDashboardController(http.Controller):
     ACTION_FILTRES = {
         'vendus': lambda t: t['qty_sold'] > 0,
         'non_vendus': lambda t: t['qty_sold'] <= 0,
-        'rupture': lambda t: t['stock'] <= 0,
+        # BUG CORRIGÉ (2026-10-14, demande utilisatrice) : une référence
+        # jamais réceptionnée NI vendue n'est pas « en rupture », elle n'a
+        # simplement jamais été mise en stock — même règle que ruptures_count
+        # sur le tableau de bord principal (qui affiche 33, pas 169). Sans
+        # cette condition, les 136 références jamais mouvementées du tout
+        # gonflaient ce filtre.
+        'rupture': lambda t: t['stock'] <= 0 and (t['qty_purchased'] > 0 or t['qty_sold'] > 0),
         'en_stock': lambda t: t['stock'] > 0,
         'depot': lambda t: t['depot'] > 0,
         'depot_vide': lambda t: t['depot'] <= 0,
@@ -9068,14 +9334,15 @@ class MaVieDashboardController(http.Controller):
         principal ; toute évolution de l'un doit être reportée dans l'autre."""
         domain = [('location_id.usage', '=', 'internal')]
         domain += self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id')
-        shop_field = kw.get('shop_field')
-        shop_scope = self._get_shop_scope(shop_field)
-        if shop_field:
-            if shop_scope:
-                if shop_scope['company_id']:
-                    domain.append(('company_id', '=', shop_scope['company_id']))
-                if shop_scope['warehouse'] and shop_scope['warehouse'].lot_stock_id:
-                    domain.append(('location_id', 'child_of', shop_scope['warehouse'].lot_stock_id.id))
+        shop_scopes = self._get_shop_scopes(kw)
+        if shop_scopes:
+            scope_company_ids = sorted({s['company_id'] for s in shop_scopes if s.get('company_id')})
+            if scope_company_ids:
+                domain.append(('company_id', 'in', scope_company_ids))
+            lot_stock_ids = [s['warehouse'].lot_stock_id.id for s in shop_scopes
+                             if s.get('warehouse') and s['warehouse'].lot_stock_id]
+            if lot_stock_ids:
+                domain.append(('location_id', 'child_of', lot_stock_ids))
         else:
             context_company_ids = self._get_context_company_ids()
             if context_company_ids:
@@ -9095,8 +9362,9 @@ class MaVieDashboardController(http.Controller):
                     if cid not in excluded_non_retail_ids]
         if explicit:
             scoped |= Warehouse.search([('company_id', 'in', explicit)])
-        if shop_scope and shop_scope['kind'] == 'online' and shop_scope['warehouse']:
-            scoped |= shop_scope['warehouse']
+        for s in shop_scopes:
+            if s.get('kind') == 'online' and s.get('warehouse'):
+                scoped |= s['warehouse']
         lot_ids = scoped.mapped('lot_stock_id').ids
         if excluded_non_retail_ids:
             domain.append(('company_id', 'not in', excluded_non_retail_ids))
@@ -9417,7 +9685,17 @@ class MaVieDashboardController(http.Controller):
              -- Une référence ARCHIVÉE ne doit jamais apparaître dans le
              -- tableau ni dans le compteur (demande du 2026-09-26), même si
              -- elle garde des ventes ou du stock.
-             WHERE pp.id = ANY(%s) AND pt.active
+             --
+             -- BUG CORRIGÉ (2026-10-14) : contrairement à
+             -- _action_references_sans_activite (déjà filtrée), cette
+             -- requête alimente aussi les références qui ONT une vraie
+             -- activité (vente/achat/stock) — elle laissait donc passer
+             -- les fiches techniques non filtrées par type/sale_ok plus
+             -- haut : « Gift Card » et « Top-up eWallet » (type=service,
+             -- vraies ventes de cartes-cadeaux/recharges) apparaissaient
+             -- dans le catalogue de 1354 références et dans le filtre
+             -- « Reste négatif ». Même filtre que partout ailleurs.
+             WHERE pp.id = ANY(%s) AND pt.active AND pt.sale_ok AND pt.type = 'product'
         """, (list(par_variante.keys()),))
         refs = {}
         for pid, tid, ref, nom, categorie, list_price, collection_id in cr.fetchall():
@@ -9568,7 +9846,14 @@ class MaVieDashboardController(http.Controller):
         fiche créée mais jamais approvisionnée n'y apparaissait pas. On les
         ajoute pour que le compteur de la page corresponde au catalogue.
         """
-        domaine = [('active', '=', True)]
+        # BUG CORRIGÉ (2026-10-14) : sans sale_ok/type='product', cette
+        # complétion ramenait aussi les fiches techniques (« REMISE
+        # PROMOTIONNELLE » en 2221 exemplaires, « Gift Card », etc.) —
+        # vérifié en base : univers de 3634 fiches au lieu des 1351 réelles
+        # du catalogue vendable, gonflant le total affiché sur la page
+        # Action de 2283 lignes fantômes à zéro. Même filtre que
+        # relevant_tmpl_ids dans /mavie/api/kpis.
+        domaine = [('active', '=', True), ('sale_ok', '=', True), ('type', '=', 'product')]
         domaine += self._sachet_exclude_domain('collection_id')
         if self._filtre_produit_actif(kw):
             ids_filtre = request.env['product.template'].sudo().with_context(
@@ -12080,6 +12365,7 @@ class MaVieDashboardController(http.Controller):
                 'id': b.id,
                 'name': b.name,
                 'etat': etats.get(b.state, b.state),
+                'state': b.state,
                 'source': b.location_source_id.warehouse_id.name or b.location_source_id.display_name,
                 'dest': b.location_target_id.warehouse_id.name or b.location_target_id.display_name,
                 'pieces': sum(b.line_ids.mapped('quantity')),
@@ -12244,9 +12530,17 @@ class MaVieDashboardController(http.Controller):
         fin = (param.get_param(self.CLE_OPERATION + '_fin') or '').strip()
         cats = [int(x) for x in (param.get_param(self.CLE_OPERATION + '_categories') or '').split(',')
                 if x.strip().isdigit()]
+        # DEMANDE UTILISATRICE (2026-10-14) : restreindre une opération à
+        # certains magasins, comme on le fait déjà pour les catégories.
+        magasins = [m for m in (param.get_param(self.CLE_OPERATION + '_magasins') or '').split(',') if m]
         if not nom or not debut:
-            return {'active': False, 'nom': '', 'debut': '', 'fin': '', 'categories': []}
+            return {'active': False, 'nom': '', 'debut': '', 'fin': '', 'categories': [], 'magasins': []}
         aujourdhui = fields.Date.context_today(request.env.user).isoformat()
+        mappings = self._get_active_shop_mappings()
+        magasins_noms = [
+            (m.warehouse_id.name or m.shop_label or m.shop_field)
+            for m in mappings if m.shop_field in magasins
+        ]
         return {
             'active': True,
             'nom': nom,
@@ -12254,6 +12548,8 @@ class MaVieDashboardController(http.Controller):
             'fin': fin,
             'categories': cats,
             'categories_noms': request.env['product.category'].sudo().browse(cats).mapped('complete_name'),
+            'magasins': magasins,
+            'magasins_noms': magasins_noms,
             # Une opération dont la date de fin est passée ne pose plus
             # rien : on le dit, plutôt que de la laisser croire en cours.
             'terminee': bool(fin and fin < aujourdhui),
@@ -12278,6 +12574,15 @@ class MaVieDashboardController(http.Controller):
         cats = request.env['product.category'].sudo().search([], order='complete_name')
         return {'categories': [{'id': c.id, 'nom': c.complete_name} for c in cats]}
 
+    @http.route('/mavie/api/soldes-magasins', type='json', auth='user',
+                methods=['POST'], csrf=False)
+    def api_soldes_magasins(self, **kw):
+        mappings = self._get_active_shop_mappings().sorted(lambda m: m.warehouse_id.name or '')
+        return {'magasins': [
+            {'shop_field': m.shop_field, 'nom': m.warehouse_id.name or m.shop_label or m.shop_field}
+            for m in mappings
+        ]}
+
     @http.route('/mavie/api/solde-operation', type='json', auth='user',
                 methods=['POST'], csrf=False)
     def api_solde_operation(self, **kw):
@@ -12286,7 +12591,7 @@ class MaVieDashboardController(http.Controller):
             param = request.env['ir.config_parameter'].sudo()
             action = (kw.get('action') or 'lire').strip()
             if action == 'effacer':
-                for suffixe in ('_nom', '_debut', '_fin', '_categories'):
+                for suffixe in ('_nom', '_debut', '_fin', '_categories', '_magasins'):
                     param.set_param(self.CLE_OPERATION + suffixe, '')
                 _logger.info("Operation de soldes effacee par %s",
                              request.env.user.login)
@@ -12305,6 +12610,9 @@ class MaVieDashboardController(http.Controller):
                 param.set_param(self.CLE_OPERATION + '_fin', fin)
                 categories = [int(c) for c in (kw.get('categories') or []) if str(c).isdigit()]
                 param.set_param(self.CLE_OPERATION + '_categories', ','.join(str(c) for c in categories))
+                champs_valides = set(self._get_active_shop_mappings().mapped('shop_field'))
+                magasins = [m for m in (kw.get('magasins') or []) if m in champs_valides]
+                param.set_param(self.CLE_OPERATION + '_magasins', ','.join(magasins))
                 _logger.info("Operation de soldes « %s » du %s au %s, par %s",
                              nom, debut, fin or 'sans fin', request.env.user.login)
             elif action != 'lire':
@@ -12411,6 +12719,11 @@ class MaVieDashboardController(http.Controller):
                     continue
                 magasins = [w for w in prog.pos_config_ids.mapped('warehouse_id.name') if w]
                 tmpls = prog.rule_ids.product_ids.mapped('product_tmpl_id')
+                # Le nom de l'opération (ex. « black friday »), posé entre
+                # crochets par _solde_creer_promotion — vide pour une solde
+                # normale, sans opération déclarée.
+                m_operation = re.search(r'\[([^\]]+)\]\s*$', prog.name or '')
+                operation_nom = m_operation.group(1) if m_operation else ''
                 for tmpl in tmpls:
                     ratio = self._solde_tax_ratio(tmpl, prog.company_id)
                     catalogue = round(float(tmpl.list_price or 0) * ratio, 2)
@@ -12423,6 +12736,7 @@ class MaVieDashboardController(http.Controller):
                         'warehouse_ids': warehouse_ids,
                         'societes': [prog.company_id.name] if prog.company_id else [],
                         'liste': prog.name,
+                        'operation': operation_nom,
                         'prix_catalogue': catalogue,
                         'prix_solde': prix_ttc,
                         'remise': remise_pct,
@@ -12510,6 +12824,7 @@ class MaVieDashboardController(http.Controller):
                     'partagee': len(magasins) > 1,
                     'societe': ', '.join(e['societes']),
                     'liste': e['liste'],
+                    'operation': e.get('operation') or '',
                     'prix_catalogue': e['prix_catalogue'],
                     'prix_solde': e['prix_solde'],
                     'remise': e['remise'],
@@ -12763,7 +13078,9 @@ class MaVieDashboardController(http.Controller):
 
             resultats = []
             faits = magasins_total = 0
-            op_categories = self._solde_operation().get('categories') or []
+            op = self._solde_operation()
+            op_categories = op.get('categories') or []
+            op_magasins = set(op.get('magasins') or [])
             for ligne in lignes:
                 try:
                     aid = int(ligne.get('article_id') or 0)
@@ -12793,6 +13110,11 @@ class MaVieDashboardController(http.Controller):
                 if choisis:
                     garde = set(choisis)
                     cibles = [m for m in cibles if m['shop_field'] in garde]
+                # L'opération peut elle-même être restreinte à certains
+                # magasins (comme ses catégories) : une remise ne doit pas
+                # déborder sur un magasin hors de sa portée déclarée.
+                if op_magasins:
+                    cibles = [m for m in cibles if m['shop_field'] in op_magasins]
                 if not cibles or prix <= 0:
                     resultats.append({
                         'article_id': aid, 'reference': ctx.get('reference') or nom,
@@ -13891,9 +14213,18 @@ class MaVieDashboardController(http.Controller):
     # ─────────────────────────────────────────────────────────────
 
     def _promo_pourcentage(self, catalogue_ttc, prix_ttc):
+        # DEMANDE UTILISATRICE (2026-10-14) : « supprime cette partie de
+        # virgule comme dans la page de proposition » — le pourcentage
+        # affiché en caisse (« 50.14% sur produits spécifiques ») venait de
+        # ce calcul en 2 décimales, dérivé du prix soldé arrondi à un prix
+        # psychologique plutôt que d'un pourcentage rond. Arrondi à l'entier
+        # pour rester cohérent avec les pourcentages entiers affichés
+        # partout ailleurs (Propositions, Action) — le prix réellement
+        # appliqué en caisse peut donc s'écarter de quelques centimes du
+        # prix soldé proposé à l'écran.
         if catalogue_ttc <= 0:
             return None
-        return round(max(0.0, (1 - prix_ttc / catalogue_ttc)) * 100, 2)
+        return round(max(0.0, (1 - prix_ttc / catalogue_ttc)) * 100)
 
     def _solde_creer_promotion(self, tmpl, variantes, prix_ttc, plan, date_start, date_end, couleur):
         """Une promotion par société concernée, limitée aux caisses des
@@ -13916,6 +14247,18 @@ class MaVieDashboardController(http.Controller):
         # recréer un à chaque réapplication — sinon Remise & Fidélité se
         # remplit d'un programme par clic sur « Appliquer ».
         prefixe_nom = 'Solde %s —' % libelle
+        # DEMANDE UTILISATRICE (2026-10-14) : « je dois avoir le nom de
+        # l'opération, pour séparer les soldes normales ou bien les
+        # opérations » — le nom de l'opération en cours (ex. « black
+        # friday ») est ajouté entre crochets à la fin du nom du programme ;
+        # le journal (api_soldes_journal) le relit pour l'afficher à part.
+        # Le préfixe stable ci-dessus reste inchangé, donc la recherche de
+        # réutilisation plus bas continue de fonctionner même si le suffixe
+        # change d'une opération à l'autre.
+        operation = self._solde_operation()
+        op_nom = (operation.get('nom') or '').strip() if (
+            operation.get('active') and not operation.get('terminee')) else ''
+        suffixe_operation = ' [%s]' % op_nom if op_nom else ''
         for company, data in par_societe.items():
             ratio = data['ratio']
             catalogue_ht = min(variantes.mapped('lst_price')) if variantes else tmpl.list_price
@@ -13935,17 +14278,33 @@ class MaVieDashboardController(http.Controller):
             }
             if programme:
                 vals_programme['pos_config_ids'] = [(6, 0, (programme.pos_config_ids | data['configs']).ids)]
+                # Le suffixe d'opération est réécrit à chaque réapplication :
+                # une référence réappliquée hors opération retrouve un nom
+                # sans crochets, une réappliquée pendant une opération prend
+                # (ou change) son étiquette.
+                nom_sans_operation = re.sub(r'\s*\[[^\]]*\]\s*$', '', programme.name or '').rstrip()
+                vals_programme['name'] = nom_sans_operation + suffixe_operation
                 programme.write(vals_programme)
                 if programme.rule_ids:
                     programme.rule_ids[0].write({'product_ids': [(6, 0, variantes.ids)]})
                 if programme.reward_ids:
-                    programme.reward_ids[0].write({
+                    reward = programme.reward_ids[0]
+                    reward.write({
                         'discount': pct,
                         'discount_product_ids': [(6, 0, variantes.ids)],
                     })
+                    # BUG CORRIGÉ (2026-10-14) : constaté en caisse — le
+                    # pourcentage réellement appliqué était bien le nouveau
+                    # (le montant déduit correspondait), mais le libellé
+                    # affiché sur le ticket (« description », stocké) restait
+                    # celui de l'ancienne remise après une réapplication. Le
+                    # recalcul automatique d'Odoo sur ce champ ne se
+                    # déclenche pas de façon fiable ici ; on le force.
+                    reward._compute_description()
             else:
                 vals_programme.update({
-                    'name': '%s %s' % (prefixe_nom, (date_start or fields.Date.today().isoformat())),
+                    'name': '%s %s%s' % (prefixe_nom, (date_start or fields.Date.today().isoformat()),
+                                         suffixe_operation),
                     'program_type': 'promotion',
                     'applies_on': 'current',
                     'trigger': 'auto',

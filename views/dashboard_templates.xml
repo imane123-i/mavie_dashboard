@@ -191,6 +191,11 @@
                 }
                 .filter-multi-list label:hover { background: #F8FAFC; }
                 .filter-multi-list input { cursor: pointer; }
+                .filter-multi-group-label {
+                    font-size: 0.72rem; font-weight: 700; color: #94A3B8;
+                    text-transform: uppercase; letter-spacing: 0.02em;
+                    padding: 8px 6px 2px; border-top: 1px solid #F1F5F9; margin-top: 4px;
+                }
 
                 .filter-group select {
                     appearance: none;
@@ -2450,9 +2455,26 @@
 
                     <div class="filter-group">
                         <label>🏪 Magasin</label>
-                        <select id="filter-magasin">
-                            <option value="">Tous les magasins</option>
-                        </select>
+                        <!-- Plusieurs magasins peuvent être cochés (demande
+                             du 2026-10-15), même menu que Catégorie : rien
+                             ne se recalcule tant qu'on n'a pas cliqué
+                             Appliquer (ou fermé le menu). -->
+                        <div class="filter-multi" id="filter-shop-wrap">
+                            <button type="button" class="filter-multi-btn" id="filter-shop-btn">
+                                Tous les magasins
+                            </button>
+                            <div class="filter-multi-panel" id="filter-shop-panel">
+                                <div class="filter-multi-actions">
+                                    <button type="button" id="filter-shop-all">Tout cocher</button>
+                                    <button type="button" id="filter-shop-none">Tout décocher</button>
+                                </div>
+                                <div class="filter-multi-list" id="filter-shop-list"></div>
+                                <div class="filter-multi-foot">
+                                    <span id="filter-shop-hint">Cochez, puis Appliquer</span>
+                                    <button type="button" id="filter-shop-apply">Appliquer</button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="filter-group">
@@ -2824,17 +2846,6 @@
                     <div id="product-search-results" class="search-results"></div>
                 </div>
 
-                <!-- ══════════ MIDDLE SECTION FOR STOCK PAGE ══════════ -->
-                <div class="section-card full-width" id="stock-middle-section" style="display:none; padding:24px; margin-bottom:20px;">
-                    <!-- Alertes Stock -->
-                    <div class="section-title" style="font-weight:700; font-size:1rem; color:#0F172A; display:flex; align-items:center; gap:8px;">
-                        <span style="color:#EF4444; font-size:1.2rem;">●</span> Alertes stock
-                    </div>
-                    <div id="stock-alerts-list" class="stock-alerts-container" style="display:flex; flex-direction:column; gap:12px; margin-top:16px;">
-                        <!-- Populated by JS -->
-                    </div>
-                </div>
-
                 <!-- ══════════ RUPTURE SOUS 30 JOURS ══════════ -->
                 <div class="section-card full-width" id="stock-30j-section" style="display:none; padding:24px; margin-bottom:20px;">
                     <div class="section-header-row" style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; flex-wrap:wrap; gap:12px;">
@@ -3194,6 +3205,10 @@
                         <label class="rx-field">
                             <span class="rx-field-label">Catégories <span class="rx-help-inline">(vide = toutes ; Ctrl + clic pour en choisir plusieurs)</span></span>
                             <span class="rx-input"><div id="sp-op-categ" class="sp-op-categ-liste"></div></span>
+                        </label>
+                        <label class="rx-field">
+                            <span class="rx-field-label">Magasins <span class="rx-help-inline">(vide = tous ; Ctrl + clic pour en choisir plusieurs)</span></span>
+                            <span class="rx-input"><div id="sp-op-magasins" class="sp-op-categ-liste"></div></span>
                         </label>
                         <div class="sp-op-actions">
                             <button type="button" class="rx-btn rx-btn-primary" id="btn-sp-op-ok">Enregistrer</button>
@@ -4126,8 +4141,8 @@
                         <table style="width:100%; border-collapse:collapse;">
                             <thead>
                                 <tr style="border-bottom:2px solid #E2E8F0; text-align:left; background:#F1F5F9; position:sticky; top:0; z-index:10;">
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Photo</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Réf</th>
-                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Désignation / Article</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;" title="Magasin où cette référence n'a plus bougé depuis le plus longtemps, avec la quantité qui s'y trouve — c'est là que le stock est réellement bloqué. Survolez une ligne pour voir la répartition dans les autres magasins.">Magasin le plus figé</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;" title="Stock total de la référence sur TOUT le réseau, pas seulement dans le magasin principal indiqué à gauche.">Stock total réseau</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;" title="Pièces vendues en caisse sur les 90 derniers jours. 0 = la référence n'a rien vendu du tout.">Vendu 90 j</th>
@@ -4223,8 +4238,8 @@
                         <table style="width:100%; border-collapse:collapse;">
                             <thead>
                                 <tr style="border-bottom:2px solid #E2E8F0; text-align:left; background:#F1F5F9; position:sticky; top:0; z-index:10;">
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Photo</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Réf</th>
-                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Produit</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Société</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Magasin</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Achat au dépôt</th>

@@ -45,6 +45,15 @@ var state = {
     filters_loaded: false,
     shops: [],
     proches_rupture_30j_cache: [],
+    // DEMANDE UTILISATRICE (2026-10-23) : page « Tableau de bord » unifiée
+    // (Stock & ruptures + Propositions + Dépôt sur un seul écran), avec
+    // retour instantané à l'affichage classique — jamais activée par
+    // défaut, choix mémorisé par navigateur (pas de compte à gérer côté
+    // serveur pour ça).
+    vueUnifiee: (function() {
+        try { return localStorage.getItem('mavie_vue_unifiee') === '1'; }
+        catch (e) { return false; }
+    })(),
     detail: {
         article_id: null,
         shop_field: null,
@@ -65,6 +74,11 @@ var state = {
         // nécessaires — voir _createTransferFromMatrix).
         group_ref: null,
         group_count: 0,
+        // DEMANDE UTILISATRICE (2026-10-24) : « transférer tout » une
+        // Collection/Catégorie/Couleur choisie dans le regroupement en
+        // chaîne, pas une seule référence. null = mode normal (inchangé) ;
+        // {ids, label, count} = mode groupe (voir _trChainGroupBanner).
+        group: null,
     },
     colorDetail: {
         article_id: null,
@@ -88,7 +102,7 @@ var lastSoldesCount = 0;
 var lastEcartsRefsCount = 0;
 var lastEcartsList = [];
 // Historique transferts / soldes affiché sous les cartes.
-var lastHistory = { transfers: [], soldes: [] };
+var lastHistory = { transfers: [], reassort: [], soldes: [] };
 var historyTab = 'transferts';
 // Historique d'UNE référence, ouvert depuis la fiche produit.
 var lastProductHistory = { transfers: [], soldes: [] };
@@ -104,7 +118,7 @@ var _searchDebounce = null;
 // résultat correct. D'où le "parfois ça marche, parfois non".
 // On numérote chaque appel et on ignore toute réponse qui n'est plus la
 // dernière demandée.
-var _reqSeq = { kpis: 0, salesDaily: 0, history: 0, productHistory: 0 };
+var _reqSeq = { kpis: 0, salesDaily: 0, achatsDaily: 0, history: 0, productHistory: 0 };
 
 function el(id) { return document.getElementById(id); }
 
@@ -117,6 +131,17 @@ function formatMAD(n) {
     if (!n && n !== 0) return '— MAD';
     n = Math.round(n * 100) / 100;
     return n.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' MAD';
+}
+
+// Version courte pour les étiquettes de valeur au-dessus des barres de
+// graphique (ex. « 12,3k MAD ») — formatMAD seul serait trop large pour
+// tenir au-dessus d'une barre de 34px.
+function formatMADCompact(n) {
+    if (!n && n !== 0) return '—';
+    var abs = Math.abs(n);
+    if (abs >= 1000000) return (n / 1000000).toLocaleString('fr-FR', { maximumFractionDigits: 1 }) + 'M';
+    if (abs >= 1000) return (n / 1000).toLocaleString('fr-FR', { maximumFractionDigits: 1 }) + 'k';
+    return Math.round(n).toLocaleString('fr-FR');
 }
 
 function formatPct(n) {
@@ -432,6 +457,7 @@ function updateFiltersFromUI() {
     state.flop_limit    = (flopLimitEl && flopLimitEl.value && !isNaN(parseInt(flopLimitEl.value))) ? Math.max(1, parseInt(flopLimitEl.value)) : 10;
     state.top_couleurs_limit  = (topCouleursLimitEl && topCouleursLimitEl.value && !isNaN(parseInt(topCouleursLimitEl.value))) ? Math.max(1, parseInt(topCouleursLimitEl.value)) : 10;
     state.flop_couleurs_limit = (flopCouleursLimitEl && flopCouleursLimitEl.value && !isNaN(parseInt(flopCouleursLimitEl.value))) ? Math.max(1, parseInt(flopCouleursLimitEl.value)) : 10;
+    _sauvegarderFiltres();
 }
 
 // ── Filtre Catégorie : menu à cocher ───────────────────────────────────
@@ -696,6 +722,115 @@ function getFilterParams() {
     };
 }
 
+// ── Mémorisation des filtres entre les pages (DEMANDE UTILISATRICE
+// 2026-10-26, point 1 de l'audit UX : « changer de page remet tous les
+// filtres à zéro ») ─────────────────────────────────────────────────────
+// Chaque page du menu (Tableau de bord, Stock & ruptures, Action,
+// Propositions, Suivi) est une action Odoo séparée qui recharge un
+// IFRAME tout neuf (voir dashboard_action.js) : rien ne survit en mémoire
+// d'une page à l'autre. On mémorise donc Magasin/Catégorie/Collection/
+// Batch/Période/limites Top-Flop dans localStorage (même mécanisme déjà
+// utilisé pour mavie_vue_unifiee), et on les réapplique silencieusement
+// à l'ouverture de CHAQUE page — exactement comme si les filtres avaient
+// vraiment survécu au changement de page.
+var FILTRES_STORAGE_KEY = 'mavie_filtres_actifs';
+
+function _sauvegarderFiltres() {
+    try {
+        var periodTypeEl = el('filter-period-type');
+        localStorage.setItem(FILTRES_STORAGE_KEY, JSON.stringify({
+            collection_id: state.collection_id,
+            categ_ids: state.categ_ids || [],
+            batch_id: state.batch_id,
+            shop_fields: state.shop_fields || [],
+            date_start: state.date_start,
+            date_end: state.date_end,
+            period_type: periodTypeEl ? periodTypeEl.value : 'all',
+            period_month: (el('filter-period-month') || {}).value || '',
+            period_month_year: (el('filter-period-month-year') || {}).value || '',
+            period_week: (el('filter-period-week') || {}).value || '',
+            period_year: (el('filter-period-year') || {}).value || '',
+            top_limit: state.top_limit,
+            flop_limit: state.flop_limit,
+            top_couleurs_limit: state.top_couleurs_limit,
+            flop_couleurs_limit: state.flop_couleurs_limit,
+        }));
+    } catch (e) { /* navigation privée, stockage bloqué : on continue sans */ }
+}
+
+function _filtresSauvegardes() {
+    try {
+        var brut = localStorage.getItem(FILTRES_STORAGE_KEY);
+        return brut ? JSON.parse(brut) : null;
+    } catch (e) { return null; }
+}
+
+// Appliqué une fois les listes déroulantes/cases à cocher remplies par
+// loadFilters() — DOIT tourner avant le premier appel à loadKPIs(), car
+// loadKPIs() commence par updateFiltersFromUI() qui relit le DOM : poser
+// `state.*` directement sans d'abord poser les valeurs DOM serait écrasé
+// aussitôt (collection/catégorie/batch/période/limites viennent du DOM ;
+// seuls shop_fields/categ_ids sont posés directement ici par _majMagasins/
+// _majCategories, voir le commentaire dans updateFiltersFromUI).
+function _restaurerFiltresDOM() {
+    var f = _filtresSauvegardes();
+    if (!f) return;
+
+    var colEl = el('filter-collection');
+    if (colEl && f.collection_id) colEl.value = f.collection_id;
+    var batEl = el('filter-batch');
+    if (batEl && f.batch_id) batEl.value = f.batch_id;
+
+    var magListe = el('filter-shop-list');
+    if (magListe && f.shop_fields && f.shop_fields.length) {
+        var magChoisis = {};
+        f.shop_fields.forEach(function(v) { magChoisis[v] = true; });
+        Array.prototype.forEach.call(magListe.querySelectorAll('input'), function(cb) {
+            cb.checked = !!magChoisis[cb.value];
+        });
+        _majMagasins();
+        _shopSelectionOuverture = (state.shop_fields || []).join(',');
+    }
+
+    var catListe = el('filter-category-list');
+    if (catListe && f.categ_ids && f.categ_ids.length) {
+        var catChoisies = {};
+        f.categ_ids.forEach(function(v) { catChoisies[v] = true; });
+        Array.prototype.forEach.call(catListe.querySelectorAll('input'), function(cb) {
+            cb.checked = !!catChoisies[cb.value];
+        });
+        _majCategories();
+        _categSelectionOuverture = (state.categ_ids || []).join(',');
+    }
+
+    if (f.period_type) {
+        var typeEl = el('filter-period-type');
+        if (typeEl) typeEl.value = f.period_type;
+        var monthEl = el('filter-period-month');
+        if (monthEl && f.period_month) monthEl.value = f.period_month;
+        var monthYearEl = el('filter-period-month-year');
+        if (monthYearEl && f.period_month_year) monthYearEl.value = f.period_month_year;
+        var weekEl = el('filter-period-week');
+        if (weekEl && f.period_week) weekEl.value = f.period_week;
+        var yearEl = el('filter-period-year');
+        if (yearEl && f.period_year) yearEl.value = f.period_year;
+        var startEl = el('filter-date-start');
+        if (startEl && f.date_start) startEl.value = f.date_start;
+        var endEl = el('filter-date-end');
+        if (endEl && f.date_end) endEl.value = f.date_end;
+        _updatePeriodVisibility();
+    }
+
+    var topLimitEl = el('top-limit');
+    if (topLimitEl && f.top_limit) topLimitEl.value = f.top_limit;
+    var flopLimitEl = el('flop-limit');
+    if (flopLimitEl && f.flop_limit) flopLimitEl.value = f.flop_limit;
+    var topCouleursLimitEl = el('top-couleurs-limit');
+    if (topCouleursLimitEl && f.top_couleurs_limit) topCouleursLimitEl.value = f.top_couleurs_limit;
+    var flopCouleursLimitEl = el('flop-couleurs-limit');
+    if (flopCouleursLimitEl && f.flop_couleurs_limit) flopCouleursLimitEl.value = f.flop_couleurs_limit;
+}
+
 // Seule page portant l'historique transferts/soldes : le "Tableau de bord"
 // (menu Dashboard → Tableau de bord, page=ventes), qui est aussi la page par
 // défaut et celle où s'affiche la vue MOD FOR LIFE.
@@ -703,10 +838,78 @@ function isHistoryPage() {
     return currentPage === 'ventes';
 }
 
+// DEMANDE UTILISATRICE (2026-10-23) : « les top/flop et tout ça qui
+// affiche trop de lignes doit afficher que 3 lignes, puis si je veux les
+// détails je modifie manuellement combien afficher ». Les champs
+// top-limit/flop-limit/top-couleurs-limit/flop-couleurs-limit/stock-30j-
+// limit existent déjà (modifiables à la main, comme avant) — on change
+// juste leur valeur de départ selon le mode, sans toucher à la page
+// Stock & ruptures classique (ses propres défauts restent 10).
+var VUE_UNIFIEE_LIMIT_IDS = ['top-limit', 'flop-limit', 'top-couleurs-limit', 'flop-couleurs-limit', 'stock-30j-limit'];
+function _appliquerLimitesVueUnifiee(on) {
+    VUE_UNIFIEE_LIMIT_IDS.forEach(function(id) {
+        var e = el(id);
+        if (e) e.value = on ? '3' : '10';
+    });
+}
+
+// Bouton « Vue unifiée » : visible seulement sur la page Tableau de bord
+// (page=ventes), reflète l'état actuel (texte + couleur).
+function _refreshVueUnifieeBouton() {
+    var btn = el('btn-vue-unifiee');
+    if (!btn) return;
+    btn.style.display = currentPage === 'ventes' ? '' : 'none';
+    btn.classList.toggle('on', !!state.vueUnifiee);
+    btn.textContent = state.vueUnifiee ? '↩ Revenir à l\'affichage classique' : '🧩 Vue unifiée';
+}
+
 function adjustUIForPage() {
+    _refreshVueUnifieeBouton();
+    // Par défaut masqués ; seule la branche « vue unifiée » ci-dessous les
+    // réaffiche. Évite qu'ils restent visibles après un retour à
+    // l'affichage classique (state.vueUnifiee passé à false sans reload).
+    ['vu-title-stock', 'vu-title-propositions'].forEach(function(id) {
+        var e = el(id); if (e) e.style.display = 'none';
+    });
+    var titreInterneProp = el('propositions-inner-title');
+    if (titreInterneProp) titreInterneProp.style.display = '';
+    var vuNav = el('vu-nav');
+    if (vuNav) vuNav.style.display = 'none';
     // ── Bascule entre l'ancien tableau de bord et le nouveau "Stock & Rupture" ──
     var stockOnlyIds  = ['stock-kpi-grid', 'stock-middle-section', 'stock-30j-section', 'stock-valorisation-section'];
     var legacyOnlyIds = ['main-kpi-grid', 'section-top-flop', 'section-top-flop-couleurs'];
+
+    // DEMANDE UTILISATRICE (2026-10-23) : page « Tableau de bord » unifiée
+    // — Stock & ruptures, Propositions (Soldes + Transferts) et la vue
+    // Dépôt réunis sur un seul écran, pour décider sans naviguer entre
+    // plusieurs pages. N'affecte QUE la page Ventes, et seulement quand le
+    // bouton de bascule a été activé (state.vueUnifiee) ; les pages Stock
+    // & ruptures / Action / Propositions / Suivi restent inchangées et
+    // continuent de fonctionner normalement en direct.
+    if (currentPage === 'ventes' && state.vueUnifiee) {
+        legacyOnlyIds.forEach(function(id) { var e = el(id); if (e) e.style.display = ''; });
+        stockOnlyIds.forEach(function(id)  { var e = el(id); if (e) e.style.display = ''; });
+        var actionPageU = el('action-page');
+        if (actionPageU) actionPageU.style.display = 'none';
+        var suiviPageU = el('suivi-page');
+        if (suiviPageU) suiviPageU.style.display = 'none';
+        var propositionsPageU = el('propositions-page');
+        if (propositionsPageU) propositionsPageU.style.display = '';
+        // Onglets exclusifs comme sur la page Propositions autonome :
+        // un seul à la fois, même en vue unifiée.
+        _prOnglet(prOnglet);
+        var vuTitreStock = el('vu-title-stock');
+        if (vuTitreStock) vuTitreStock.style.display = '';
+        var vuTitrePropositions = el('vu-title-propositions');
+        if (vuTitrePropositions) vuTitrePropositions.style.display = '';
+        if (titreInterneProp) titreInterneProp.style.display = 'none';
+        if (vuNav) vuNav.style.display = '';
+        var historySectionU = el('history-section');
+        if (historySectionU) historySectionU.style.display = '';
+        var sbUni = document.querySelector('.search-bar-wrapper');
+        if (sbUni) sbUni.style.display = '';
+        return;
+    }
 
     if (currentPage === 'stock') {
         stockOnlyIds.forEach(function(id)  { var e = el(id); if (e) e.style.display = ''; });
@@ -738,7 +941,7 @@ function adjustUIForPage() {
     if (currentPage === 'suivi') {
         ['main-kpi-grid', 'stock-kpi-grid', 'section-top-flop', 'section-top-flop-couleurs', 'stock-middle-section',
          'stock-30j-section', 'stock-valorisation-section', 'section-abc', 'section-sales-chart',
-         'modforlife-kpi-grid', 'history-section', 'action-page'].forEach(function(id) {
+         'section-achats-chart', 'modforlife-kpi-grid', 'history-section', 'action-page'].forEach(function(id) {
             var e = el(id); if (e) e.style.display = 'none';
         });
         var sbU = document.querySelector('.search-bar-wrapper');
@@ -751,9 +954,14 @@ function adjustUIForPage() {
     var propositionsPage = el('propositions-page');
     if (propositionsPage) propositionsPage.style.display = currentPage === 'propositions' ? '' : 'none';
     if (currentPage === 'propositions') {
+        // Réaffirme l'exclusivité normale des deux onglets : si la vue
+        // unifiée du Tableau de bord les a laissés tous les deux visibles
+        // (_prShowBoth), revenir sur cette page sans ça les laisserait
+        // tous les deux affichés l'un sous l'autre.
+        _prOnglet(prOnglet);
         ['main-kpi-grid', 'stock-kpi-grid', 'section-top-flop', 'section-top-flop-couleurs', 'stock-middle-section',
          'stock-30j-section', 'stock-valorisation-section', 'section-abc', 'section-sales-chart',
-         'modforlife-kpi-grid', 'history-section', 'action-page'].forEach(function(id) {
+         'section-achats-chart', 'modforlife-kpi-grid', 'history-section', 'action-page'].forEach(function(id) {
             var e = el(id); if (e) e.style.display = 'none';
         });
         var sbS = document.querySelector('.search-bar-wrapper');
@@ -763,7 +971,7 @@ function adjustUIForPage() {
     if (currentPage === 'action') {
         ['main-kpi-grid', 'stock-kpi-grid', 'section-top-flop', 'section-top-flop-couleurs', 'stock-middle-section',
          'stock-30j-section', 'stock-valorisation-section', 'section-abc', 'section-sales-chart',
-         'modforlife-kpi-grid', 'history-section'].forEach(function(id) {
+         'section-achats-chart', 'modforlife-kpi-grid', 'history-section'].forEach(function(id) {
             var e = el(id); if (e) e.style.display = 'none';
         });
         var sb = document.querySelector('.search-bar-wrapper');
@@ -782,7 +990,8 @@ function adjustUIForPage() {
             'card-sell-through': 'block',
             'card-ruptures': 'none',
             'section-abc': 'block',
-            'section-sales-chart': 'block'
+            'section-sales-chart': 'block',
+            'section-achats-chart': 'block'
         },
         stock: {
             'card-ca-total': 'none',
@@ -794,7 +1003,8 @@ function adjustUIForPage() {
             'card-sell-through': 'block',
             'card-ruptures': 'block',
             'section-abc': 'none',
-            'section-sales-chart': 'none'
+            'section-sales-chart': 'none',
+            'section-achats-chart': 'none'
         },
         commandes: {
             'card-ca-total': 'none',
@@ -806,7 +1016,8 @@ function adjustUIForPage() {
             'card-sell-through': 'none',
             'card-ruptures': 'none',
             'section-abc': 'none',
-            'section-sales-chart': 'none'
+            'section-sales-chart': 'none',
+            'section-achats-chart': 'none'
         }
     };
 
@@ -854,6 +1065,12 @@ async function loadKPIs() {
         loadSuivi();
         return;
     }
+    // Vue unifiée (Tableau de bord) : en plus des KPI/stock ci-dessous, on
+    // charge aussi les Propositions (Soldes + Transferts) — sans attendre,
+    // les deux appels partent en parallèle.
+    if (state.vueUnifiee && currentPage === 'ventes') {
+        loadPropositions();
+    }
     showLoading(true);
 
     var seq = ++_reqSeq.kpis;
@@ -889,9 +1106,25 @@ async function loadKPIs() {
     var mflGrid = el('modforlife-kpi-grid');
     if (mflGrid) mflGrid.style.display = 'none';
     _placeSearchBar(false);
+    // Retour à la normale pour la barre de navigation rapide, si on
+    // quitte la vue Dépôt (voir le retargetage fait dans
+    // _renderModForLifeDashboard).
+    var vuNavKpiNormal = el('vu-nav-kpi');
+    if (vuNavKpiNormal) vuNavKpiNormal.setAttribute('data-vu-cible', 'main-kpi-grid');
+    var vuNavStockNormal = el('vu-nav-stock');
+    if (vuNavStockNormal) vuNavStockNormal.style.display = '';
 
-    if (currentPage === 'stock') {
+    // BUG CORRIGÉ (2026-10-23, repéré par l'utilisatrice : « la partie
+    // rupture est vide, il ne contient pas les données ») : en vue
+    // unifiée, le bloc Stock & Ruptures était rendu VISIBLE mais jamais
+    // REMPLI — seul currentPage === 'stock' déclenchait son rendu, et la
+    // vue unifiée reste sur currentPage === 'ventes'.
+    if (currentPage === 'stock' || (state.vueUnifiee && currentPage === 'ventes')) {
         _renderStockDashboard(data);
+    }
+    if (currentPage === 'stock') {
+        // rien de plus : la page Stock & ruptures n'affiche pas les KPI
+        // ventes classiques.
     } else {
         var kpiMap = {
             'kpi-ca-total':      formatMAD(data.ca_total),
@@ -998,6 +1231,10 @@ async function loadKPIs() {
         if (currentPage === 'ventes') {
             _renderABC(data.abc_analysis);
             loadSalesDaily();
+            // DEMANDE UTILISATRICE (2026-10-24) : « fait à côté graphe de
+            // CA achat » — le même graphique que CA par Arrivage, côté
+            // achat au lieu de vente.
+            loadAchatsDaily();
         }
     }
 }
@@ -1033,13 +1270,28 @@ function _renderModForLifeDashboard(data) {
     var idsToHide = [
         'main-kpi-grid', 'stock-kpi-grid', 'section-top-flop', 'section-top-flop-couleurs',
         'stock-middle-section', 'stock-30j-section', 'stock-valorisation-section',
-        'section-abc', 'section-sales-chart',
+        'section-abc', 'section-sales-chart', 'section-achats-chart',
+        // Vue unifiée : le titre de section « Stock & Ruptures » n'a pas
+        // sa place ici, son contenu est masqué juste au-dessus.
+        'vu-title-stock',
     ];
     idsToHide.forEach(function(id) { var e = el(id); if (e) e.style.display = 'none'; });
 
     var grid = el('modforlife-kpi-grid');
     if (grid) grid.style.display = '';
     _placeSearchBar(true);
+
+    // BUG CORRIGÉ (2026-10-24, repéré par l'utilisatrice : « quand je
+    // switch au dépôt... il marche pas ») : en vue unifiée, la barre de
+    // navigation rapide pointait toujours vers main-kpi-grid / le titre
+    // Stock & Ruptures — tous les deux masqués ici puisque la vue Dépôt
+    // affiche sa propre grille. Le lien KPI pointe maintenant vers la
+    // grille Dépôt, et le lien Stock & Ruptures (inapplicable au dépôt,
+    // qui n'est pas un magasin) est masqué tant qu'on reste sur cette vue.
+    var vuNavKpi = el('vu-nav-kpi');
+    if (vuNavKpi) vuNavKpi.setAttribute('data-vu-cible', 'modforlife-kpi-grid');
+    var vuNavStock = el('vu-nav-stock');
+    if (vuNavStock) vuNavStock.style.display = 'none';
 
     // Vue en PIÈCES (décision utilisateur du 2026-08-19) : une conversion en
     // cartons avait été ajoutée puis retirée, faute de donnée en base disant
@@ -1773,7 +2025,7 @@ function _renderProductTable(tbodyId, products, isFlop) {
     if (!products || products.length === 0) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 9;
+        td.colSpan = 8;
         td.textContent = 'Aucun produit';
         td.style.textAlign = 'center';
         td.style.color = '#999';
@@ -1795,13 +2047,11 @@ function _renderProductTable(tbodyId, products, isFlop) {
 
         tr.appendChild(_photoCell(p));
 
-        var tdName = document.createElement('td');
-        tdName.textContent = p.name;
-        tr.appendChild(tdName);
-
         var tdRef = document.createElement('td');
         tdRef.textContent = p.ref || '—';
-        tdRef.style.color = '#64748B';
+        tdRef.style.color = '#0F172A';
+        tdRef.style.fontWeight = '600';
+        tdRef.title = p.name || '';
         tr.appendChild(tdRef);
 
         // Ordre demandé : CA Achat (HT), Qté achetée, Qté vendue, Reste.
@@ -1904,6 +2154,8 @@ var SHOP_CHART_COLORS = [
 
 var lastSalesDailyData = null;
 var salesChartMode = 'arrivage';
+var lastAchatsDailyData = null;
+var achatsChartMode = 'arrivage';
 
 function _showChartTooltip(e, html) {
     var tip = el('chart-tooltip');
@@ -1955,6 +2207,74 @@ function _renderSalesChart() {
     } else {
         _renderSalesChartByArrivage(chartDiv, data.daily || []);
     }
+
+    // BUG CORRIGÉ (2026-10-22) : « Non rattaché » (articles sans arrivage)
+    // n'est plus une barre du graphique — il écrasait les vrais arrivages
+    // sur l'échelle commune (jusqu'à 27x plus gros, vérifié sur Elite).
+    // Affiché à part pour que le total reste visible sans rendre le reste
+    // illisible.
+    var nrEl = el('sales-daily-non-rattache');
+    if (nrEl) {
+        if (data.non_rattache && data.non_rattache.ca) {
+            nrEl.style.display = '';
+            nrEl.textContent = 'ℹ️ + ' + formatMAD(data.non_rattache.ca) + ' (' + formatNumber(data.non_rattache.qty)
+                + ' pièces) vendues sur des articles sans arrivage rattaché — non comparable, donc hors du graphique.';
+        } else {
+            nrEl.style.display = 'none';
+        }
+    }
+}
+
+// DEMANDE UTILISATRICE (2026-10-24) : « fait à côté graphe de CA achat »
+// — mêmes mécaniques que le graphique de vente ci-dessus (même format de
+// réponse serveur), on réutilise donc _renderSalesChartByArrivage et
+// _renderSalesChartByShop telles quelles (déjà génériques : elles ne
+// prennent que les éléments DOM et les données en paramètres).
+async function loadAchatsDaily() {
+    var seq = ++_reqSeq.achatsDaily;
+    var params = getFilterParams();
+    var data = await rpc('/mavie/api/achats-daily', params);
+    if (seq !== _reqSeq.achatsDaily) return;
+    if (!data || data.error) return;
+    lastAchatsDailyData = data;
+    _renderAchatsChart();
+}
+
+function setAchatsChartMode(mode) {
+    achatsChartMode = mode;
+    var arrBtn = el('achats-chart-mode-arrivage');
+    var shopBtn = el('achats-chart-mode-shop');
+    if (arrBtn) arrBtn.classList.toggle('active', mode === 'arrivage');
+    if (shopBtn) shopBtn.classList.toggle('active', mode === 'shop');
+    _renderAchatsChart();
+}
+
+function _renderAchatsChart() {
+    var chartDiv = el('achats-daily-chart');
+    var legendDiv = el('achats-daily-legend');
+    if (!chartDiv) return;
+    chartDiv.innerHTML = '';
+    if (legendDiv) { legendDiv.innerHTML = ''; legendDiv.style.display = 'none'; }
+
+    var data = lastAchatsDailyData;
+    if (!data) return;
+
+    if (achatsChartMode === 'shop') {
+        _renderSalesChartByShop(chartDiv, legendDiv, data.by_shop || []);
+    } else {
+        _renderSalesChartByArrivage(chartDiv, data.daily || []);
+    }
+
+    var nrEl = el('achats-daily-non-rattache');
+    if (nrEl) {
+        if (data.non_rattache && data.non_rattache.ca) {
+            nrEl.style.display = '';
+            nrEl.textContent = 'ℹ️ + ' + formatMAD(data.non_rattache.ca) + ' (' + formatNumber(data.non_rattache.qty)
+                + ' pièces) achetées sur des articles sans arrivage rattaché — non comparable, donc hors du graphique.';
+        } else {
+            nrEl.style.display = 'none';
+        }
+    }
 }
 
 function _renderSalesChartByArrivage(chartDiv, daily) {
@@ -1972,6 +2292,11 @@ function _renderSalesChartByArrivage(chartDiv, daily) {
 
         var barInner = document.createElement('div');
         barInner.className = 'chart-bar-inner';
+
+        var valueLabel = document.createElement('div');
+        valueLabel.className = 'chart-bar-value';
+        valueLabel.textContent = formatMADCompact(d.ca);
+        barInner.appendChild(valueLabel);
 
         var barHeight = Math.max(((d.ca / maxCA) * 180), 4);
         var bar = document.createElement('div');
@@ -2030,6 +2355,11 @@ function _renderSalesChartByShop(chartDiv, legendDiv, byShop) {
         var barInner = document.createElement('div');
         barInner.className = 'chart-bar-inner';
 
+        var valueLabel = document.createElement('div');
+        valueLabel.className = 'chart-bar-value';
+        valueLabel.textContent = formatMADCompact(totalCA);
+        barInner.appendChild(valueLabel);
+
         var stack = document.createElement('div');
         stack.className = 'chart-bar-stack';
         var stackHeight = Math.max(((totalCA / maxCA) * 180), 4);
@@ -2061,16 +2391,29 @@ function _renderSalesChartByShop(chartDiv, legendDiv, byShop) {
     });
 
     if (legendDiv) {
+        // DEMANDE UTILISATRICE (2026-10-22, « normalement j'ai 7 magasins
+        // pas 6 ») : le backend liste désormais tous les magasins connus
+        // pour chaque arrivage, y compris ceux à 0 (qui n'ont rien vendu
+        // dessus) — la légende les montre tous, ceux à 0 grisés, plutôt
+        // que de les faire disparaître comme avant.
+        var caTotalByShop = {};
+        byShop.forEach(function(a) {
+            a.shops.forEach(function(s) {
+                caTotalByShop[s.shop] = (caTotalByShop[s.shop] || 0) + (s.ca || 0);
+            });
+        });
         legendDiv.style.display = 'flex';
         Object.keys(shopColorByName).forEach(function(shopName) {
+            var vide = !caTotalByShop[shopName];
             var item = document.createElement('div');
             item.className = 'chart-legend-item';
             var swatch = document.createElement('span');
             swatch.className = 'chart-legend-swatch';
-            swatch.style.background = shopColorByName[shopName];
+            swatch.style.background = vide ? '#E2E8F0' : shopColorByName[shopName];
             item.appendChild(swatch);
             var text = document.createElement('span');
-            text.textContent = shopName;
+            text.textContent = shopName + (vide ? ' (rien vendu ici)' : '');
+            if (vide) text.style.color = '#94A3B8';
             item.appendChild(text);
             legendDiv.appendChild(item);
         });
@@ -2081,6 +2424,13 @@ async function openDetail(articleId, productName, shopField) {
     var overlay = el('detail-overlay');
     if (!overlay) return;
     overlay.classList.add('active');
+
+    // DEMANDE UTILISATRICE (2026-10-22) : le regroupement à 5 listes dans
+    // tous les popups — choisir une variante ici relance la fiche sur la
+    // nouvelle référence.
+    _chainMonter('dt-chain', function(variante, chemin) {
+        if (chemin.reference) openDetail(chemin.reference.id, chemin.reference.label);
+    });
 
     var nameEl = el('detail-name');
     if (nameEl) nameEl.textContent = 'Chargement...';
@@ -2561,8 +2911,16 @@ function _renderVariants(tbodyId, variants, activeShop, hasBasePivotData) {
             tr.style.cursor = 'pointer';
             tr.title = 'Cliquer pour voir le stock de cette couleur dans chaque magasin';
             tr.onclick = function() {
+                // BUG CORRIGÉ (2026-10-23) : même lacune que Solder/Transférer
+                // depuis la fiche produit — ouvrait par-dessus sans fermer ni
+                // poser de retour.
                 var nameEl = el('detail-name');
-                openColorDetail(state.detail.article_id, nameEl ? nameEl.textContent : '', v.color);
+                var articleId = state.detail.article_id;
+                var shopField = state.detail.shop_field;
+                var nom = nameEl ? nameEl.textContent : '';
+                closeDetail();
+                _setRetour('color-detail-overlay', function() { openDetail(articleId, nom, shopField); });
+                openColorDetail(articleId, nom, v.color);
             };
         }
 
@@ -2727,19 +3085,100 @@ function closeDetail() {
 // ═══════════════════════════════════════════════════════════
 // EXTRACTION / TRANSFERT INTER-MAGASINS
 // ═══════════════════════════════════════════════════════════
-function openTransferPanel(articleId, productName, presetColor, targetShopField, couleurs) {
-    var overlay = el('transfer-overlay');
-    if (!overlay || !articleId) return;
+// DEMANDE UTILISATRICE (2026-10-24) : « si j'ai choisi Été 2026 je dois
+// avoir l'affichage de toute cette catégorie pour pouvoir la transférer
+// toute » / « si j'ai choisi la couleur blanc, tout ce qui est blanc ». Le
+// bandeau n'apparaît que si au moins un niveau (Collection/Catégorie/
+// Couleur) est posé ET qu'aucune Référence précise n'a encore été choisie
+// (sinon ce n'est plus un groupe, c'est le mode normal qui prend le relais
+// via onLeaf → Variante).
+function _chainGroupeResume(chemin) {
+    var morceaux = [];
+    if (chemin.collection) morceaux.push(chemin.collection.label);
+    if (chemin.categorie) morceaux.push(chemin.categorie.label);
+    if (chemin.couleur) morceaux.push('Couleur ' + chemin.couleur.label);
+    return morceaux.join(' + ');
+}
 
-    state.transfer.article_id = articleId;
-    state.transfer.article_name = productName || '';
-    state.transfer.color = presetColor || null;
+function _trChainGroupBanner(chemin, referenceItems) {
+    var banner = el('tr-chain-group-banner');
+    if (!banner) return;
+    var actif = !!(chemin.collection || chemin.categorie || chemin.couleur) && !chemin.reference;
+    if (!actif) {
+        banner.style.display = 'none';
+        banner.innerHTML = '';
+        return;
+    }
+    var n = (referenceItems || []).length;
+    var resume = _chainGroupeResume(chemin);
+    // Sécurité (2026-10-26) : dédoublonne au cas où la même référence
+    // apparaîtrait deux fois dans la liste — évite de créer deux fois le
+    // même document (transfert/solde/réassort) pour une seule référence.
+    var ids = Array.from(new Set((referenceItems || []).map(function(it) { return it.id; })));
+    banner.style.display = '';
+    banner.innerHTML = '<div style="margin:8px 0;padding:10px 12px;border-radius:8px;background:#EEF2FF;border:1px solid #C7D2FE;font-size:0.85rem;color:#3730A3;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
+        + '<span>📦 <b>' + formatNumber(n) + ' référence' + (n > 1 ? 's' : '') + '</b> correspond' + (n > 1 ? 'ent' : '') + ' à ' + _escapeHtml(resume) + '</span>'
+        + '<span style="margin-left:auto;display:flex;gap:8px;">'
+        + '<button type="button" id="tr-btn-group-cancel" style="background:#fff;color:#4F46E5;border:1px solid #C7D2FE;border-radius:6px;padding:6px 12px;font-size:0.82rem;font-weight:600;cursor:pointer;">Annuler</button>'
+        + '<button type="button" id="tr-btn-group-all" style="background:#4F46E5;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:0.82rem;font-weight:600;cursor:pointer;" ' + (n === 0 ? 'disabled' : '') + '>Transférer tout le groupe</button>'
+        + '</span></div>';
+    var btn = el('tr-btn-group-all');
+    if (btn) btn.addEventListener('click', function() {
+        // BUG CORRIGÉ (2026-10-26, repéré par l'utilisatrice : « normalement
+        // je dois avoir que le blanc à transférer ») : la couleur choisie
+        // pour FORMER le groupe (quelles références en font partie) n'était
+        // pas réutilisée pour FILTRER les variantes à l'intérieur de ces
+        // références — la matrice montrait alors TOUTES les couleurs de
+        // chaque référence, pas seulement celle choisie.
+        openTransferPanel(null, null, null, null, null,
+            { ids: ids, label: resume, count: n, couleur: chemin.couleur ? chemin.couleur.label : null });
+    });
+    // DEMANDE UTILISATRICE (2026-10-26) : « je veux revenir et ne pas faire
+    // ça » — remet les 5 listes à zéro (le bandeau disparaît) sans fermer
+    // le popup, pour revenir à ce qui était affiché avant.
+    var btnAnnuler = el('tr-btn-group-cancel');
+    if (btnAnnuler) btnAnnuler.addEventListener('click', function() {
+        var host = el('tr-chain');
+        if (host && host._chainClear) host._chainClear();
+    });
+}
+
+function openTransferPanel(articleId, productName, presetColor, targetShopField, couleurs, group) {
+    var overlay = el('transfer-overlay');
+    // DEMANDE UTILISATRICE (2026-10-24) : mode groupe (Transférer toute une
+    // Collection/Catégorie/Couleur) — `group` = {ids, label, count} ;
+    // `articleId` n'est alors plus requis (il n'y a pas UNE référence).
+    if (!overlay || (!articleId && !group)) return;
+
+    // Recherche « Changer de produit » (demande utilisatrice 2026-10-22) :
+    // choisir une autre référence sans sortir de ce popup relance le même
+    // panneau dessus.
+    _rechercheMonter('tr-nav', function(p) {
+        openTransferPanel(p.id, p.ref);
+    });
+    _chainMonter('tr-chain', function(variante, chemin) {
+        if (chemin.reference) {
+            openTransferPanel(chemin.reference.id, chemin.reference.label,
+                chemin.couleur ? chemin.couleur.label : null);
+        }
+    }, function(chemin, referenceItems) {
+        _trChainGroupBanner(chemin, referenceItems);
+    });
+    state.transfer.article_id = group ? null : articleId;
+    state.transfer.article_name = group ? '' : (productName || '');
+    // BUG CORRIGÉ (2026-10-26) : en mode groupe, `group.couleur` (si le
+    // groupe a été formé via le niveau Couleur du regroupement) DOIT
+    // continuer à filtrer les variantes à l'intérieur de chaque référence —
+    // sinon la matrice montre toutes les couleurs de chaque référence,
+    // pas seulement celle qui a servi à constituer le groupe.
+    state.transfer.color = group ? ((group && group.couleur) || null) : (presetColor || null);
     state.transfer.reassort = false;
     state.transfer.group_ref = null;
     state.transfer.group_count = 0;
+    state.transfer.group = group || null;
 
     var nameEl = el('transfer-product-name');
-    if (nameEl) nameEl.textContent = productName || '—';
+    if (nameEl) nameEl.textContent = group ? ('📦 Groupe : ' + group.label + ' (' + formatNumber(group.count) + ' référence' + (group.count > 1 ? 's' : '') + ')') : (productName || '—');
 
     var destSel = el('transfer-dest-shop');
     if (destSel) {
@@ -2750,8 +3189,12 @@ function openTransferPanel(articleId, productName, presetColor, targetShopField,
         destSel.value = targetShopField || '';
     }
 
+    // Le filtre Couleur à l'intérieur d'une référence n'a pas de sens en
+    // mode groupe (plusieurs références) — la couleur a déjà été choisie,
+    // le cas échéant, au niveau du regroupement en chaîne lui-même.
     var colorSel = el('transfer-color-filter');
-    if (colorSel) {
+    if (colorSel && colorSel.parentElement) colorSel.parentElement.style.display = group ? 'none' : '';
+    if (colorSel && !group) {
         while (colorSel.options.length > 1) colorSel.remove(1);
         // BUG CORRIGÉ (2026-09-22) : les couleurs venaient TOUJOURS de la
         // fiche produit ouverte. Depuis la page Action (aucune fiche
@@ -2793,9 +3236,11 @@ function openTransferPanel(articleId, productName, presetColor, targetShopField,
 
     overlay.classList.add('active');
 
-    if (destSel && destSel.value) {
-        _loadTransferSuggestions();
-    }
+    // DEMANDE UTILISATRICE (2026-10-22) : stock tous magasins + ventes
+    // récentes + KPI doivent être visibles dès l'ouverture, pas seulement
+    // une fois un magasin cible choisi (_loadTransferSuggestions gère déjà
+    // elle-même l'absence de cible pour le tableau des suggestions).
+    _loadTransferSuggestions();
 }
 
 function closeTransferPanel() {
@@ -2804,6 +3249,7 @@ function closeTransferPanel() {
     state.transfer.article_id = null;
     state.transfer.group_ref = null;
     state.transfer.group_count = 0;
+    state.transfer.group = null;
 }
 
 function _showTransferSuggestionsView() {
@@ -2826,33 +3272,83 @@ async function _loadTransferSuggestions() {
     var tbody = el('transfer-suggestions-tbody');
     var msgEl = el('transfer-suggestions-msg');
 
+    // DEMANDE UTILISATRICE (2026-10-24) : mode groupe — pas de article_id
+    // unique, mais un `state.transfer.group.ids` à la place.
+    if (!state.transfer.article_id && !state.transfer.group) return;
+
+    // DEMANDE UTILISATRICE (2026-10-22) : le stock par magasin, les ventes
+    // récentes et les KPI doivent être visibles dès l'ouverture du popup,
+    // AVANT même d'avoir choisi un magasin cible — c'est justement ce qui
+    // aide à décider où envoyer. Seul le tableau « magasins suggérés »
+    // (qui a besoin d'une cible pour classer par ville) reste vide tant
+    // qu'aucun magasin cible n'est choisi.
     if (!destShopField) {
         if (tbody) tbody.innerHTML = '';
-        if (msgEl) msgEl.textContent = 'Choisissez un magasin cible pour voir les suggestions.';
-        return;
+        if (msgEl) msgEl.textContent = 'Choisissez un magasin cible pour voir les suggestions classées par ville.';
+    } else {
+        if (msgEl) msgEl.textContent = 'Recherche des magasins source…';
+        if (tbody) tbody.innerHTML = '';
     }
-    if (!state.transfer.article_id) return;
-
-    if (msgEl) msgEl.textContent = 'Recherche des magasins source…';
-    if (tbody) tbody.innerHTML = '';
 
     var colorSel = el('transfer-color-filter');
-    var colorFilter = colorSel ? colorSel.value : '';
+    // BUG CORRIGÉ (2026-10-26) : en mode groupe, la couleur du chemin
+    // (state.transfer.color, posée par openTransferPanel) doit être
+    // CONSERVÉE — pas remise à vide. Le sélecteur Couleur intra-référence,
+    // lui, n'a pas de sens en mode groupe (déjà caché, voir
+    // openTransferPanel) donc on ne le relit pas dans ce cas.
+    var colorFilter = state.transfer.group ? (state.transfer.color || '') : (colorSel ? colorSel.value : '');
     state.transfer.color = colorFilter || null;
 
-    var data = await rpc('/mavie/api/transfer-suggestions', {
-        product_tmpl_id: state.transfer.article_id,
+    var rpcParams = {
         dest_shop_field: destShopField,
         color: colorFilter || null,
-    });
+    };
+    if (state.transfer.group) {
+        rpcParams.product_tmpl_ids = state.transfer.group.ids;
+    } else {
+        rpcParams.product_tmpl_id = state.transfer.article_id;
+    }
+    var data = await rpc('/mavie/api/transfer-suggestions', rpcParams);
 
     if (!data || data.error) {
         if (msgEl) msgEl.textContent = 'Erreur : ' + (data && data.error || 'inconnue');
         return;
     }
 
-    _renderTransferSuggestions(data.suggestions || [], destShopField);
     _renderTransferAllStores(data.all_stores || [], destShopField);
+    _renderTransferKpis(data.kpis || {});
+
+    // DEMANDE UTILISATRICE (2026-10-23) : photo + prix de vente, pour
+    // juger l'enjeu d'un transfert sans rouvrir la fiche produit.
+    var prixEl = el('transfer-product-price');
+    if (prixEl) {
+        if (data.prix_vente_ttc) {
+            prixEl.textContent = formatMAD(data.prix_vente_ttc);
+            prixEl.style.display = '';
+        } else {
+            prixEl.style.display = 'none';
+        }
+    }
+    var imgEl = el('transfer-image');
+    var imgMissingEl = el('transfer-image-missing');
+    var hasPhoto = !!(data.has_image && data.image_url);
+    if (imgEl) {
+        if (hasPhoto) {
+            imgEl.onerror = function() {
+                imgEl.style.display = 'none';
+                if (imgMissingEl) imgMissingEl.style.display = 'flex';
+            };
+            imgEl.src = data.image_url;
+            imgEl.style.display = 'block';
+        } else {
+            imgEl.removeAttribute('src');
+            imgEl.style.display = 'none';
+        }
+    }
+    if (imgMissingEl) imgMissingEl.style.display = hasPhoto ? 'none' : 'flex';
+
+    if (!destShopField) return;
+    _renderTransferSuggestions(data.suggestions || [], destShopField);
 
     if (msgEl) {
         var suggestions = data.suggestions || [];
@@ -2865,6 +3361,16 @@ async function _loadTransferSuggestions() {
             msgEl.textContent = '';
         }
     }
+}
+
+function _renderTransferKpis(kpis) {
+    var m = {
+        'tr-kpi-qty-purchased': formatNumber(kpis.qty_purchased || 0),
+        'tr-kpi-ca-achat': formatMAD(kpis.ca_achat || 0),
+        'tr-kpi-qty-sold': formatNumber(kpis.qty_sold || 0),
+        'tr-kpi-ca': formatMAD(kpis.ca_vendu || 0),
+    };
+    Object.keys(m).forEach(function(id) { var e = el(id); if (e) e.textContent = m[id]; });
 }
 
 function _renderTransferSuggestions(suggestions, destShopField) {
@@ -2927,7 +3433,7 @@ function _renderTransferAllStores(allStores, destShopField) {
     if (!allStores || !allStores.length) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 6;
+        td.colSpan = 7;
         td.textContent = 'Aucune donnée de magasin disponible.';
         td.style.cssText = 'text-align:center;padding:16px;color:#94A3B8;';
         tr.appendChild(td);
@@ -2963,7 +3469,7 @@ function _renderTransferAllStores(allStores, destShopField) {
         tdDisp.style.textAlign = 'center';
         tdDisp.style.fontWeight = '600';
         tdDisp.style.color = '#2563EB';
-        tdDisp.textContent = formatNumber(s.dispatched || 0);
+        tdDisp.textContent = formatNumber(s.entrees || 0);
         tr.appendChild(tdDisp);
 
         var tdSold = document.createElement('td');
@@ -2972,6 +3478,16 @@ function _renderTransferAllStores(allStores, destShopField) {
         tdSold.style.color = '#7C3AED';
         tdSold.textContent = formatNumber(s.sold || 0);
         tr.appendChild(tdSold);
+
+        // DEMANDE UTILISATRICE (2026-10-22) : ventes récentes (30 derniers
+        // jours) magasin par magasin, pour juger si ça vaut le coup
+        // d'envoyer du stock là — pas que le total depuis toujours.
+        var tdSold30 = document.createElement('td');
+        tdSold30.style.textAlign = 'center';
+        tdSold30.style.color = s.sold_30j ? '#059669' : '#94A3B8';
+        tdSold30.style.fontWeight = s.sold_30j ? '600' : '400';
+        tdSold30.textContent = formatNumber(s.sold_30j || 0);
+        tr.appendChild(tdSold30);
 
         var tdStock = document.createElement('td');
         tdStock.style.textAlign = 'center';
@@ -3009,6 +3525,26 @@ function _renderTransferAllStores(allStores, destShopField) {
 
         tbody.appendChild(tr);
     });
+
+    // DEMANDE UTILISATRICE (2026-10-23) : vitesse de vente du magasin
+    // CIBLE — calculée côté client à partir de sold_30j (déjà renvoyé par
+    // le serveur), pour juger si le stock envoyé va tenir 3 jours ou 30.
+    var carteVitesse = el('tr-kpi-vitesse-cible-card');
+    var valeurVitesse = el('tr-kpi-vitesse-cible');
+    if (carteVitesse && valeurVitesse) {
+        var cible = destShopField ? allStores.filter(function(s) { return s.shop_field === destShopField; })[0] : null;
+        if (cible) {
+            var vitesseSemaine = Math.round((cible.sold_30j || 0) * 7 / 30 * 10) / 10;
+            var couvertureJours = vitesseSemaine > 0 ? Math.round((cible.stock || 0) / (vitesseSemaine / 7)) : null;
+            valeurVitesse.textContent = vitesseSemaine > 0
+                ? formatNumber(vitesseSemaine) + ' / sem.' + (couvertureJours !== null ? ' · ' + formatNumber(couvertureJours) + ' j de couverture' : '')
+                : '0 vente récente';
+            valeurVitesse.style.color = vitesseSemaine > 0 ? '' : '#DC2626';
+            carteVitesse.style.display = '';
+        } else {
+            carteVitesse.style.display = 'none';
+        }
+    }
 }
 
 async function openTransferMatrix(sourceShopField, sourceLabel, destShopField) {
@@ -3039,11 +3575,16 @@ async function openTransferMatrix(sourceShopField, sourceLabel, destShopField) {
 
     _showTransferMatrixView();
 
-    var data = await rpc('/mavie/api/transfer-variant-stock', {
-        product_tmpl_id: state.transfer.article_id,
+    var matrixParams = {
         source_shop_field: sourceShopField,
         color: state.transfer.color || null,
-    });
+    };
+    if (state.transfer.group) {
+        matrixParams.product_tmpl_ids = state.transfer.group.ids;
+    } else {
+        matrixParams.product_tmpl_id = state.transfer.article_id;
+    }
+    var data = await rpc('/mavie/api/transfer-variant-stock', matrixParams);
 
     if (!data || data.error) {
         if (msgEl) msgEl.textContent = 'Erreur : ' + (data && data.error || 'inconnue');
@@ -3059,11 +3600,18 @@ function _renderTransferMatrix(variants) {
     if (!tbody) return;
     tbody.innerHTML = '';
 
+    // DEMANDE UTILISATRICE (2026-10-24) : colonne Référence visible
+    // seulement en mode groupe (plusieurs références à la fois) — chaque
+    // ligne du serveur porte alors un champ `reference`.
+    var groupMode = !!state.transfer.group;
+    var thRef = el('transfer-matrix-th-ref');
+    if (thRef) thRef.style.display = groupMode ? '' : 'none';
+
     if (variants.length === 0) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = 4;
-        td.textContent = 'Aucun stock disponible dans ce magasin pour ce produit.';
+        td.colSpan = groupMode ? 5 : 4;
+        td.textContent = 'Aucun stock disponible dans ce magasin pour ce' + (groupMode ? ' groupe.' : ' produit.');
         td.style.textAlign = 'center';
         td.style.color = '#999';
         tr.appendChild(td);
@@ -3073,6 +3621,13 @@ function _renderTransferMatrix(variants) {
 
     variants.forEach(function(v) {
         var tr = document.createElement('tr');
+
+        if (groupMode) {
+            var tdRef = document.createElement('td');
+            tdRef.textContent = v.reference || '—';
+            tdRef.style.fontWeight = '600';
+            tr.appendChild(tdRef);
+        }
 
         var tdColor = document.createElement('td');
         tdColor.textContent = v.color;
@@ -3092,7 +3647,10 @@ function _renderTransferMatrix(variants) {
         qtyInput.className = 'transfer-qty-input';
         qtyInput.min = '0';
         qtyInput.max = String(v.available_qty);
-        qtyInput.value = '0';
+        // DEMANDE UTILISATRICE (2026-10-22) : pré-remplie avec le stock
+        // disponible affiché juste à côté, modifiable ensuite — évite de
+        // ressaisir à la main une quantité déjà visible à l'écran.
+        qtyInput.value = String(v.available_qty || 0);
         qtyInput.dataset.productId = v.product_id;
         tdQty.appendChild(qtyInput);
         tr.appendChild(tdQty);
@@ -3126,18 +3684,24 @@ async function _createTransferFromMatrix(btnEl) {
     // son group_ref pour qu'ils soient regroupés à l'affichage (liste + PDF)
     // au lieu d'apparaître comme des transferts sans rapport.
     if (!state.transfer.group_ref) {
-        state.transfer.group_ref = state.transfer.article_id + '-' + state.transfer.dest_shop_field + '-' + Date.now();
+        var refPourCle = state.transfer.group ? 'groupe' : state.transfer.article_id;
+        state.transfer.group_ref = refPourCle + '-' + state.transfer.dest_shop_field + '-' + Date.now();
     }
 
-    var data = await rpc('/mavie/api/transfer-create', {
-        product_tmpl_id: state.transfer.article_id,
+    // DEMANDE UTILISATRICE (2026-10-24) : mode groupe — pas de
+    // product_tmpl_id unique, /mavie/api/transfer-create résout déjà
+    // chaque ligne par product_id (variante) sans lui, comme le fait déjà
+    // l'assistant de Propositions > Transferts.
+    var createParams = {
         source_shop_field: state.transfer.source_shop_field,
         dest_shop_field: state.transfer.dest_shop_field,
         lines: lines,
         group_ref: state.transfer.group_ref,
         // Ouvert depuis la fenêtre Réassort : compté comme « réassort ».
         reassort: !!state.transfer.reassort,
-    });
+    };
+    if (!state.transfer.group) createParams.product_tmpl_id = state.transfer.article_id;
+    var data = await rpc('/mavie/api/transfer-create', createParams);
 
     if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Créer le transfert'; }
 
@@ -3193,6 +3757,15 @@ async function _createTransferFromMatrix(btnEl) {
     resultEl.style.borderColor = '#86EFAC';
     resultEl.innerHTML = html;
 
+    // BUG CORRIGÉ (2026-10-26, repéré par l'utilisatrice : « dans
+    // l'historique... ya seulement l'affichage d'une seule ») : la section
+    // Historique du Tableau de bord n'était jamais rafraîchie après une
+    // création — elle gardait l'état d'avant l'ouverture du popup tant que
+    // la page n'était pas rechargée manuellement. Les données elles-mêmes
+    // étaient toutes bien créées (vérifié en base), seul l'affichage
+    // restait figé.
+    if (isHistoryPage() && typeof loadHistory === 'function') loadHistory();
+
     // Retour à la liste des suggestions (le stock source a changé)
     _showTransferSuggestionsView();
     _loadTransferSuggestions();
@@ -3204,6 +3777,15 @@ async function _createTransferFromMatrix(btnEl) {
 function openColorDetail(articleId, productName, color) {
     var overlay = el('color-detail-overlay');
     if (!overlay || !articleId || !color) return;
+
+    // DEMANDE UTILISATRICE (2026-10-22) : regroupement à 5 listes dans
+    // tous les popups — choisir une variante relance ce même popup sur la
+    // couleur de la nouvelle référence choisie.
+    _chainMonter('clr-chain', function(variante, chemin) {
+        if (chemin.reference && chemin.couleur) {
+            openColorDetail(chemin.reference.id, chemin.reference.label, chemin.couleur.label);
+        }
+    });
 
     state.colorDetail.article_id = articleId;
     state.colorDetail.product_name = productName || '';
@@ -3335,9 +3917,30 @@ async function _loadColorDetailStores(articleId, color) {
     // ligne, pour savoir d'où faire venir la marchandise.
     var depotRow = (data.stores || []).filter(function(st) { return st.depot; })[0];
     var stockTotalEl = el('color-detail-stock-total');
-    if (stockTotalEl && depotRow && depotRow.stock_total) {
-        stockTotalEl.title = 'Magasins uniquement. Le dépôt en détient '
-            + formatNumber(depotRow.stock_total) + ', voir le tableau ci-dessous.';
+    if (stockTotalEl) {
+        // BUG CORRIGÉ (2026-10-16, repéré par l'utilisatrice : « ya
+        // plusieurs articles dans les magasins, vérifie ça ») : la carte
+        // "Stock magasins" était d'abord remplie côté client depuis
+        // v.stock (tableau Variantes Couleurs), qui suit DEPUIS AUJOURD'HUI
+        // le filtre « Filtrer par Magasin » de la fiche — correct pour ce
+        // tableau-là, mais ce popup-ci additionne volontairement TOUT le
+        // réseau (voir api_color_stock_by_store : le filtre magasin n'est
+        // jamais appliqué ici, exprès, pour savoir où se trouve la
+        // marchandise en vue d'un transfert). Les deux chiffres
+        // divergeaient donc dès qu'un magasin était filtré dans la fiche
+        // (ex. "1" en carte contre "4" dans son propre tableau juste en
+        // dessous). On réaffiche ici la valeur réseau (data.stock_present),
+        // qui vient de la MÊME source que le tableau et que son total
+        // "STOCK PRÉSENT EN MAGASIN", donc toujours cohérente avec lui.
+        var stockPresentReseau = data.stock_present || 0;
+        stockTotalEl.textContent = formatNumber(stockPresentReseau);
+        stockTotalEl.style.color = stockPresentReseau < 0 ? '#EF4444' : '';
+        stockTotalEl.title = 'Compte physique réel (stock.quant), tous magasins mappés confondus '
+            + '(indépendant du filtre « Filtrer par Magasin » de la fiche).';
+        if (depotRow && depotRow.stock_total) {
+            stockTotalEl.title += ' Le dépôt en détient ' + formatNumber(depotRow.stock_total)
+                + ' en plus, voir le tableau ci-dessous.';
+        }
     }
 }
 
@@ -3357,6 +3960,10 @@ function _mouvementsCell(mv, stock) {
     if (mv.sortie) puce('−' + formatNumber(mv.sortie) + ' envoyé', '#E0E7FF', '#3730A3');
     if (mv.reassort) puce('+' + formatNumber(mv.reassort) + ' réassort', '#DCFCE7', '#166534');
     if (mv.solde) puce(formatNumber(mv.solde) + ' vendus en solde', '#FEE2E2', '#B91C1C');
+    // BUG CORRIGÉ (2026-10-28) : une solde POSÉE mais pas encore vendue
+    // (mv.solde = 0) n'affichait rien — voir _mouvements_couleur, bloc
+    // solde_pose.
+    if (!mv.solde && mv.solde_pose) puce('🏷️ en solde', '#FEE2E2', '#B91C1C');
     if (mv.attente) puce('⏳ ' + formatNumber(mv.attente) + ' en attente', '#FEF3C7', '#92400E');
     if (!puces.length) {
         td.textContent = '—';
@@ -3381,7 +3988,7 @@ function _mouvementsDetailHtml(lignes) {
     lignes.forEach(function(l) {
         var sens = l.sens === 'recu' ? '<span style="color:#1D4ED8;font-weight:700;">Reçu</span>'
             : (l.sens === 'envoye' ? '<span style="color:#3730A3;font-weight:700;">Envoyé</span>'
-            : '<span style="color:#B91C1C;font-weight:700;">Vendu en solde</span>');
+            : '<span style="color:#B91C1C;font-weight:700;">' + (l.quoi === 'Solde posée' ? 'Solde posée' : 'Vendu en solde') + '</span>');
         h += '<tr class="ac-var"><td>' + _escapeHtml(l.date || '—') + '</td>'
            + '<td>' + sens + (l.quoi === 'Réassort' ? ' <span style="color:#166534;">(réassort)</span>' : '') + '</td>'
            + '<td>' + _escapeHtml(l.avec || '—') + '</td>'
@@ -3428,7 +4035,7 @@ function _renderColorDetailStores(stores, totals) {
         // rouge vendu en solde — au lieu d'un gris qui ne dit rien.
         var mv = s.mouvements || {};
         var faits = [];
-        if (mv.solde) faits.push('solde');
+        if (mv.solde || mv.solde_pose) faits.push('solde');
         if (mv.reassort) faits.push('reassort');
         if (mv.entree || mv.sortie) faits.push('transfert');
         _actColorer(tdStock, faits);
@@ -4343,8 +4950,274 @@ function closeValorisationDetail() {
     if (overlay) overlay.classList.remove('active');
 }
 
+// ═══════════════════════════════════════════════════════════
+// RECHERCHE « CHANGER DE PRODUIT » — barre de recherche simple,
+// PARTAGÉE par les popups d'action (Transférer, Solder, Réassort).
+// DEMANDE UTILISATRICE (2026-10-22) : le navigateur à 5 onglets
+// (Collection → Catégorie → Couleur → Référence → Variante) était
+// « trop compliqué » — remplacé par une seule barre où on tape et on
+// choisit dans la liste, même principe que la recherche du tableau
+// de bord (/mavie/api/search-products, déjà en place).
+// ═══════════════════════════════════════════════════════════
+function _rechercheMonter(hostId, onPick) {
+    var host = el(hostId);
+    if (!host || host.getAttribute('data-rech-mounted')) return;
+    host.setAttribute('data-rech-mounted', '1');
+    host.innerHTML = '<div style="position:relative;">'
+        + '<input type="text" class="rech-produit-input" placeholder="🔍 Changer de produit — référence, nom ou catégorie…" '
+        + 'style="width:100%;padding:8px 12px;border:1px solid #CBD5E1;border-radius:8px;font-size:0.85rem;outline:none;background:#F8FAFC;color:#0F172A;"/>'
+        + '<div class="search-results"></div>'
+        + '</div>';
+    var input = host.querySelector('.rech-produit-input');
+    var results = host.querySelector('.search-results');
+    var debounce;
+    input.addEventListener('input', function() {
+        var q = input.value.trim();
+        clearTimeout(debounce);
+        if (q.length < 2) { results.classList.remove('active'); return; }
+        debounce = setTimeout(async function() {
+            var data = await rpc('/mavie/api/search-products', { query: q });
+            var items = (data && data.results) || [];
+            results.innerHTML = items.length
+                ? items.map(function(p) {
+                    return '<div class="search-result-item" data-rech-id="' + p.id + '" data-rech-nom="' + _escapeHtml(p.name || '') + '">'
+                        + '<span>' + _escapeHtml(p.name || '—') + '</span><span class="sr-ref">' + _escapeHtml(p.ref || '—') + '</span></div>';
+                }).join('')
+                : '<div class="search-result-empty">Aucun produit trouvé</div>';
+            results.classList.add('active');
+        }, 300);
+    });
+    input.addEventListener('keydown', function(e) { e.stopPropagation(); });
+    results.addEventListener('click', function(e) {
+        var item = e.target.closest('[data-rech-id]');
+        if (!item) return;
+        results.classList.remove('active');
+        input.value = '';
+        onPick({ id: parseInt(item.getAttribute('data-rech-id'), 10), ref: item.getAttribute('data-rech-nom') });
+    });
+    document.addEventListener('click', function(e) {
+        if (!host.contains(e.target)) results.classList.remove('active');
+    });
+}
+
+// ═══════════════════════════════════════════════════════════
+// REGROUPEMENT EN CHAÎNE — 5 listes déroulantes, Collection →
+// Catégorie → Couleur → Référence → Variante, dans CET ORDRE —
+// PARTAGÉ par les popups d'action (Transférer, Solder, Réassort).
+// DEMANDE UTILISATRICE (2026-10-22) : forme simple (des <select>
+// classiques qui s'enchaînent) du regroupement demandé plus tôt — pas
+// d'onglets ni de clics en cascade, juste choisir dans des listes.
+// Choisir la Variante (dernier niveau) affiche le détail dans CE MÊME
+// popup, en étant descendu du plus grand (Collection) au plus petit
+// (Variante).
+// ═══════════════════════════════════════════════════════════
+var CHAIN_NIVEAUX = [
+    { cle: 'collection', label: 'Collection' },
+    { cle: 'categorie', label: 'Catégorie' },
+    { cle: 'couleur', label: 'Couleur' },
+    { cle: 'reference', label: 'Référence' },
+    { cle: 'variante', label: 'Variante' },
+];
+var _chainCollectionsPromise = null;
+function _chainGetCollections() {
+    if (!_chainCollectionsPromise) {
+        _chainCollectionsPromise = rpc('/mavie/api/filters', {}).then(function(d) {
+            return (d && d.collections) || [];
+        });
+    }
+    return _chainCollectionsPromise;
+}
+
+// DEMANDE UTILISATRICE (2026-10-24) : « transférer/solder/réassortir TOUT
+// un groupe d'un coup » — si on choisit Collection/Catégorie/Couleur sans
+// descendre jusqu'à une Référence précise, on doit pouvoir agir sur TOUTES
+// les références qui correspondent, pas une seule. `onGroupChange(chemin,
+// referenceItems)` (3e paramètre, optionnel) est appelé chaque fois que le
+// niveau Référence est (re)rempli — à l'ouverture ET après chaque
+// changement — avec la liste COMPLÈTE des références correspondant au
+// chemin actuel (déjà en mémoire côté client, aucun appel serveur de plus).
+function _chainMonter(hostId, onLeaf, onGroupChange) {
+    var host = el(hostId);
+    if (!host || host.getAttribute('data-chain-mounted')) return;
+    host.setAttribute('data-chain-mounted', '1');
+    // DEMANDE UTILISATRICE (2026-10-24) : chaque liste doit être utilisable
+    // directement — on peut choisir une Couleur, une Référence (ou même la
+    // Variante une fois une Référence en main) sans être obligée de
+    // commencer par Collection. Seule Variante reste grisée au départ :
+    // une variante appartient forcément à une Référence précise, donc son
+    // contenu n'a pas de sens avant qu'une Référence soit choisie.
+    host.innerHTML = '<div style="font-size:0.72rem;font-weight:600;color:#64748B;text-transform:uppercase;letter-spacing:0.03em;margin-bottom:6px;">Regroupement — choisissez n\'importe quel niveau, dans n\'importe quel ordre</div>'
+        + '<div style="display:flex;flex-wrap:wrap;gap:8px;">'
+        + CHAIN_NIVEAUX.map(function(n) {
+            return '<select class="chain-select" data-chain-niveau="' + n.cle + '"' + (n.cle === 'variante' ? ' disabled="disabled"' : '') + ' '
+                + 'style="flex:1;min-width:140px;padding:7px 10px;border:1px solid #CBD5E1;border-radius:8px;font-size:0.83rem;background:#F8FAFC;color:#0F172A;">'
+                + '<option value="">' + _escapeHtml(n.label) + '…</option></select>';
+        }).join('')
+        + '</div>'
+        // BUG CORRIGÉ (2026-10-26, repéré par l'utilisatrice : « ya bug dans
+        // le choix des références » — liste Référence qui reste vide/ne
+        // s'ouvre pas) : sur un catalogue réel (3700 à 6800 références sans
+        // filtre), déverser TOUT dans un <select> natif fait planter son
+        // rendu dans le navigateur. On plafonne l'affichage et on ajoute un
+        // champ pour filtrer par texte — _chainItems garde quand même la
+        // liste COMPLÈTE (le bandeau « agir sur le groupe » n\'est donc pas
+        // affecté, lui reste exact).
+        + '<input type="text" class="chain-filter-input" data-chain-filtre="reference" placeholder="🔍 Filtrer les références par texte…" '
+        + 'style="display:none;width:100%;margin-top:6px;padding:7px 10px;border:1px solid #CBD5E1;border-radius:8px;font-size:0.83rem;background:#FFF;color:#0F172A;"/>'
+        + '<div class="chain-filter-note" data-chain-note="reference" style="display:none;font-size:0.76rem;color:#B45309;margin-top:4px;"></div>';
+
+    var chemin = {};
+    var selects = {};
+    CHAIN_NIVEAUX.forEach(function(n) { selects[n.cle] = host.querySelector('[data-chain-niveau="' + n.cle + '"]'); });
+    var CHAIN_SEUIL_AFFICHAGE = 200;
+    var filtreInput = host.querySelector('[data-chain-filtre="reference"]');
+    var filtreNote = host.querySelector('[data-chain-note="reference"]');
+
+    // Rend une sous-liste (déjà triée) d'options pour `sel`, en gardant
+    // TOUJOURS `value` = index dans `sel._chainItems` (la liste complète),
+    // jamais l'index dans la sous-liste affichée — sinon le `change`
+    // plus bas (qui lit `sel._chainItems[parseInt(sel.value)]`) pointerait
+    // sur la mauvaise référence dès qu'on filtre.
+    function _rendreOptionsReference(sousListe, note) {
+        var sel = selects.reference;
+        sel.innerHTML = '<option value="">Référence…</option>'
+            + sousListe.map(function(paire) {
+                return '<option value="' + paire[0] + '">' + _escapeHtml(String(paire[1].label)) + '</option>';
+            }).join('');
+        sel.disabled = sousListe.length === 0;
+        if (filtreNote) {
+            filtreNote.textContent = note || '';
+            filtreNote.style.display = note ? '' : 'none';
+        }
+    }
+
+    if (filtreInput) {
+        filtreInput.addEventListener('click', function(e) { e.stopPropagation(); });
+        filtreInput.addEventListener('input', function() {
+            var items = selects.reference._chainItems || [];
+            var q = filtreInput.value.trim().toLowerCase();
+            var avecIndex = items.map(function(it, i) { return [i, it]; });
+            var filtres = q ? avecIndex.filter(function(p) { return String(p[1].label).toLowerCase().indexOf(q) !== -1; }) : avecIndex;
+            var tronque = filtres.length > CHAIN_SEUIL_AFFICHAGE;
+            var affichees = tronque ? filtres.slice(0, CHAIN_SEUIL_AFFICHAGE) : filtres;
+            var note = tronque
+                ? (filtres.length + ' résultats, les ' + CHAIN_SEUIL_AFFICHAGE + ' premiers affichés — affinez le texte.')
+                : (q ? filtres.length + ' résultat' + (filtres.length > 1 ? 's' : '') : '');
+            _rendreOptionsReference(affichees, note);
+        });
+    }
+
+    function reinitialiser(depuisIdx) {
+        CHAIN_NIVEAUX.slice(depuisIdx).forEach(function(n) {
+            delete chemin[n.cle];
+            var sel = selects[n.cle];
+            sel.innerHTML = '<option value="">' + _escapeHtml(n.label) + '…</option>';
+            sel.disabled = true;
+            if (n.cle === 'reference') {
+                if (filtreInput) { filtreInput.value = ''; filtreInput.style.display = 'none'; }
+                if (filtreNote) { filtreNote.textContent = ''; filtreNote.style.display = 'none'; }
+            }
+        });
+    }
+
+    async function remplirNiveau(idx) {
+        var n = CHAIN_NIVEAUX[idx];
+        var sel = selects[n.cle];
+        sel.disabled = true;
+        sel.innerHTML = '<option value="">Chargement…</option>';
+        var items;
+        if (n.cle === 'collection') {
+            items = (await _chainGetCollections()).map(function(c) { return { id: c.id, label: c.name }; });
+        } else {
+            var params = {
+                niveau: n.cle,
+                collection_id: chemin.collection ? chemin.collection.id : '',
+                categ_ids: chemin.categorie ? [chemin.categorie.id] : [],
+                couleur: chemin.couleur ? chemin.couleur.id : '',
+                ref_id: chemin.reference ? chemin.reference.id : '',
+            };
+            var data = await rpc('/mavie/api/nav-niveau', params);
+            items = (data && data.items) || [];
+        }
+        sel._chainItems = items;
+        if (n.cle === 'reference') {
+            // Voir _rendreOptionsReference plus haut : jamais plus de
+            // CHAIN_SEUIL_AFFICHAGE options natives d'un coup.
+            if (filtreInput) {
+                filtreInput.value = '';
+                filtreInput.style.display = items.length > CHAIN_SEUIL_AFFICHAGE ? '' : 'none';
+            }
+            var avecIndex = items.map(function(it, i) { return [i, it]; });
+            var tronque = avecIndex.length > CHAIN_SEUIL_AFFICHAGE;
+            var affichees = tronque ? avecIndex.slice(0, CHAIN_SEUIL_AFFICHAGE) : avecIndex;
+            var note = tronque
+                ? (items.length + ' références au total, les ' + CHAIN_SEUIL_AFFICHAGE
+                   + ' premières affichées — tapez dans le champ ci-dessus pour chercher les autres.')
+                : '';
+            _rendreOptionsReference(affichees, note);
+        } else {
+            sel.innerHTML = '<option value="">' + _escapeHtml(n.label) + '…</option>'
+                + items.map(function(it, i) { return '<option value="' + i + '">' + _escapeHtml(String(it.label)) + '</option>'; }).join('');
+            sel.disabled = items.length === 0;
+        }
+        if (n.cle === 'reference' && typeof onGroupChange === 'function') {
+            onGroupChange(chemin, items);
+        }
+    }
+
+    host.addEventListener('change', function(e) {
+        var sel = e.target.closest('select[data-chain-niveau]');
+        if (!sel) return;
+        var niveau = sel.getAttribute('data-chain-niveau');
+        var idx = CHAIN_NIVEAUX.findIndex(function(n) { return n.cle === niveau; });
+        reinitialiser(idx + 1);
+        if (sel.value === '') return;
+        var item = sel._chainItems[parseInt(sel.value, 10)];
+        chemin[niveau] = item;
+        if (niveau === 'variante') {
+            onLeaf(item, chemin);
+            return;
+        }
+        // Rafraîchit TOUS les niveaux suivants (pas seulement le prochain)
+        // pour qu'ils restent immédiatement utilisables après ce choix,
+        // qu'on soit parti de Collection ou d'un niveau du milieu.
+        CHAIN_NIVEAUX.slice(idx + 1).forEach(function(n, i) { remplirNiveau(idx + 1 + i); });
+        // Quand c'est Référence elle-même qu'on vient de choisir, aucun
+        // remplirNiveau('reference') ne tourne (on rafraîchit seulement ce
+        // qui est APRÈS elle) — on prévient quand même ici pour que le
+        // bandeau « agir sur le groupe » se cache immédiatement (une
+        // Référence précise est choisie, ce n'est plus un groupe).
+        if (niveau === 'reference' && typeof onGroupChange === 'function') {
+            onGroupChange(chemin, selects.reference._chainItems || []);
+        }
+    });
+
+    function chargerDepuisZero() {
+        CHAIN_NIVEAUX.slice(0, -1).forEach(function(n, idx) { remplirNiveau(idx); });
+    }
+
+    // Charge tous les niveaux dès l'ouverture (sauf Variante, qui a besoin
+    // d'une Référence choisie) — on peut donc choisir n'importe lequel en
+    // premier, pas forcément Collection.
+    chargerDepuisZero();
+
+    // DEMANDE UTILISATRICE (2026-10-26) : « je veux revenir et ne pas faire
+    // ce solde, je dois avoir un bouton d'annuler » — exposé sur le host
+    // pour que le bandeau « agir sur le groupe » (Transférer/Solder/
+    // Réassort) puisse remettre les 5 listes à zéro sans fermer le popup.
+    host._chainClear = function() {
+        reinitialiser(0);
+        chargerDepuisZero();
+    };
+}
+
 // DEMANDE UTILISATEUR (2026-10-07) : voir les références derrière une
 // couleur du Top/Flop Couleurs.
+// state.couleurDetail garde les données brutes du dernier chargement pour
+// que le filtre magasin / le filtre référence retranchent et retrient CÔTÉ
+// CLIENT, sans aller-retour serveur (même principe que top_limit/flop_limit).
+var _cdState = { couleur: '', lignes: [], magasins: [], selectedId: null, selectedName: '' };
+
 async function openCouleurDetail(couleur) {
     var overlay = el('couleur-detail-overlay');
     var nameEl = el('couleur-detail-name');
@@ -4356,6 +5229,27 @@ async function openCouleurDetail(couleur) {
     if (summaryEl) summaryEl.textContent = 'Chargement…';
     tbody.innerHTML = '';
     overlay.classList.add('active');
+    _cdState = { couleur: couleur, lignes: [], magasins: [], selectedId: null, selectedName: '' };
+    _cdUpdateActionButtons();
+
+    // DEMANDE UTILISATRICE (2026-10-22) : le regroupement à 5 listes aussi
+    // dans ce popup — choisir une référence/variante ailleurs dans le
+    // catalogue (pas forcément de cette couleur) la sélectionne
+    // directement pour les boutons Transférer/Solder/Réassort, sans devoir
+    // la trouver dans la liste ci-dessous.
+    _chainMonter('cd-chain', function(variante, chemin) {
+        if (chemin.reference) {
+            _cdState.selectedId = chemin.reference.id;
+            _cdState.selectedName = chemin.reference.label;
+            _cdUpdateActionButtons();
+            _cdRenderLignes();
+        }
+    });
+
+    var filterRef = el('cd-filter-ref');
+    if (filterRef) filterRef.value = '';
+    var filterMagasin = el('cd-filter-magasin');
+    if (filterMagasin) filterMagasin.value = '';
 
     var params = getFilterParams();
     params.couleur = couleur;
@@ -4366,32 +5260,110 @@ async function openCouleurDetail(couleur) {
         return;
     }
 
-    var lignes = data.lignes || [];
-    if (summaryEl) {
-        var totalQty = lignes.reduce(function(a, l) { return a + l.qty; }, 0);
-        var totalCa = lignes.reduce(function(a, l) { return a + l.ca; }, 0);
-        summaryEl.textContent = formatNumber(lignes.length) + ' référence(s) · '
-            + formatNumber(totalQty) + ' pièces vendues · ' + formatMAD(totalCa);
+    _cdState.lignes = data.lignes || [];
+    _cdState.magasins = data.magasins || [];
+    _cdRenderMagasins();
+    if (filterMagasin) {
+        filterMagasin.innerHTML = '<option value="">Tous les magasins — classement global</option>'
+            + _cdState.magasins.map(function(m) {
+                return '<option value="' + _escapeHtml(m.shop_field) + '">' + _escapeHtml(m.name) + ' (' + formatNumber(m.qty) + ')</option>';
+            }).join('');
     }
-    if (!lignes.length) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:24px;color:#94A3B8;">'
-            + 'Aucune vente pour cette couleur sur ce périmètre.</td></tr>';
+    _cdRenderLignes();
+}
+
+function _cdRenderMagasins() {
+    var container = el('cd-magasins-list');
+    if (!container) return;
+    if (!_cdState.magasins.length) {
+        container.innerHTML = '<span style="color:#94A3B8;font-size:0.82rem;">Aucune vente par magasin sur ce périmètre.</span>';
         return;
     }
-    tbody.innerHTML = lignes.map(function(l) {
-        return '<tr style="border-bottom:1px solid #F1F5F9;cursor:pointer;" data-article="' + l.id + '">'
+    container.innerHTML = _cdState.magasins.map(function(m) {
+        var badgeColor = m.rank <= 3 ? '#DCFCE7' : (m.rank > _cdState.magasins.length - 3 ? '#FEE2E2' : '#F1F5F9');
+        var textColor = m.rank <= 3 ? '#166534' : (m.rank > _cdState.magasins.length - 3 ? '#991B1B' : '#475569');
+        return '<span style="background:' + badgeColor + ';color:' + textColor + ';padding:4px 10px;border-radius:14px;font-size:0.78rem;font-weight:600;cursor:pointer;" '
+            + 'data-cd-magasin="' + _escapeHtml(m.shop_field) + '" title="Cliquer pour filtrer les références sur ce magasin">'
+            + '#' + m.rank + ' ' + _escapeHtml(m.name) + ' — ' + formatNumber(m.qty) + '</span>';
+    }).join('');
+}
+
+// Filtre référence (texte) + filtre magasin (re-tri sur la qté vendue DANS
+// ce magasin précis, via l.shops déjà renvoyé par le serveur) — le CA Vendu
+// reste tous magasins confondus (le serveur ne ventile pas le CA par
+// magasin pour cette vue, seulement la qté).
+function _cdRenderLignes() {
+    var tbody = el('couleur-detail-tbody');
+    var summaryEl = el('couleur-detail-summary');
+    if (!tbody) return;
+
+    var texte = (el('cd-filter-ref') && el('cd-filter-ref').value || '').trim().toLowerCase();
+    var magasin = (el('cd-filter-magasin') && el('cd-filter-magasin').value) || '';
+
+    var lignes = _cdState.lignes.filter(function(l) {
+        if (texte && (l.ref || '').toLowerCase().indexOf(texte) === -1
+            && (l.nom || '').toLowerCase().indexOf(texte) === -1) return false;
+        if (magasin && !((l.shops || {})[magasin] > 0)) return false;
+        return true;
+    });
+    if (magasin) {
+        lignes = lignes.slice().sort(function(a, b) { return (b.shops[magasin] || 0) - (a.shops[magasin] || 0); });
+    }
+
+    if (summaryEl) {
+        var totalQty = lignes.reduce(function(a, l) { return a + (magasin ? (l.shops[magasin] || 0) : l.qty); }, 0);
+        var totalCa = lignes.reduce(function(a, l) { return a + l.ca; }, 0);
+        summaryEl.textContent = formatNumber(lignes.length) + ' référence(s) · '
+            + formatNumber(totalQty) + ' pièces vendues' + (magasin ? ' à ' + magasin : '') + ' · '
+            + formatMAD(totalCa) + (magasin ? ' (tous magasins)' : '');
+    }
+    if (!lignes.length) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:24px;color:#94A3B8;">'
+            + 'Aucune référence ne correspond à ce filtre.</td></tr>';
+        return;
+    }
+    tbody.innerHTML = lignes.map(function(l, idx) {
+        var qtyAffichee = magasin ? (l.shops[magasin] || 0) : l.qty;
+        var selected = _cdState.selectedId === l.id;
+        var styleSel = selected ? 'background:rgba(124,58,237,0.14);box-shadow:inset 3px 0 0 0 #7C3AED;' : '';
+        return '<tr style="border-bottom:1px solid #F1F5F9;cursor:pointer;' + styleSel + '" data-article="' + l.id + '" data-nom="' + _escapeHtml(l.nom) + '" title="Cliquer pour sélectionner / désélectionner cette référence">'
+            + '<td style="padding:10px;text-align:center;color:#94A3B8;">' + (selected ? '<span style="color:#7C3AED;font-weight:700;">✓</span>' : (magasin ? (idx + 1) : l.rank)) + '</td>'
             + '<td style="padding:10px;font-weight:600;color:#0F172A;">' + _escapeHtml(l.ref) + '</td>'
-            + '<td style="padding:10px;">' + _escapeHtml(l.nom) + '</td>'
-            + '<td style="padding:10px;text-align:center;">' + formatNumber(l.qty) + '</td>'
+            + '<td style="padding:10px;text-align:center;">' + (l.qty_purchased ? formatNumber(l.qty_purchased) : '<span style="color:#94A3B8;">—</span>') + '</td>'
+            + '<td style="padding:10px;text-align:center;font-weight:600;">' + formatNumber(qtyAffichee) + '</td>'
+            + '<td style="padding:10px;text-align:right;">' + (l.ca_achat ? formatMAD(l.ca_achat) : '<span style="color:#94A3B8;">—</span>') + '</td>'
             + '<td style="padding:10px;text-align:right;">' + formatMAD(l.ca) + '</td>'
             + '</tr>';
     }).join('');
+}
+
+function _cdUpdateActionButtons() {
+    var hasSel = !!_cdState.selectedId;
+    ['cd-btn-transfer', 'cd-btn-solde', 'cd-btn-reassort'].forEach(function(id) {
+        var btn = el(id);
+        if (!btn) return;
+        btn.disabled = !hasSel;
+        btn.title = hasSel ? ('Agir sur ' + _cdState.selectedName) : "Sélectionnez d'abord une référence ci-dessous";
+    });
+    var hint = el('cd-action-hint');
+    if (hint) {
+        hint.style.display = hasSel ? 'none' : '';
+    }
 }
 
 function closeCouleurDetail() {
     var overlay = el('couleur-detail-overlay');
     if (overlay) overlay.classList.remove('active');
 }
+
+// BUG CORRIGÉ (2026-10-22, repéré par l'utilisatrice : « les actions ne
+// marchent pas ») : Transférer/Solder/Réassort cliqués depuis ce popup
+// ouvraient bien le bon panneau, mais DERRIÈRE lui (même z-index 9600,
+// couleur-detail-overlay plus bas dans le DOM donc peint par-dessus) —
+// invisible, donc « ça ne fait rien » à l'écran. Ce popup n'était jamais
+// enregistré dans le mécanisme ← / retour (_popupFermetures), donc rien
+// ne le refermait non plus en ouvrant l'action. On ferme maintenant
+// explicitement ce popup et on mémorise comment le rouvrir (← le fait).
 
 function _renderRotationCollection(rotation) {
     var container = el('stock-rotation-list');
@@ -4651,8 +5623,20 @@ function _negativesHtml(lignes, positif, total) {
         h += '<div style="font-weight:700;color:#0F172A;margin:10px 0 4px;">' + _escapeHtml(l.variante)
             + ' · ' + _escapeHtml(l.emplacement) + ' · lot ' + _escapeHtml(l.lot)
             + ' · <span style="color:#EF4444;">' + formatNumber(l.quantite) + '</span></div>';
+        // BUG CORRIGÉ (2026-10-24, repéré par l'utilisatrice : « comment tu
+        // as su que c'est ça qui est arrivé, est-ce exact ? ») : le texte
+        // affirmait « commande de caisse introuvable » dès qu'un mouvement
+        // avait un champ origine_saisie (stock.picking.origin, souvent
+        // rempli automatiquement par Odoo, PAS seulement en saisie
+        // manuelle) rempli — sans jamais vérifier si une commande de
+        // caisse avait réellement été retrouvée. Constaté en base (Elite
+        // réf. W93, MaVie réf. 020) : origine_saisie rempli ET caisse/
+        // vendeur bien identifiés (pas « Hors caisse ») — le texte disait
+        // quand même « introuvable », contredisant les colonnes Caisse/
+        // Vendeur juste en dessous dans le même tableau.
+        var HORS_CAISSE = 'Hors caisse : aucune commande de caisse liée';
         var diagnostic = 'Ajustement d’inventaire (aucune sortie retrouvée)';
-        if (l.ventes && l.ventes.some(function(v) { return v.origine_saisie; })) {
+        if (l.ventes && l.ventes.some(function(v) { return v.origine_saisie && v.caisse === HORS_CAISSE; })) {
             diagnostic = 'Sortie saisie à la main (origine saisie, commande de caisse introuvable)';
         } else if (l.ventes && l.ventes.length) {
             diagnostic = 'Vente ou sortie faite sans stock disponible à ce moment';
@@ -5269,6 +6253,7 @@ function _suiviBindOnce() {
 
 async function loadSuivi() {
     _suiviBindOnce();
+    _suiviOngletsBindOnce();
     var tbody = el('suivi-tbody');
     if (tbody) tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#64748B;padding:18px;">Chargement…</td></tr>';
     var data = await rpc('/mavie/api/suivi-transferts', getFilterParams());
@@ -5321,6 +6306,259 @@ function _suiviRenderFiltreMagasin() {
     sel.innerHTML = '<option value="">Tous les magasins</option>'
         + noms.map(function(m) { return '<option value="' + _escapeHtml(m) + '">' + _escapeHtml(m) + '</option>'; }).join('');
     if (noms.indexOf(valeurActuelle) !== -1) sel.value = valeurActuelle;
+}
+
+// ══════════════════════════════════════════════════════════════
+// ONGLETS DE LA PAGE SUIVI — Transferts / Réassort
+//
+// DEMANDE UTILISATRICE (2026-10-19) : « séparer deux pages, une de
+// transferts et une de réassort, comme de solde et transferts » — même
+// motif que les onglets de la page Propositions (_prOnglet), chargement
+// paresseux de l'onglet Réassort à sa première ouverture.
+// ══════════════════════════════════════════════════════════════
+var suiviOnglet = 'su-transferts';
+var suiviReassortCharge = false;
+var suiviOngletsBound = false;
+
+function _suiviOnglet(nom) {
+    suiviOnglet = nom;
+    ['su-transferts', 'su-reassort'].forEach(function(o) {
+        var zone = el('onglet-' + o);
+        if (zone) zone.style.display = o === nom ? '' : 'none';
+        var bouton = el('onglet-btn-' + o);
+        if (bouton) bouton.className = 'pr-onglet' + (o === nom ? ' pr-on' : '');
+    });
+    // Chaque onglet a ses propres boutons Exporter/Rafraîchir (demande
+    // utilisatrice 2026-10-19) : l'export Transferts ne doit pas laisser
+    // croire qu'il couvre aussi le réassort, et inversement.
+    var actions = el('su-head-actions');
+    if (actions) actions.style.display = nom === 'su-transferts' ? 'flex' : 'none';
+    var actionsReassort = el('su-reassort-head-actions');
+    if (actionsReassort) actionsReassort.style.display = nom === 'su-reassort' ? 'flex' : 'none';
+    if (nom === 'su-reassort' && !suiviReassortCharge) {
+        suiviReassortCharge = true;
+        loadSuiviReassort();
+    }
+}
+
+function _suiviOngletsBindOnce() {
+    if (suiviOngletsBound) return;
+    suiviOngletsBound = true;
+    ['su-transferts', 'su-reassort'].forEach(function(o) {
+        var bouton = el('onglet-btn-' + o);
+        if (bouton) bouton.addEventListener('click', function() { _suiviOnglet(o); });
+    });
+}
+
+var suiviReassortState = {
+    order: [], rows: {}, filtre: 'tous', recherche: '', magasin: '', bound: false,
+    open: {}, detail: {},
+};
+
+// DEMANDE UTILISATRICE (2026-10-19) : « je dois aussi avoir le détail de
+// chaque réassort comme ce qui est fait dans transferts » — même mécanisme
+// que _suiviToggleRow, même rendu (_suiviDetailContentHtml est générique :
+// il ne lit que lignes/verifiable/picking_done/valeur_ecart_totale, pas le
+// modèle d'origine), juste une autre route pour aller chercher le détail.
+async function _suiviReassortToggleRow(id) {
+    suiviReassortState.open[id] = !suiviReassortState.open[id];
+    if (suiviReassortState.open[id] && !suiviReassortState.detail[id]) {
+        _suiviReassortRepaint();
+        var r = suiviReassortState.rows[id];
+        var data = await rpc('/mavie/api/suivi-reassort-detail', { id: r.record_id, modele: r.modele });
+        suiviReassortState.detail[id] = _suiviDetailContentHtml(data);
+        _suiviReassortRepaint();
+        return;
+    }
+    _suiviReassortRepaint();
+}
+
+// DEMANDE UTILISATRICE (2026-10-21) : « je dois aussi avoir l'option
+// annuler comme de transferts » — voir api_suivi_reassort_cancel : annule
+// le bon de vente ET retourne la sortie déjà faite au dépôt, pour que le
+// stock dépôt redevienne exact (contrairement à un transfert, où rien n'a
+// encore bougé tant que rien n'est reçu).
+async function _suiviReassortAnnuler(id, nom) {
+    if (!window.confirm('Annuler le réassort ' + nom + ' ?\n\n'
+        + 'La réception au magasin n’est pas encore faite : elle sera annulée, et '
+        + 'les pièces déjà sorties du dépôt y seront remises automatiquement.')) return;
+    var res = await rpc('/mavie/api/suivi-reassort-cancel', { id: parseInt(id, 10) });
+    if (!res || res.error) {
+        window.alert('L’annulation a échoué : ' + ((res && res.error) || 'erreur inconnue'));
+        return;
+    }
+    await loadSuiviReassort();
+}
+
+function _suiviReassortCategorie(r) {
+    if (r.recu === null) return 'attente';
+    if (r.anomalie) return 'anomalies';
+    return 'recu';
+}
+
+function _suiviReassortBindOnce() {
+    if (suiviReassortState.bound) return;
+    suiviReassortState.bound = true;
+    var refresh = el('btn-suivi-reassort-refresh');
+    if (refresh) refresh.addEventListener('click', loadSuiviReassort);
+    var exporter = el('btn-suivi-reassort-export');
+    if (exporter) exporter.addEventListener('click', function() {
+        var params = _buildExportParams({
+            filtre: suiviReassortState.filtre || 'tous',
+            magasin: suiviReassortState.magasin || '',
+            recherche: suiviReassortState.recherche || '',
+        });
+        window.open('/mavie/api/suivi-reassort/export?' + params.toString(), '_blank');
+    });
+    var reassortBody = el('suivi-reassort-tbody');
+    if (reassortBody) reassortBody.addEventListener('click', function(ev) {
+        var annulerLien = ev.target.closest && ev.target.closest('.su-reassort-annuler');
+        if (annulerLien) {
+            ev.preventDefault();
+            _suiviReassortAnnuler(annulerLien.getAttribute('data-id'), annulerLien.getAttribute('data-nom'));
+            return;
+        }
+        var lien = ev.target.closest && ev.target.closest('a');
+        if (lien) return; // laisse le lien vers le bon (nouvel onglet) faire son travail
+        var row = ev.target.closest && ev.target.closest('[data-suivi-reassort-row]');
+        if (row) _suiviReassortToggleRow(row.getAttribute('data-suivi-reassort-row'));
+    });
+    var filtres = el('suivi-reassort-filtres');
+    if (filtres) filtres.addEventListener('click', function(ev) {
+        var btn = ev.target.closest && ev.target.closest('.su-filtre-btn');
+        if (!btn) return;
+        suiviReassortState.filtre = btn.getAttribute('data-filtre');
+        _suiviReassortRepaint();
+    });
+    var recherche = el('suivi-reassort-recherche');
+    if (recherche) {
+        var t = null;
+        recherche.addEventListener('input', function() {
+            clearTimeout(t);
+            t = setTimeout(function() {
+                suiviReassortState.recherche = (recherche.value || '').trim().toLowerCase();
+                _suiviReassortRepaint();
+            }, 180);
+        });
+    }
+    var filtreMagasin = el('suivi-reassort-f-magasin');
+    if (filtreMagasin) filtreMagasin.addEventListener('change', function() {
+        suiviReassortState.magasin = filtreMagasin.value || '';
+        _suiviReassortRepaint();
+    });
+}
+
+async function loadSuiviReassort() {
+    _suiviReassortBindOnce();
+    var tbody = el('suivi-reassort-tbody');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#64748B;padding:18px;">Chargement…</td></tr>';
+    var data = await rpc('/mavie/api/suivi-reassort', getFilterParams());
+    if (!data || data.error) {
+        if (tbody) tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#B91C1C;padding:18px;">'
+            + _escapeHtml((data && data.error) || 'Erreur inconnue') + '</td></tr>';
+        return;
+    }
+    var resume = el('suivi-reassort-resume');
+    if (resume) {
+        resume.innerHTML = formatNumber(data.total) + ' bon(s)'
+            + (data.nb_attente
+                ? ' · <span style="color:#B45309;font-weight:700;">' + formatNumber(data.nb_attente)
+                  + ' en attente de réception</span>'
+                : '')
+            + (data.nb_anomalies
+                ? ' · <span style="color:#B91C1C;font-weight:700;">⚠️ ' + formatNumber(data.nb_anomalies)
+                  + ' avec un écart envoyé/reçu</span>'
+                : ' · aucun écart détecté sur les bons reçus');
+    }
+    suiviReassortState.order = (data.rows || []).map(function(r) { return r.id; });
+    suiviReassortState.rows = {};
+    (data.rows || []).forEach(function(r) { suiviReassortState.rows[r.id] = r; });
+    var sel = el('suivi-reassort-f-magasin');
+    if (sel) {
+        var valeurActuelle = sel.value;
+        // DEMANDE UTILISATRICE (2026-10-20) : « je dois avoir tout les
+        // magasins aussi ici pas juste carré eden et carrefour targa » —
+        // la liste venait des lignes affichées (limitée aux magasins ayant
+        // déjà un réassort) ; on utilise maintenant la liste complète des
+        // magasins configurés envoyée par le serveur (data.magasins).
+        var noms = data.magasins || [];
+        sel.innerHTML = '<option value="">Tous les magasins</option>'
+            + noms.map(function(m) { return '<option value="' + _escapeHtml(m) + '">' + _escapeHtml(m) + '</option>'; }).join('');
+        if (noms.indexOf(valeurActuelle) !== -1) sel.value = valeurActuelle;
+    }
+    _suiviReassortRepaint();
+}
+
+function _suiviReassortFiltrees() {
+    var q = suiviReassortState.recherche;
+    var magasin = suiviReassortState.magasin;
+    return suiviReassortState.order.filter(function(id) {
+        var r = suiviReassortState.rows[id];
+        if (suiviReassortState.filtre !== 'tous' && _suiviReassortCategorie(r) !== suiviReassortState.filtre) return false;
+        if (magasin && r.trajet.indexOf(magasin) === -1) return false;
+        if (q && (r.name + ' ' + r.trajet).toLowerCase().indexOf(q) === -1) return false;
+        return true;
+    });
+}
+
+function _suiviReassortRowHtml(r) {
+    var recuTxt = r.recu === null
+        ? '<span style="color:#94A3B8;">en attente de réception</span>'
+        : formatNumber(r.recu);
+    var ecartTxt = r.ecart === null ? '—'
+        : (r.ecart === 0 ? '<span style="color:#047857;">0</span>'
+                          : '<span style="color:#B91C1C;font-weight:700;">⚠️ ' + (r.ecart > 0 ? '+' : '') + formatNumber(r.ecart) + '</span>');
+    var jours = _suiviJoursDepuis(r.date);
+    var bloque = r.state === 'submitted' && jours !== null && jours >= SUIVI_SEUIL_BLOQUE_JOURS;
+    // DEMANDE UTILISATRICE (2026-10-21) : « je dois aussi avoir l'option
+    // annuler comme de transferts » — seulement la jambe vente (dépôt →
+    // magasin) et seulement avant réception : passé ce stade la
+    // marchandise a bougé pour de vrai côté magasin, api_suivi_reassort_
+    // cancel refuse elle-même (même garde-fou que api_transfer_cancel).
+    var annulerLien = (r.modele === 'sale.order' && r.recu === null && r.state !== 'cancelled')
+        ? ' · <a href="#" class="su-reassort-annuler" data-id="' + r.record_id
+          + '" data-nom="' + _escapeHtml(r.name) + '" style="color:#B91C1C;">Annuler</a>'
+        : '';
+    var etatTxt = _escapeHtml(r.state_label)
+        + (bloque ? '<span class="su-stuck" title="En attente de réception depuis ' + jours + ' jours">⏳ ' + jours + 'j</span>' : '')
+        + annulerLien;
+    var ouvert = !!suiviReassortState.open[r.id];
+    var ligne = '<tr class="su-row" data-suivi-reassort-row="' + r.id + '" style="border-bottom:1px solid #F1F5F9;cursor:pointer;' + (r.anomalie ? 'background:#FEF2F2;' : '') + '">'
+        + '<td style="padding:8px;"><span class="su-caret">▸</span></td>'
+        + '<td style="padding:8px;">' + _lienOdoo(r.name, r.record_id, r.modele) + '</td>'
+        + '<td style="padding:8px;">' + _escapeHtml(r.trajet) + '</td>'
+        + '<td style="padding:8px;">' + etatTxt + '</td>'
+        + '<td style="padding:8px;text-align:center;">' + formatNumber(r.envoye) + '</td>'
+        + '<td style="padding:8px;text-align:center;">' + recuTxt + '</td>'
+        + '<td style="padding:8px;text-align:center;">' + ecartTxt + '</td>'
+        + '<td style="padding:8px;">' + _escapeHtml(r.date) + '</td>'
+        + '</tr>';
+    if (ouvert) {
+        ligne += '<tr class="su-detail-tr"><td colspan="8" style="padding:0;">'
+            + '<div class="su-detail-wrap">' + (suiviReassortState.detail[r.id] || '<span class="rx-muted">Chargement du détail…</span>') + '</div>'
+            + '</td></tr>';
+    }
+    return ligne;
+}
+
+function _suiviReassortRepaint() {
+    var tbody = el('suivi-reassort-tbody');
+    if (!tbody) return;
+    var compte = { tous: suiviReassortState.order.length, attente: 0, anomalies: 0, recu: 0 };
+    suiviReassortState.order.forEach(function(id) { compte[_suiviReassortCategorie(suiviReassortState.rows[id])]++; });
+    (document.querySelectorAll('#suivi-reassort-filtres .su-filtre-btn') || []).forEach(function(btn) {
+        var f = btn.getAttribute('data-filtre');
+        btn.classList.toggle('active', f === suiviReassortState.filtre);
+        var base = btn.textContent.replace(/\s*\(\d+\)$/, '');
+        btn.textContent = base + ' (' + (compte[f] || 0) + ')';
+    });
+    var visibles = _suiviReassortFiltrees();
+    if (!visibles.length) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#64748B;padding:18px;">'
+            + (suiviReassortState.order.length ? 'Aucun bon ne correspond à ce filtre.' : 'Aucun réassort envoyé vers un magasin.') + '</td></tr>';
+        return;
+    }
+    tbody.innerHTML = visibles.map(function(id) { return _suiviReassortRowHtml(suiviReassortState.rows[id]); }).join('');
 }
 
 async function _suiviSetNote(id) {
@@ -5420,6 +6658,20 @@ function _suiviRepaint() {
 // envoyé/reçu, sur les bons vérifiables de cette page (calcul client, à
 // partir de ce qui est déjà chargé — pas de nouvel appel serveur).
 function _suiviVerifHtml(r) {
+    // DEMANDE UTILISATRICE (2026-10-19) : les lignes de réassort (r.modele
+    // = 'sale.order') n'ont pas de validation/note manuelle dans ce module
+    // (ces champs n'existent que sur inter.internal.transfer) — on affiche
+    // un simple statut en lecture seule plutôt qu'un bouton qui écrirait
+    // sur le mauvais modèle.
+    if (r.modele) {
+        if (r.recu === null) return '<span class="su-attente">en attente de réception magasin</span>';
+        if (r.anomalie) {
+            var mot2 = r.ecart > 0 ? ('il manque ' + formatNumber(r.ecart) + ' pièce' + (r.ecart > 1 ? 's' : ''))
+                                    : (formatNumber(Math.abs(r.ecart)) + ' pièce' + (Math.abs(r.ecart) > 1 ? 's' : '') + ' en trop');
+            return '<span class="su-alerte" title="Envoyé ' + r.envoye + ', reçu ' + r.recu + '">⚠️ ' + mot2 + '</span>';
+        }
+        return '<span class="su-valide-ok">✓ reçu</span>';
+    }
     // DEMANDE UTILISATEUR (2026-10-12) : un bon inter-sociétés "Fait" dont le
     // stock de destination confirme l'arrivée (stock_verif='ok') affichait
     // "non vérifiable" — vrai au sens du picking suivi par le dashboard,
@@ -5479,9 +6731,16 @@ function _suiviRowHtml(r) {
         && jours !== null && jours >= SUIVI_SEUIL_BLOQUE_JOURS;
     var etatTxt = _escapeHtml(r.state_label)
         + (bloque ? '<span class="su-stuck" title="Ni collecté ni validé depuis ' + jours + ' jours">⏳ ' + jours + 'j</span>' : '');
+    // DEMANDE UTILISATRICE (2026-10-19) : les lignes de réassort portent un
+    // modèle et un id réel différents (sale.order, pas inter.internal.
+    // transfer) — r.id lui-même est une clé d'état JS préfixée
+    // ("reassort-123"), pas l'id Odoo à ouvrir.
+    var lienNom = r.modele
+        ? _lienOdoo(r.name, r.record_id, r.modele)
+        : _lienTransfert(r.name, r.id);
     var ligne = '<tr class="su-row" data-suivi-row="' + r.id + '" data-open="' + (ouvert ? '1' : '0') + '" style="border-bottom:1px solid #F1F5F9;' + (r.anomalie ? 'background:#FEF2F2;' : '') + '">'
-        + '<td style="padding:8px;"><span class="su-caret">▸</span></td>'
-        + '<td style="padding:8px;">' + _lienTransfert(r.name, r.id) + '</td>'
+        + '<td style="padding:8px;">' + (r.modele ? '' : '<span class="su-caret">▸</span>') + '</td>'
+        + '<td style="padding:8px;">' + lienNom + '</td>'
         + '<td style="padding:8px;">' + _escapeHtml(r.trajet) + '</td>'
         + '<td style="padding:8px;">' + etatTxt + '</td>'
         + '<td style="padding:8px;text-align:center;">' + formatNumber(r.envoye) + '</td>'
@@ -5507,9 +6766,11 @@ function _suiviDetailContentHtml(data) {
     if (!data.lignes || !data.lignes.length) {
         return '<span class="rx-muted">Aucune ligne.</span>';
     }
+    var labelSource = data.label_source || 'Stock magasin source';
+    var labelDest = data.label_dest || 'Stock magasin destination';
     var h = '<table class="su-detail-table"><thead><tr>'
-          + '<th>Référence</th><th class="num">Stock magasin source</th><th class="num">Envoyé</th>'
-          + '<th class="num">Stock magasin destination</th><th class="num">Reçu</th><th class="num">Écart</th>'
+          + '<th>Référence</th><th class="num">' + _escapeHtml(labelSource) + '</th><th class="num">Envoyé</th>'
+          + '<th class="num">' + _escapeHtml(labelDest) + '</th><th class="num">Reçu</th><th class="num">Écart</th>'
           + '<th class="num">Valeur de l’écart</th><th>Bon concerné</th>'
           + '</tr></thead><tbody>';
     data.lignes.forEach(function(l) {
@@ -5593,7 +6854,7 @@ async function loadHistory() {
     var data = await rpc('/mavie/api/history', getFilterParams());
     if (seq !== _reqSeq.history) return;
     if (!data || data.error) {
-        lastHistory = { transfers: [], soldes: [] };
+        lastHistory = { transfers: [], reassort: [], soldes: [] };
         var summaryErr = el('history-summary');
         if (summaryErr) summaryErr.textContent = 'Erreur : ' + ((data && data.error) || 'inconnue');
         return;
@@ -5605,8 +6866,10 @@ async function loadHistory() {
 function setHistoryTab(tab) {
     historyTab = tab;
     var tabTransferts = el('history-tab-transferts');
+    var tabReassort = el('history-tab-reassort');
     var tabSoldes = el('history-tab-soldes');
     if (tabTransferts) tabTransferts.classList.toggle('active', tab === 'transferts');
+    if (tabReassort) tabReassort.classList.toggle('active', tab === 'reassort');
     if (tabSoldes) tabSoldes.classList.toggle('active', tab === 'soldes');
     _renderHistory();
 }
@@ -5635,7 +6898,9 @@ function _renderHistory() {
         theadRow.appendChild(th);
     });
 
-    var rows = historyTab === 'soldes' ? (lastHistory.soldes || []) : (lastHistory.transfers || []);
+    var rows = historyTab === 'soldes' ? (lastHistory.soldes || [])
+        : historyTab === 'reassort' ? (lastHistory.reassort || [])
+        : (lastHistory.transfers || []);
 
     if (summaryEl) {
         summaryEl.textContent = historyTab === 'soldes'
@@ -5647,6 +6912,9 @@ function _renderHistory() {
               + (lastHistory.soldes_tronque
                   ? ' — les ' + formatNumber(lastHistory.soldes_affiches || 0) + ' plus récentes sont affichées'
                   : '')
+            : historyTab === 'reassort'
+            ? formatNumber(lastHistory.reassort_count || 0) + ' bons de réassort · '
+              + formatNumber(lastHistory.reassort_qty || 0) + ' pièces envoyées du dépôt'
             : formatNumber(lastHistory.transfers_count || 0) + ' bons de transfert · '
               + formatNumber(lastHistory.transfers_qty || 0) + ' pièces déplacées';
     }
@@ -5655,12 +6923,15 @@ function _renderHistory() {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
         td.colSpan = columns.length;
-        // L'historique ne liste QUE les transferts lancés depuis le
-        // dashboard : il démarre donc vide, sans reprendre les bons créés
-        // auparavant par le formulaire Odoo. On l'explique plutôt que de
-        // laisser croire à un filtre trop restrictif ou à un bug.
+        // L'historique ne liste QUE les transferts/réassorts lancés depuis
+        // le dashboard : il démarre donc vide, sans reprendre les bons
+        // créés auparavant par le formulaire Odoo. On l'explique plutôt
+        // que de laisser croire à un filtre trop restrictif ou à un bug.
         td.textContent = historyTab === 'soldes'
             ? 'Aucune vente en solde sur ce périmètre.'
+            : historyTab === 'reassort'
+            ? 'Aucun réassort sur ce périmètre. '
+              + 'Les bons envoyés depuis la page Action apparaîtront ici.'
             : 'Aucun transfert sur ce périmètre. '
               + 'Les bons créés ici apparaîtront dans cette liste ; '
               + 'les transferts antérieurs restent consultables dans Odoo (Transferts internes).';
@@ -5687,17 +6958,103 @@ function _renderHistory() {
 
         if (historyTab === 'soldes') {
             tr.style.cursor = 'pointer';
-            tr.onclick = function() { openDetail(r.id, r.name); };
+            // DEMANDE UTILISATRICE (2026-10-26) : une solde posée en lot
+            // (Collection/Catégorie/Couleur) tient sur UNE ligne — cliquer
+            // dessus ouvre le détail de toutes ses références, pas une
+            // fiche produit (il n'y a pas UNE référence sur cette ligne).
+            if (r.group_ref) {
+                tr.style.background = 'rgba(79,70,229,0.04)';
+                tr.onclick = function() { _sdOuvrirGroupeDetail(r.group_ref, r.name); };
+                tr.appendChild(cell(r.date, '#64748B'));
+                tr.appendChild(cell(r.ticket, '#64748B'));
+                tr.appendChild(cell(r.magasin));
+                tr.appendChild(cell('📦 ' + formatNumber(r.nb_references || 0) + ' réf.', '#4F46E5', '700'));
+                tr.appendChild(cell(r.name, '#0F172A', '600'));
+                tr.appendChild(cell('—', null, null, 'center'));
+                tr.appendChild(cell('—', '#64748B', null, 'right'));
+                tr.appendChild(cell('-' + (r.remise_pct || 0).toFixed(1).replace('.', ',') + ' %',
+                                    '#DC2626', '700', 'center'));
+                tr.appendChild(cell('Voir le détail →', '#4F46E5', '600', 'right'));
+            } else {
+                tr.onclick = function() { openDetail(r.id, r.name); };
+                tr.appendChild(cell(r.date, '#64748B'));
+                tr.appendChild(cell(r.ticket, '#64748B'));
+                tr.appendChild(cell(r.magasin));
+                tr.appendChild(cell(r.ref, '#64748B', '600'));
+                tr.appendChild(cell(r.name, '#0F172A', '600'));
+                tr.appendChild(cell(formatNumber(r.qty), null, '700', 'center'));
+                tr.appendChild(cell(formatMAD(r.prix_catalogue), '#64748B', null, 'right'));
+                tr.appendChild(cell('-' + (r.remise_pct || 0).toFixed(1).replace('.', ',') + ' %',
+                                    '#DC2626', '700', 'center'));
+                tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
+            }
+        } else if (historyTab === 'reassort') {
+            // DEMANDE UTILISATRICE (2026-10-26) : « fais pareil pour
+            // réassort » — un réassort posé en lot (Collection/Catégorie/
+            // Couleur) tient sur une seule ligne cliquable, qui ouvre le
+            // détail de chaque référence (même principe que Solder).
+            if (r.group_ref) {
+                tr.style.cursor = 'pointer';
+                tr.style.background = 'rgba(217,119,6,0.05)';
+                tr.onclick = function() { _raOuvrirGroupeDetail(r.group_ref, r.name); };
+                var bonCellG = document.createElement('td');
+                bonCellG.style.cssText = 'padding:9px 8px;font-size:0.84rem;font-weight:700;color:#D97706;';
+                bonCellG.textContent = '📦 ' + (r.name || 'Groupe');
+                tr.appendChild(bonCellG);
+                tr.appendChild(cell(r.date, '#64748B'));
+                tr.appendChild(cell('Plusieurs bons', '#64748B', '600'));
+                tr.appendChild(cell('Voir le détail →', '#D97706', '600'));
+                tr.appendChild(cell(r.source_societe, '#475569'));
+                tr.appendChild(cell(r.source_magasin, '#0F172A', '600'));
+                tr.appendChild(cell('—', '#475569'));
+                tr.appendChild(cell('—', '#94A3B8'));
+                tr.appendChild(cell('Réassort', '#D97706'));
+                tr.appendChild(cell(formatNumber(r.nb_references), null, null, 'center'));
+                tr.appendChild(cell(formatNumber(r.qty), null, '700', 'center'));
+                tbody.appendChild(tr);
+                return;
+            }
+            // Même disposition de colonnes que les transferts, mais le bon
+            // est un sale.order (ouvert via son propre modèle) et l'état
+            // n'a que 3 valeurs (en attente / reçu / annulé), sans les 4
+            // étapes du circuit transfert_interne.
+            tr.style.cursor = 'pointer';
+            tr.addEventListener('click', function(ev) {
+                if (ev.target.closest('a, button')) return;
+                window.open('/web#id=' + r.id + '&model=sale.order&view_type=form', '_blank');
+            });
+            var bonCellR = document.createElement('td');
+            bonCellR.style.cssText = 'padding:9px 8px;font-size:0.84rem;font-weight:700;';
+            var bonLienR = document.createElement('a');
+            bonLienR.textContent = r.name;
+            bonLienR.href = '/web#id=' + r.id + '&model=sale.order&view_type=form';
+            bonLienR.target = '_blank';
+            bonLienR.style.cssText = 'color:#2563EB;font-weight:700;text-decoration:none;';
+            bonCellR.appendChild(bonLienR);
+            tr.appendChild(bonCellR);
             tr.appendChild(cell(r.date, '#64748B'));
-            tr.appendChild(cell(r.ticket, '#64748B'));
-            tr.appendChild(cell(r.magasin));
-            tr.appendChild(cell(r.ref, '#64748B', '600'));
-            tr.appendChild(cell(r.name, '#0F172A', '600'));
+            var etatColor = r.state === 'cancelled' ? '#94A3B8' : (r.state === 'done' ? '#059669' : '#D97706');
+            tr.appendChild(cell(r.state_label, etatColor, '600'));
+            var opCellR = cell(r.picking_name || '—', r.picking_name ? '#2563EB' : '#94A3B8',
+                               r.picking_name ? '600' : null);
+            if (r.picking_id) {
+                opCellR.textContent = '';
+                var lienR = document.createElement('a');
+                lienR.textContent = r.picking_name;
+                lienR.href = '/web#id=' + r.picking_id + '&model=stock.picking&view_type=form';
+                lienR.target = '_blank';
+                lienR.title = 'Ouvrir la réception dans Inventaire → Transferts';
+                lienR.style.cssText = 'color:#2563EB;font-weight:600;text-decoration:none;';
+                opCellR.appendChild(lienR);
+            }
+            tr.appendChild(opCellR);
+            tr.appendChild(cell(r.source_societe, '#475569'));
+            tr.appendChild(cell(r.source_magasin, '#0F172A', '600'));
+            tr.appendChild(cell(r.dest_societe, '#475569'));
+            tr.appendChild(cell(r.dest_magasin, '#0F172A', '600'));
+            tr.appendChild(cell('Réassort', '#D97706'));
+            tr.appendChild(cell(formatNumber(r.nb_references), null, null, 'center'));
             tr.appendChild(cell(formatNumber(r.qty), null, '700', 'center'));
-            tr.appendChild(cell(formatMAD(r.prix_catalogue), '#64748B', null, 'right'));
-            tr.appendChild(cell('-' + (r.remise_pct || 0).toFixed(1).replace('.', ',') + ' %',
-                                '#DC2626', '700', 'center'));
-            tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
         } else {
             // DEMANDE UTILISATEUR (2026-10-12) : chaque bon cliquable (ouvre
             // le transfert dans Odoo, même lien que la colonne « Bon » de
@@ -5749,6 +7106,140 @@ function _renderHistory() {
 
         tbody.appendChild(tr);
     });
+}
+
+// DEMANDE UTILISATRICE (2026-10-26) : popup de détail pour une solde
+// posée en lot — une ligne par référence du lot (tri par référence),
+// réutilise /mavie/api/soldes-journal (déjà appelé par le Journal des
+// soldes) et filtre côté client sur group_ref — pas de nouvel endpoint.
+async function _sdOuvrirGroupeDetail(groupRef, label) {
+    var overlay = el('solde-groupe-detail-overlay');
+    if (!overlay || !groupRef) return;
+    var header = el('solde-groupe-detail-header');
+    var body = el('solde-groupe-detail-body');
+    if (header) header.textContent = label || 'Groupe';
+    if (body) body.innerHTML = '<div class="ac-empty">Chargement…</div>';
+    overlay.classList.add('active');
+
+    var data = await rpc('/mavie/api/soldes-journal', {});
+    if (!body) return;
+    var brutes = ((data && data.rows) || []).filter(function(r) { return r.group_ref === groupRef; });
+
+    // BUG CORRIGÉ (2026-10-26, repéré par l'utilisatrice : « ya que 38
+    // références mais le popup en montre 62 ») : une même référence vendue
+    // dans PLUSIEURS sociétés crée UNE promotion par société (voir
+    // _solde_creer_promotion) — donc plusieurs entrées dans le journal pour
+    // la MÊME référence. On les fusionne ici en une seule ligne par
+    // référence, avec la liste complète des magasins (pas juste leur
+    // nombre — autre demande : « il doivent afficher les magasins exact
+    // non seulement le nombre »).
+    var parRef = {};
+    var ordre = [];
+    brutes.forEach(function(r) {
+        var cle = r.article_id;
+        if (!parRef[cle]) {
+            parRef[cle] = { article_id: r.article_id, reference: r.reference, produit: r.produit,
+                prix_catalogue: r.prix_catalogue, prix_solde: r.prix_solde, remise: r.remise, magasins: [] };
+            ordre.push(cle);
+        }
+        (r.magasins && r.magasins.length ? r.magasins : [r.magasin]).forEach(function(nomMagasin) {
+            if (nomMagasin && parRef[cle].magasins.indexOf(nomMagasin) === -1) parRef[cle].magasins.push(nomMagasin);
+        });
+    });
+    var lignes = ordre.map(function(cle) { return parRef[cle]; });
+    lignes.sort(function(a, b) { return (a.reference || '').localeCompare(b.reference || ''); });
+
+    if (header) {
+        header.textContent = formatNumber(lignes.length) + ' référence' + (lignes.length > 1 ? 's' : '')
+            + ' · ' + (label || 'Groupe') + (lignes.length ? ' · -' + (lignes[0].remise || 0).toFixed(1).replace('.', ',') + ' %' : '');
+    }
+    if (!lignes.length) {
+        body.innerHTML = '<div class="ac-empty">Aucune référence trouvée pour ce lot.</div>';
+        return;
+    }
+    body.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
+        + '<thead><tr style="background:#F8FAFC;text-align:left;">'
+        + '<th style="padding:8px;">Référence</th><th style="padding:8px;">Produit</th>'
+        + '<th style="padding:8px;">Magasin(s)</th><th style="padding:8px;text-align:right;">Prix catalogue</th>'
+        + '<th style="padding:8px;text-align:right;">Prix soldé</th></tr></thead><tbody>'
+        + lignes.map(function(r) {
+            return '<tr style="border-bottom:1px solid #F1F5F9;cursor:pointer;" data-article="' + r.article_id + '" data-name="' + _escapeHtml(r.produit || '') + '">'
+                + '<td style="padding:8px;font-weight:600;">' + _escapeHtml(r.reference || '—') + '</td>'
+                + '<td style="padding:8px;">' + _escapeHtml(r.produit || '—') + '</td>'
+                + '<td style="padding:8px;">' + _escapeHtml(r.magasins.join(', ') || '—') + '</td>'
+                + '<td style="padding:8px;text-align:right;color:#64748B;">' + formatMAD(r.prix_catalogue) + '</td>'
+                + '<td style="padding:8px;text-align:right;font-weight:600;">' + formatMAD(r.prix_solde) + '</td>'
+                + '</tr>';
+        }).join('') + '</tbody></table>';
+    Array.prototype.forEach.call(body.querySelectorAll('tr[data-article]'), function(tr) {
+        tr.addEventListener('click', function() {
+            var aid = parseInt(tr.getAttribute('data-article'), 10);
+            if (!aid) return;
+            closeSoldeGroupeDetail();
+            _setRetour('detail-overlay', function() { _sdOuvrirGroupeDetail(groupRef, label); });
+            openDetail(aid, tr.getAttribute('data-name') || '');
+        });
+    });
+}
+
+function closeSoldeGroupeDetail() {
+    var overlay = el('solde-groupe-detail-overlay');
+    if (overlay) overlay.classList.remove('active');
+}
+
+// DEMANDE UTILISATRICE (2026-10-26) : « fais pareil pour réassort » —
+// popup de détail pour un réassort posé en lot, un bon par référence.
+async function _raOuvrirGroupeDetail(groupRef, label) {
+    var overlay = el('reassort-groupe-detail-overlay');
+    if (!overlay || !groupRef) return;
+    var header = el('reassort-groupe-detail-header');
+    var body = el('reassort-groupe-detail-body');
+    if (header) header.textContent = label || 'Groupe';
+    if (body) body.innerHTML = '<div class="ac-empty">Chargement…</div>';
+    overlay.classList.add('active');
+
+    var data = await rpc('/mavie/api/reassort-groupe-detail', { group_ref: groupRef });
+    if (!body) return;
+    var lignes = (data && data.rows) || [];
+    lignes.sort(function(a, b) { return (a.reference || '').localeCompare(b.reference || ''); });
+
+    if (header) {
+        header.textContent = formatNumber(lignes.length) + ' référence' + (lignes.length > 1 ? 's' : '')
+            + ' · ' + (label || 'Groupe') + ' · ' + formatNumber(lignes.reduce(function(a, r) { return a + (r.qty || 0); }, 0)) + ' pièces';
+    }
+    if (!lignes.length) {
+        body.innerHTML = '<div class="ac-empty">Aucune référence trouvée pour ce lot.</div>';
+        return;
+    }
+    body.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
+        + '<thead><tr style="background:#F8FAFC;text-align:left;">'
+        + '<th style="padding:8px;">Référence</th><th style="padding:8px;">Bon</th>'
+        + '<th style="padding:8px;">Magasin cible</th><th style="padding:8px;">État</th>'
+        + '<th style="padding:8px;text-align:center;">Qté</th></tr></thead><tbody>'
+        + lignes.map(function(r) {
+            var etatColor = r.state === 'cancelled' ? '#94A3B8' : (r.state === 'done' ? '#059669' : '#D97706');
+            return '<tr style="border-bottom:1px solid #F1F5F9;cursor:pointer;" data-article="' + (r.article_id || '') + '" data-name="' + _escapeHtml(r.reference || '') + '">'
+                + '<td style="padding:8px;font-weight:600;">' + _escapeHtml(r.reference || '—') + '</td>'
+                + '<td style="padding:8px;color:#2563EB;">' + _escapeHtml(r.name || '—') + '</td>'
+                + '<td style="padding:8px;">' + _escapeHtml(r.dest_magasin || '—') + '</td>'
+                + '<td style="padding:8px;color:' + etatColor + ';font-weight:600;">' + _escapeHtml(r.state_label || '—') + '</td>'
+                + '<td style="padding:8px;text-align:center;font-weight:600;">' + formatNumber(r.qty || 0) + '</td>'
+                + '</tr>';
+        }).join('') + '</tbody></table>';
+    Array.prototype.forEach.call(body.querySelectorAll('tr[data-article]'), function(tr) {
+        var aid = parseInt(tr.getAttribute('data-article'), 10);
+        if (!aid) return;
+        tr.addEventListener('click', function() {
+            closeReassortGroupeDetail();
+            _setRetour('detail-overlay', function() { _raOuvrirGroupeDetail(groupRef, label); });
+            openDetail(aid, tr.getAttribute('data-name') || '');
+        });
+    });
+}
+
+function closeReassortGroupeDetail() {
+    var overlay = el('reassort-groupe-detail-overlay');
+    if (overlay) overlay.classList.remove('active');
 }
 
 // Bouton « Test » de l'historique (demande utilisatrice 2026-09-23) :
@@ -5841,8 +7332,10 @@ function closeProductHistory() {
 
 function _syncProductHistoryTabs() {
     var tabT = el('product-history-tab-transferts');
+    var tabR = el('product-history-tab-reassort');
     var tabS = el('product-history-tab-soldes');
     if (tabT) tabT.classList.toggle('active', productHistoryTab === 'transferts');
+    if (tabR) tabR.classList.toggle('active', productHistoryTab === 'reassort');
     if (tabS) tabS.classList.toggle('active', productHistoryTab === 'soldes');
 
     var subtabsContainer = el('product-history-soldes-subtabs');
@@ -5880,9 +7373,12 @@ function _renderProductHistory() {
     tbody.innerHTML = '';
 
     var isSoldes = productHistoryTab === 'soldes';
+    var isReassort = productHistoryTab === 'reassort';
     var columns = isSoldes
         ? ['Date', 'Ticket', 'Magasin', 'Couleur', 'Taille', 'Qté',
            'Prix catalogue (TTC)', 'Remise', 'Prix payé (TTC)']
+        : isReassort
+        ? ['Bon', 'Date', 'État', 'Société source', 'Magasin source', 'Magasin cible', 'Qté']
         : ['Bon', 'Date', 'État', 'Origine', 'Magasin source', 'Magasin cible',
            'Couleur', 'Taille', 'Qté'];
     columns.forEach(function(label) {
@@ -5894,7 +7390,7 @@ function _renderProductHistory() {
     });
 
     var data = lastProductHistory || {};
-    var rawRows = isSoldes ? (data.soldes || []) : (data.transfers || []);
+    var rawRows = isSoldes ? (data.soldes || []) : (isReassort ? (data.reassort || []) : (data.transfers || []));
     var rows = rawRows;
 
     if (isSoldes) {
@@ -5922,6 +7418,9 @@ function _renderProductHistory() {
                 + formatNumber(totalQty) + ' pièces · '
                 + formatMAD(totalCa) + ' encaissés'
                 + (retoursCount ? ' · dont ' + formatNumber(retoursCount) + ' retour(s) client' : '');
+        } else if (isReassort) {
+            summaryEl.textContent = formatNumber(data.reassort_bons || 0) + ' bon(s) de réassort · '
+                + formatNumber(data.reassort_qty || 0) + ' pièces envoyées du dépôt';
         } else {
             summaryEl.textContent = formatNumber(data.transfers_bons || 0) + ' bon(s) de transfert · '
                 + formatNumber(data.transfers_count || 0) + ' ligne(s) · '
@@ -5935,6 +7434,8 @@ function _renderProductHistory() {
         td.colSpan = columns.length;
         td.textContent = isSoldes
             ? 'Cette référence n\'a jamais été vendue en solde.'
+            : isReassort
+            ? 'Cette référence n\'a jamais fait l\'objet d\'un réassort.'
             : 'Cette référence n\'a jamais fait l\'objet d\'un transfert.';
         td.style.cssText = 'text-align:center;padding:24px;color:#94A3B8;';
         tr.appendChild(td);
@@ -5979,6 +7480,20 @@ function _renderProductHistory() {
             }
             tr.appendChild(remiseCell);
             tr.appendChild(cell(formatMAD(r.prix_paye), '#0F172A', '600', 'right'));
+        } else if (isReassort) {
+            var raColor = r.state === 'done' ? '#10B981'
+                : (r.state === 'cancelled' ? '#DC2626' : '#F59E0B');
+            tr.appendChild(cell(r.name, '#0F172A', '700'));
+            tr.appendChild(cell(r.date, '#64748B'));
+            tr.appendChild(cell(r.state_label, raColor, '600'));
+            tr.appendChild(cell(r.source_societe, '#64748B'));
+            var raSrc = cell(r.source_magasin, '#0F172A', '600');
+            raSrc.title = r.source_societe;
+            tr.appendChild(raSrc);
+            var raDst = cell(r.dest_magasin, '#0F172A', '600');
+            raDst.title = r.dest_societe;
+            tr.appendChild(raDst);
+            tr.appendChild(cell(formatNumber(r.qty), null, '700', 'center'));
         } else {
             var stateColor = r.state === 'done' ? '#10B981'
                 : (r.state === 'transmitted' ? '#2563EB'
@@ -6022,14 +7537,56 @@ document.addEventListener('DOMContentLoaded', function() {
 
     _initPeriodFilters();
 
-    // CORRECTION #1 : Chargement en parallèle pour accélérer l'affichage
-    // On lance les filtres et les KPIs en même temps
+    // Vue unifiée déjà activée depuis une session précédente (choix
+    // mémorisé par navigateur) : poser les limites compactes AVANT le
+    // premier chargement, sinon le premier rendu part sur les valeurs
+    // par défaut (10) au lieu de 3.
+    if (state.vueUnifiee) _appliquerLimitesVueUnifiee(true);
+
+    // DEMANDE UTILISATRICE (2026-10-26) : filtres mémorisés d'une page à
+    // l'autre (point 1 de l'audit UX — chaque page du menu recharge un
+    // iframe tout neuf, donc rien ne survit normalement). S'il y a des
+    // filtres sauvegardés, on attend que loadFilters() ait rempli les
+    // listes déroulantes/cases AVANT de les poser et de lancer le premier
+    // calcul — sinon updateFiltersFromUI() (1re ligne de loadKPIs) relirait
+    // un DOM encore vide et écraserait aussitôt ce qu'on vient de poser.
+    // CORRECTION #1 (historique) : Chargement en parallèle pour accélérer
+    // l'affichage — toujours vrai quand il n'y a RIEN à restaurer (cas le
+    // plus fréquent), pour ne pas ralentir le premier affichage.
+    var filtresASauvegarder = _filtresSauvegardes();
     var filtersPromise = loadFilters();
-    filtersPromise.then(function() {
-        // Rien à faire ici, loadKPIs est déjà lancé ci-dessous
-    });
-    // KPIs lancés immédiatement sans attendre les filtres
-    loadKPIs();
+    if (filtresASauvegarder) {
+        filtersPromise.then(function() {
+            _restaurerFiltresDOM();
+            loadKPIs();
+        });
+    } else {
+        loadKPIs();
+    }
+
+    // DEMANDE UTILISATRICE (2026-10-23) : bouton de bascule vers la vue
+    // unifiée du Tableau de bord — visible seulement sur cette page,
+    // réversible en un clic (voir _refreshVueUnifieeBouton, appelé par
+    // adjustUIForPage à chaque changement de page/filtre).
+    var btnVueUnifiee = el('btn-vue-unifiee');
+    if (btnVueUnifiee) {
+        btnVueUnifiee.addEventListener('click', function() {
+            state.vueUnifiee = !state.vueUnifiee;
+            try { localStorage.setItem('mavie_vue_unifiee', state.vueUnifiee ? '1' : '0'); }
+            catch (e) {}
+            _appliquerLimitesVueUnifiee(state.vueUnifiee);
+            loadKPIs();
+        });
+    }
+    var vuNavEl = el('vu-nav');
+    if (vuNavEl) {
+        vuNavEl.querySelectorAll('a[data-vu-cible]').forEach(function(lien) {
+            lien.addEventListener('click', function() {
+                var cible = el(lien.getAttribute('data-vu-cible'));
+                if (cible && cible.scrollIntoView) cible.scrollIntoView({behavior: 'smooth', block: 'start'});
+            });
+        });
+    }
 
     var chartModeArrivageBtn = el('chart-mode-arrivage');
     if (chartModeArrivageBtn) {
@@ -6038,6 +7595,14 @@ document.addEventListener('DOMContentLoaded', function() {
     var chartModeShopBtn = el('chart-mode-shop');
     if (chartModeShopBtn) {
         chartModeShopBtn.addEventListener('click', function() { setSalesChartMode('shop'); });
+    }
+    var achatsChartModeArrivageBtn = el('achats-chart-mode-arrivage');
+    if (achatsChartModeArrivageBtn) {
+        achatsChartModeArrivageBtn.addEventListener('click', function() { setAchatsChartMode('arrivage'); });
+    }
+    var achatsChartModeShopBtn = el('achats-chart-mode-shop');
+    if (achatsChartModeShopBtn) {
+        achatsChartModeShopBtn.addEventListener('click', function() { setAchatsChartMode('shop'); });
     }
 
     ['filter-collection', 'filter-batch'].forEach(function(id) {
@@ -6164,10 +7729,27 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
+    // BUG CORRIGÉ (2026-10-23) : la fiche produit a son propre filtre
+    // magasin (detail-filter-magasin / state.detail.shop_field), mais les
+    // boutons Solder/Transférer l'ignoraient complètement — même lacune
+    // que celle corrigée sur le popup Couleur.
+    // BUG CORRIGÉ (2026-10-23, repéré par l'utilisatrice : « je parle
+    // aussi de sortie et entrer de plusieurs popup ») : ces deux boutons
+    // ouvraient Solder/Transférer PAR-DESSUS la fiche produit, sans la
+    // fermer ni enregistrer de chemin de retour — contrairement à tous
+    // les autres enchaînements de popups (Couleur, Fiche couleur), qui
+    // ferment l'origine et posent _setRetour pour que le bouton « ← »
+    // revienne correctement. Le bouton « ← » n'apparaissait donc jamais
+    // sur Solder/Transférer quand on y arrivait depuis la fiche produit.
     var openSoldeBtn = el('btn-open-solde');
     if (openSoldeBtn) {
         openSoldeBtn.addEventListener('click', function() {
-            if (state.detail.article_id) openSoldePanel(state.detail.article_id);
+            if (!state.detail.article_id) return;
+            var articleId = state.detail.article_id;
+            var shopField = state.detail.shop_field;
+            closeDetail();
+            _setRetour('solde-overlay', function() { openDetail(articleId, '', shopField); });
+            openSoldePanel(articleId, '', null, shopField);
         });
     }
 
@@ -6175,8 +7757,32 @@ document.addEventListener('DOMContentLoaded', function() {
     if (openTransferBtn) {
         openTransferBtn.addEventListener('click', function() {
             if (!state.detail.article_id) return;
+            var articleId = state.detail.article_id;
+            var shopField = state.detail.shop_field;
             var nameEl = el('detail-name');
-            openTransferPanel(state.detail.article_id, nameEl ? nameEl.textContent : '');
+            var nom = nameEl ? nameEl.textContent : '';
+            closeDetail();
+            _setRetour('transfer-overlay', function() { openDetail(articleId, nom, shopField); });
+            openTransferPanel(articleId, nom, null, shopField);
+        });
+    }
+
+    // DEMANDE UTILISATRICE (2026-10-24) : « ajoute aussi bouton de réassort
+    // dans fiche de produit » — même principe de fermeture + retour que
+    // Transférer/Solder ci-dessus.
+    var openReassortBtn = el('btn-open-reassort');
+    if (openReassortBtn) {
+        openReassortBtn.addEventListener('click', function() {
+            if (!state.detail.article_id) return;
+            var articleId = state.detail.article_id;
+            var shopField = state.detail.shop_field;
+            var nameEl = el('detail-name');
+            var nom = nameEl ? nameEl.textContent : '';
+            var refEl = el('detail-ref');
+            var ref = refEl ? refEl.textContent : nom;
+            closeDetail();
+            _setRetour('ac-reassort-overlay', function() { openDetail(articleId, nom, shopField); });
+            openActionReassort({ id: articleId, ref: ref });
         });
     }
 
@@ -6197,6 +7803,10 @@ document.addEventListener('DOMContentLoaded', function() {
     var prodHistTabT = el('product-history-tab-transferts');
     if (prodHistTabT) {
         prodHistTabT.addEventListener('click', function() { setProductHistoryTab('transferts'); });
+    }
+    var prodHistTabR = el('product-history-tab-reassort');
+    if (prodHistTabR) {
+        prodHistTabR.addEventListener('click', function() { setProductHistoryTab('reassort'); });
     }
     var prodHistTabS = el('product-history-tab-soldes');
     if (prodHistTabS) {
@@ -6469,6 +8079,28 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
+    // ── Détail d'une solde posée en lot (DEMANDE UTILISATRICE 2026-10-26) ──
+    var closeSoldeGroupeDetailBtn = el('close-solde-groupe-detail-btn');
+    if (closeSoldeGroupeDetailBtn) closeSoldeGroupeDetailBtn.addEventListener('click', closeSoldeGroupeDetail);
+
+    var soldeGroupeDetailOverlay = el('solde-groupe-detail-overlay');
+    if (soldeGroupeDetailOverlay) {
+        soldeGroupeDetailOverlay.addEventListener('click', function(e) {
+            if (e.target === soldeGroupeDetailOverlay) closeSoldeGroupeDetail();
+        });
+    }
+
+    // ── Détail d'un réassort posé en lot (DEMANDE UTILISATRICE 2026-10-26) ──
+    var closeReassortGroupeDetailBtn = el('close-reassort-groupe-detail-btn');
+    if (closeReassortGroupeDetailBtn) closeReassortGroupeDetailBtn.addEventListener('click', closeReassortGroupeDetail);
+
+    var reassortGroupeDetailOverlay = el('reassort-groupe-detail-overlay');
+    if (reassortGroupeDetailOverlay) {
+        reassortGroupeDetailOverlay.addEventListener('click', function(e) {
+            if (e.target === reassortGroupeDetailOverlay) closeReassortGroupeDetail();
+        });
+    }
+
     // ── Valorisation : détail par magasin d'une société ──
     var closeValorisationBtn = el('close-valorisation-btn');
     if (closeValorisationBtn) closeValorisationBtn.addEventListener('click', closeValorisationDetail);
@@ -6492,11 +8124,86 @@ document.addEventListener('DOMContentLoaded', function() {
 
     var couleurDetailTbody = el('couleur-detail-tbody');
     if (couleurDetailTbody) {
+        // Un clic sélectionne la référence (pour les boutons Transférer /
+        // Solder en haut du popup) au lieu de naviguer directement vers la
+        // fiche produit — le popup couleur sert à comparer les références
+        // d'une couleur et agir dessus sans en sortir (demande utilisatrice
+        // 2026-10-22).
         couleurDetailTbody.addEventListener('click', function(e) {
             var tr = e.target.closest && e.target.closest('tr[data-article]');
             if (!tr) return;
             var id = parseInt(tr.getAttribute('data-article'), 10);
-            if (id) openDetail(id, '');
+            if (!id) return;
+            _cdState.selectedId = (_cdState.selectedId === id) ? null : id;
+            _cdState.selectedName = tr.getAttribute('data-nom') || '';
+            _cdUpdateActionButtons();
+            _cdRenderLignes();
+        });
+    }
+
+    var cdFilterRef = el('cd-filter-ref');
+    if (cdFilterRef) cdFilterRef.addEventListener('input', _cdRenderLignes);
+
+    var cdFilterMagasin = el('cd-filter-magasin');
+    if (cdFilterMagasin) cdFilterMagasin.addEventListener('change', _cdRenderLignes);
+
+    var cdMagasinsList = el('cd-magasins-list');
+    if (cdMagasinsList) {
+        cdMagasinsList.addEventListener('click', function(e) {
+            var badge = e.target.closest && e.target.closest('[data-cd-magasin]');
+            if (!badge || !cdFilterMagasin) return;
+            cdFilterMagasin.value = badge.getAttribute('data-cd-magasin');
+            _cdRenderLignes();
+        });
+    }
+
+    // Les 3 actions ferment explicitement le popup couleur avant d'ouvrir
+    // la leur (même z-index, sinon le panneau ouvert reste caché derrière)
+    // et mémorisent comment y revenir — le bouton ← (ajouté automatiquement
+    // par _initBoutonsRetour) rouvre alors la même couleur.
+    // BUG CORRIGÉ (2026-10-23, repéré par l'utilisatrice : « teste le popup
+    // couleur avec un vrai magasin aussi ») : filtrer ce popup sur un
+    // magasin (pour voir ses références top/flop) puis cliquer Transférer
+    // perdait ce magasin — le popup Transférer s'ouvrait sans cible
+    // présélectionnée. Le magasin filtré ici devient maintenant le magasin
+    // cible proposé là-bas.
+    var cdBtnTransfer = el('cd-btn-transfer');
+    if (cdBtnTransfer) {
+        cdBtnTransfer.addEventListener('click', function() {
+            if (!_cdState.selectedId) return;
+            var couleur = _cdState.couleur;
+            var magasinFiltre = (el('cd-filter-magasin') && el('cd-filter-magasin').value) || null;
+            closeCouleurDetail();
+            _setRetour('transfer-overlay', function() { openCouleurDetail(couleur); });
+            openTransferPanel(_cdState.selectedId, _cdState.selectedName, couleur, magasinFiltre);
+        });
+    }
+
+    var cdBtnSolde = el('cd-btn-solde');
+    if (cdBtnSolde) {
+        cdBtnSolde.addEventListener('click', function() {
+            if (!_cdState.selectedId) return;
+            var couleur = _cdState.couleur;
+            var magasinFiltre = (el('cd-filter-magasin') && el('cd-filter-magasin').value) || null;
+            closeCouleurDetail();
+            _setRetour('solde-overlay', function() { openCouleurDetail(couleur); });
+            openSoldePanel(_cdState.selectedId, couleur, null, magasinFiltre);
+        });
+    }
+
+    var cdBtnReassort = el('cd-btn-reassort');
+    if (cdBtnReassort) {
+        cdBtnReassort.addEventListener('click', function() {
+            if (!_cdState.selectedId) return;
+            var couleur = _cdState.couleur;
+            var magasinFiltre = (el('cd-filter-magasin') && el('cd-filter-magasin').value) || null;
+            var magasinInfo = magasinFiltre && (_cdState.magasins || []).filter(function(m) {
+                return m.shop_field === magasinFiltre;
+            })[0];
+            var whId = (magasinInfo && magasinInfo.wh_id) || 0;
+            closeCouleurDetail();
+            _setRetour('ac-reassort-overlay', function() { openCouleurDetail(couleur); });
+            openActionReassort({ id: _cdState.selectedId, ref: _cdState.selectedName }, couleur, null, null, whId);
         });
     }
 
@@ -6504,6 +8211,10 @@ document.addEventListener('DOMContentLoaded', function() {
     var historyTabTransferts = el('history-tab-transferts');
     if (historyTabTransferts) {
         historyTabTransferts.addEventListener('click', function() { setHistoryTab('transferts'); });
+    }
+    var historyTabReassort = el('history-tab-reassort');
+    if (historyTabReassort) {
+        historyTabReassort.addEventListener('click', function() { setHistoryTab('reassort'); });
     }
     var historyTabSoldes = el('history-tab-soldes');
     if (historyTabSoldes) {
@@ -6644,6 +8355,12 @@ function _raParams() {
         collection_id: state.collection_id,
         categ_ids: state.categ_ids || [],
         batch_id: state.batch_id,
+        // DEMANDE UTILISATRICE (2026-10-23) : « si je fais le filtre de
+        // haut il doit aussi être fait » — le filtre Période du haut de
+        // page prime désormais sur la fenêtre glissante par défaut côté
+        // serveur (_fenetre_vente_bornes) quand il est posé.
+        date_start: state.date_start,
+        date_end: state.date_end,
         fenetre: v('ra-fenetre', 90),
         seuil_pct: v('ra-seuil', 10),
         delai: v('ra-delai', 21),
@@ -7168,11 +8885,38 @@ function _raExportCsv(rows) {
 // ══════════════════════════════════════════════════════════════
 
 var sdState = { data: null, checked: {}, noms: {}, bound: false, busy: false,
-    bxgyAchatId: null, bxgyAchatLabel: '', bxgyAchatMagasins: null };
+    bxgyAchatId: null, bxgyAchatLabel: '', bxgyAchatMagasins: null,
+    // DEMANDE UTILISATRICE (2026-10-24) : « solder tout » une Collection/
+    // Catégorie/Couleur choisie dans le regroupement en chaîne. null = mode
+    // normal (une référence, inchangé) ; {ids, label, count} = mode groupe.
+    group: null };
 
-async function openSoldePanel(articleId, couleur, prerempli) {
+async function openSoldePanel(articleId, couleur, prerempli, presetShopField, group) {
     var overlay = el('solde-overlay');
-    if (!overlay || !articleId) return;
+    // DEMANDE UTILISATRICE (2026-10-24) : mode groupe (Solder toute une
+    // Collection/Catégorie/Couleur) — `group` = {ids, label, count} ;
+    // `articleId` n'est alors plus requis (il n'y a pas UNE référence).
+    if (!overlay || (!articleId && !group)) return;
+    _rechercheMonter('sd-nav', function(p) {
+        openSoldePanel(p.id);
+    });
+    _chainMonter('sd-chain', function(variante, chemin) {
+        if (chemin.reference) {
+            openSoldePanel(chemin.reference.id, chemin.couleur ? chemin.couleur.label : null);
+        }
+    }, function(chemin, referenceItems) {
+        _sdChainGroupBanner(chemin, referenceItems);
+    });
+    sdState.group = group || null;
+    if (group) {
+        // Mode groupe : pas de chargement single-reference, une mini-vue
+        // dédiée (remise % partagée + bouton) prend le relais.
+        _sdShowGroupView();
+        _sdRenderGroupView();
+        overlay.classList.add('active');
+        return;
+    }
+    _sdShowSingleView();
     _sdBindOnce();
     sdState.checked = {};
     sdState.noms = {};
@@ -7243,6 +8987,19 @@ async function openSoldePanel(articleId, couleur, prerempli) {
         _sdRefresh();
     } else if (prerempli && prerempli.remise > 0) {
         _sdPreremplir(prerempli.remise);
+    } else if (presetShopField) {
+        // Ouvert depuis le popup Couleur avec un magasin filtré : on ne
+        // coche QUE ce magasin (s'il peut recevoir un solde), au lieu de
+        // laisser la sélection vide — cohérent avec Transférer/Réassort
+        // qui ciblent déjà ce même magasin.
+        var cible = (sdState.data && sdState.data.magasins || []).filter(function(m) {
+            return m.shop_field === presetShopField;
+        })[0];
+        if (cible && (cible.stock || 0) > 0 && cible.caisses && cible.caisses.length) {
+            sdState.checked[presetShopField] = true;
+        }
+        _sdRenderStores();
+        _sdRefresh();
     }
 }
 
@@ -7272,6 +9029,166 @@ function _sdPreremplir(remise) {
 function closeSoldePanel() {
     var overlay = el('solde-overlay');
     if (overlay) overlay.classList.remove('active');
+    sdState.group = null;
+}
+
+// ── Mode groupe (DEMANDE UTILISATRICE 2026-10-24) ──────────────────────
+function _sdShowSingleView() {
+    var single = el('sd-single-view');
+    var group = el('sd-group-view');
+    if (single) single.style.display = '';
+    if (group) group.style.display = 'none';
+}
+
+function _sdShowGroupView() {
+    var single = el('sd-single-view');
+    var group = el('sd-group-view');
+    if (single) single.style.display = 'none';
+    if (group) group.style.display = '';
+}
+
+function _sdChainGroupBanner(chemin, referenceItems) {
+    var banner = el('sd-chain-group-banner');
+    if (!banner) return;
+    var actif = !!(chemin.collection || chemin.categorie || chemin.couleur) && !chemin.reference;
+    if (!actif) {
+        banner.style.display = 'none';
+        banner.innerHTML = '';
+        return;
+    }
+    var n = (referenceItems || []).length;
+    var resume = _chainGroupeResume(chemin);
+    // Sécurité (2026-10-26) : dédoublonne au cas où la même référence
+    // apparaîtrait deux fois dans la liste — évite de créer deux fois le
+    // même document (transfert/solde/réassort) pour une seule référence.
+    var ids = Array.from(new Set((referenceItems || []).map(function(it) { return it.id; })));
+    banner.style.display = '';
+    banner.innerHTML = '<div style="margin:8px 0;padding:10px 12px;border-radius:8px;background:#FEF3F2;border:1px solid #FECDCA;font-size:0.85rem;color:#9F1239;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
+        + '<span>📦 <b>' + formatNumber(n) + ' référence' + (n > 1 ? 's' : '') + '</b> correspond' + (n > 1 ? 'ent' : '') + ' à ' + _escapeHtml(resume) + '</span>'
+        + '<span style="margin-left:auto;display:flex;gap:8px;">'
+        + '<button type="button" id="sd-btn-group-cancel" style="background:#fff;color:#9F1239;border:1px solid #FECDCA;border-radius:6px;padding:6px 12px;font-size:0.82rem;font-weight:600;cursor:pointer;">Annuler</button>'
+        + '<button type="button" id="sd-btn-group-all" style="background:#BE123C;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:0.82rem;font-weight:600;cursor:pointer;" ' + (n === 0 ? 'disabled' : '') + '>Solder tout le groupe</button>'
+        + '</span></div>';
+    var btn = el('sd-btn-group-all');
+    if (btn) btn.addEventListener('click', function() {
+        openSoldePanel(null, null, null, null, { ids: ids, label: resume, count: n });
+    });
+    // DEMANDE UTILISATRICE (2026-10-26) : « je veux revenir et ne pas faire
+    // ce solde, je dois avoir un bouton d'annuler » — remet les 5 listes à
+    // zéro (le bandeau disparaît) sans fermer le popup.
+    var btnAnnuler = el('sd-btn-group-cancel');
+    if (btnAnnuler) btnAnnuler.addEventListener('click', function() {
+        var host = el('sd-chain');
+        if (host && host._chainClear) host._chainClear();
+    });
+}
+
+// Mode lot : un seul champ remise % partagé (le lot serveur ne sait créer
+// que des promotions à déclenchement automatique, pas les 7 autres types
+// du popup normal — voir /mavie/api/soldes-appliquer-lot) + les mêmes
+// dates que le mode normal. Pas de case par magasin : le serveur retient
+// déjà, par référence, les seuls magasins qui ont du stock ET une caisse.
+function _sdRenderGroupView() {
+    var container = el('sd-group-view');
+    if (!container) return;
+    var g = sdState.group;
+    if (!g) { container.innerHTML = ''; return; }
+    container.innerHTML = '<div class="sd-head" style="margin-bottom:12px;">'
+        + '<div class="rx-title">📦 Solder un groupe de références</div>'
+        + '<div class="rx-sub"><b>' + formatNumber(g.count) + ' référence' + (g.count > 1 ? 's' : '') + '</b> · ' + _escapeHtml(g.label) + '</div>'
+        + '</div>'
+        + '<div class="sd-form">'
+        + '<label class="rx-field"><span class="rx-field-label">Remise</span>'
+        + '<span class="rx-input"><input type="number" id="sdg-remise" step="1" min="1" max="99"/><em>%</em></span></label>'
+        + '<label class="rx-field"><span class="rx-field-label">Début</span>'
+        + '<span class="rx-input"><input type="date" id="sdg-debut" value="' + new Date().toISOString().slice(0, 10) + '"/></span></label>'
+        + '<label class="rx-field"><span class="rx-field-label">Fin <span class="rx-help-inline">(facultatif)</span></span>'
+        + '<span class="rx-input"><input type="date" id="sdg-fin"/></span></label>'
+        + '</div>'
+        + '<div style="font-size:0.82rem;color:#64748B;margin:8px 0;">Pour chaque référence, la solde s\'applique automatiquement '
+        + 'dans les magasins qui ont du stock ET une caisse (comme pour une référence seule). '
+        + 'Jusqu\'à 100 références traitées par vague ; au-delà, plusieurs vagues se suivent automatiquement.</div>'
+        + '<div class="sd-foot">'
+        + '<div class="sd-summary" id="sdg-summary"></div>'
+        + '<span style="display:flex;gap:8px;">'
+        + '<button type="button" id="btn-sdg-cancel" class="rx-btn rx-btn-ghost">Annuler</button>'
+        + '<button type="button" id="btn-sdg-apply" class="rx-btn rx-btn-primary">Appliquer à tout le groupe</button>'
+        + '</span></div>'
+        + '<div class="sd-result" id="sdg-result" style="display:none;"></div>';
+    var btn = el('btn-sdg-apply');
+    if (btn) btn.addEventListener('click', _sdApplyGroup);
+    // DEMANDE UTILISATRICE (2026-10-26) : revenir sans rien faire, même
+    // une fois entrée dans la vue groupe (pas seulement depuis le bandeau).
+    var btnCancel = el('btn-sdg-cancel');
+    if (btnCancel) btnCancel.addEventListener('click', function() {
+        sdState.group = null;
+        _sdShowSingleView();
+        var host = el('sd-chain');
+        if (host && host._chainClear) host._chainClear();
+    });
+}
+
+async function _sdApplyGroup() {
+    var g = sdState.group;
+    if (!g || !g.ids.length) return;
+    var remiseEl = el('sdg-remise');
+    var remise = remiseEl ? parseFloat(remiseEl.value) : NaN;
+    var resultEl = el('sdg-result');
+    if (!(remise > 0 && remise < 100)) {
+        if (resultEl) { resultEl.style.display = 'block'; resultEl.className = 'sd-result ko';
+            resultEl.textContent = 'Indiquez une remise entre 1 et 99 %.'; }
+        return;
+    }
+    var dateStart = (el('sdg-debut') || {}).value || '';
+    var dateEnd = (el('sdg-fin') || {}).value || '';
+    if (!window.confirm('Solder ' + g.count + ' référence(s) à -' + remise + '% ? Les documents sont créés directement dans Odoo.')) return;
+
+    var btn = el('btn-sdg-apply');
+    if (btn) { btn.disabled = true; btn.textContent = 'Application…'; }
+    var summaryEl = el('sdg-summary');
+
+    // DEMANDE UTILISATRICE (2026-10-26) : « je dois avoir une seule ligne
+    // avec tout les articles soldés » — repère partagé par tout le lot
+    // (même s'il faut plusieurs vagues de 100), pour que l'Historique les
+    // regroupe en une seule ligne cliquable (voir _solde_posees_rows).
+    var groupRef = 'sdg' + Date.now();
+    var tous = [];
+    var paquets = [];
+    for (var i = 0; i < g.ids.length; i += 100) paquets.push(g.ids.slice(i, i + 100));
+    for (var p = 0; p < paquets.length; p++) {
+        if (summaryEl) summaryEl.textContent = 'Vague ' + (p + 1) + ' / ' + paquets.length + '…';
+        var lignes = paquets[p].map(function(aid) { return { article_id: aid, remise: remise }; });
+        var out = await rpc('/mavie/api/soldes-appliquer-lot', {
+            lignes: lignes, date_start: dateStart, date_end: dateEnd,
+            group_ref: groupRef, group_label: g.label,
+        });
+        if (!out || out.error) {
+            tous.push({ article_id: null, reference: '—', ok: false, message: (out && out.error) || 'Erreur inconnue' });
+            continue;
+        }
+        tous = tous.concat(out.resultats || []);
+    }
+
+    if (btn) { btn.disabled = false; btn.textContent = 'Appliquer à tout le groupe'; }
+    var faits = tous.filter(function(r) { return r.ok; }).length;
+    var echecs = tous.filter(function(r) { return !r.ok; });
+    if (resultEl) {
+        resultEl.style.display = 'block';
+        resultEl.className = faits > 0 ? 'sd-result ok' : 'sd-result ko';
+        var html = '<b>' + faits + ' / ' + tous.length + '</b> référence(s) soldée(s) à -' + remise + '%.';
+        if (echecs.length) {
+            html += '<div style="margin-top:6px;font-size:0.82rem;">' + echecs.slice(0, 15).map(function(r) {
+                return '✗ ' + _escapeHtml(r.reference || '—') + ' — ' + _escapeHtml(r.message || 'erreur');
+            }).join('<br/>') + (echecs.length > 15 ? '<br/>… et ' + (echecs.length - 15) + ' autre(s).' : '') + '</div>';
+        }
+        resultEl.innerHTML = html;
+    }
+    if (summaryEl) summaryEl.textContent = faits + ' / ' + tous.length + ' traitées.';
+    // BUG CORRIGÉ (2026-10-26, repéré par l'utilisatrice : « dans
+    // l'historique... ya seulement l'affichage d'une seule ») : toutes les
+    // soldes du groupe étaient bien créées en base (vérifié), seul
+    // l'affichage de la section Historique restait figé sur l'état d'avant.
+    if (faits > 0 && isHistoryPage() && typeof loadHistory === 'function') loadHistory();
 }
 
 async function _sdLoad(articleId) {
@@ -7371,16 +9288,28 @@ function _sdRenderStores() {
             delete sdState.checked[m.shop_field];
             return;
         }
+        // DEMANDE UTILISATRICE (2026-10-23) : la vitesse de vente est la
+        // raison même de solder — « 0 vente / semaine » saute aux yeux et
+        // justifie la décision sans rouvrir la fiche produit.
+        var vitesse = m.vitesse_semaine || 0;
+        var vitesseTxt = vitesse > 0
+            ? formatNumber(vitesse).replace(/\s/g, ' ') + ' / sem.'
+            : '<span style="color:#DC2626;font-weight:700;">0 / sem.</span>';
+        var couvertureTxt = (m.couverture_jours === null || m.couverture_jours === undefined)
+            ? '<span class="rx-muted">—</span>'
+            : formatNumber(m.couverture_jours) + ' j';
         h += '<tr class="' + (on ? 'sd-on' : '') + '">'
            + '<td><input type="checkbox" data-shop="' + _escapeHtml(m.shop_field) + '"' + (on ? ' checked="checked"' : '') + '/></td>'
            + '<td><span class="rx-group-name" style="font-size:0.83rem;">' + _escapeHtml(m.magasin) + '</span>'
            + '<span class="rx-prod">' + _escapeHtml(m.societe) + '</span></td>'
            + '<td class="num">' + formatNumber(m.stock) + '</td>'
+           + '<td class="num" title="' + formatNumber(m.vendu_90j || 0) + ' pièce(s) vendue(s) sur les 90 derniers jours">' + vitesseTxt + '</td>'
+           + '<td class="num">' + couvertureTxt + '</td>'
            + '<td>' + liste + '</td>'
            + '<td class="num">' + actuelle + '</td>'
            + '</tr>';
     });
-    tbody.innerHTML = h || '<tr><td colspan="5" class="rx-muted" style="text-align:center;">Aucun magasin avec du stock de cet article.</td></tr>';
+    tbody.innerHTML = h || '<tr><td colspan="7" class="rx-muted" style="text-align:center;">Aucun magasin avec du stock de cet article.</td></tr>';
 }
 
 function _sdPrix() {
@@ -7562,6 +9491,10 @@ async function _sdApply() {
             + '<br/><span style="color:#475569;">Une caisse déjà ouverte le verra après rechargement.</span>';
         box.style.display = '';
     }
+    // BUG CORRIGÉ (2026-10-26) : la section Historique du Tableau de bord
+    // (si affichée en dessous) ne reflétait jamais une solde tout juste
+    // posée tant que la page n'était pas rechargée manuellement.
+    if (isHistoryPage() && typeof loadHistory === 'function') loadHistory();
     // Recharge l'état réel des magasins (listes créées, solde en place).
     sdState.checked = {};
     sdState.noms = {};
@@ -7823,6 +9756,7 @@ function _popupFermetures() {
         'solde-overlay':           closeSoldePanel,
         'transfer-overlay':        closeTransferPanel,
         'color-detail-overlay':    closeColorDetail,
+        'couleur-detail-overlay':  closeCouleurDetail,
         'ruptures-overlay':        closeRuptures,
         'soldes-overlay':          closeSoldes,
         'dormant-overlay':         closeDormant,
@@ -7834,6 +9768,8 @@ function _popupFermetures() {
         'product-history-overlay': closeProductHistory,
         'ac-reassort-overlay':     closeActionReassort,
         'ac-transferts-overlay':   closeHistoriqueTransferts,
+        'solde-groupe-detail-overlay': closeSoldeGroupeDetail,
+        'reassort-groupe-detail-overlay': closeReassortGroupeDetail,
     };
 }
 
@@ -7895,8 +9831,13 @@ var AC_COLONNES = [
     ['rang',          '#',                 true,  false],
     ['photo',         'Photo',             true,  false],
     ['ref',           'Référence',         true,  false],
-    ['transferts',    'Transferts',        true,  true],
+    // DEMANDE UTILISATRICE (2026-10-22) : la colonne Couleur doit rester
+    // figée comme Photo et Référence au défilement horizontal — elle est
+    // donc placée juste après 'ref' dans AC_STICKY_LARGEUR ci-dessous, ce
+    // qui impose qu'elle reste adjacente ici (les colonnes figées doivent
+    // se suivre pour que les décalages `left` s'empilent correctement).
     ['couleur',       'Couleur',           true,  false],
+    ['transferts',    'Transferts',        true,  true],
     ['categorie',     'Catégorie',         true,  false],
     ['prix',          'Prix (TTC)',        true,  true],
     ['produit',       'Produit',           false, false],
@@ -8145,7 +10086,7 @@ function _acCell(cle, r, estRef) {
 // voir aussi les references et les photos » — ces 3 colonnes restent
 // visibles au défilement horizontal (largeur fixe, obligatoire pour que
 // les décalages `left` s'empilent correctement).
-var AC_STICKY_LARGEUR = { rang: 40, photo: 56, ref: 130 };
+var AC_STICKY_LARGEUR = { rang: 40, photo: 56, ref: 130, couleur: 120 };
 
 function _acStickyOffsets(cols) {
     var off = {}, acc = 0;
@@ -8191,6 +10132,33 @@ function _acLignesRef(r, cols) {
         });
     }
     return h;
+}
+
+function _acExportCsv(rows) {
+    var sep = ';';
+    function cell(v) {
+        return '"' + String(v === null || v === undefined ? '' : v).replace(/"/g, '""') + '"';
+    }
+    var lignes = ['Reference' + sep + 'Produit' + sep + 'Categorie' + sep + 'Collection'
+                  + sep + 'Rang' + sep + 'Niveau' + sep + 'Prix (TTC)' + sep + 'Transferts (pieces)'
+                  + sep + 'Qte achetee' + sep + 'Qte vendue' + sep + 'Reste' + sep + 'Stock magasins'
+                  + sep + 'Qte en depot' + sep + 'CA Achat (TTC)' + sep + 'CA Vendu (TTC)'];
+    (rows || []).forEach(function(r) {
+        var reste = (r.qty_purchased || 0) - (r.qty_sold || 0);
+        lignes.push([cell(r.ref), cell(r.name), cell(r.categorie), cell(r.collection),
+                     r.rang || '', cell(r.niveau || ''), String(r.prix || 0).replace('.', ','),
+                     (r.transferts && r.transferts.pieces) || 0,
+                     r.qty_purchased || 0, r.qty_sold || 0, reste, r.stock || 0, r.depot || 0,
+                     String(r.ca_achat || 0).replace('.', ','), String(r.ca || 0).replace('.', ',')
+                    ].join(sep));
+    });
+    var blob = new Blob(['﻿' + lignes.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'actions-top-flop.csv';
+    a.click();
+    URL.revokeObjectURL(url);
 }
 
 function _acRender() {
@@ -8386,6 +10354,9 @@ function _acBindOnce() {
         loadActions();
     });
 
+    var exportBtn = el('btn-ac-export');
+    if (exportBtn) exportBtn.addEventListener('click', function() { _acExportCsv(acState.rows); });
+
     var socSel = el('ac-societe');
     if (socSel) socSel.addEventListener('change', function() {
         acState.societe_id = socSel.value;
@@ -8554,7 +10525,10 @@ function _acBindOnce() {
 // le dépôt peut envoyer, et prépare les documents Odoo en brouillon :
 // bon d'achat fournisseur si le dépôt manque, bons de vente inter-sociétés
 // sinon.
-var raArticle = { data: null, qtes: {} };
+var raArticle = { data: null, qtes: {},
+    // DEMANDE UTILISATRICE (2026-10-24) : null = mode normal (une
+    // référence, inchangé) ; {ids, label, count} = mode groupe.
+    group: null };
 var _raCloseWired = false;
 
 // BUG CORRIGÉ (2026-10-15) : « le bouton ✕ ne marche pas » — vrai, mais
@@ -8575,10 +10549,40 @@ function _raWireClose() {
     _raCloseWired = true;
 }
 
-async function openActionReassort(r, couleur, taille, base, whId) {
+async function openActionReassort(r, couleur, taille, base, whId, group) {
     var ov = el('ac-reassort-overlay');
-    if (!ov) return;
+    // DEMANDE UTILISATRICE (2026-10-24) : mode groupe (Réassortir toute une
+    // Collection/Catégorie/Couleur) — `group` = {ids, label, count} ; `r`
+    // n'est alors plus requis (il n'y a pas UNE référence).
+    if (!ov || (!r && !group)) return;
     _raWireClose();
+    _rechercheMonter('ra-nav', function(p) {
+        openActionReassort({ id: p.id, ref: p.ref });
+    });
+    _chainMonter('ra-chain', function(variante, chemin) {
+        if (chemin.reference) {
+            openActionReassort({ id: chemin.reference.id, ref: chemin.reference.label },
+                chemin.couleur ? chemin.couleur.label : null);
+        }
+    }, function(chemin, referenceItems) {
+        _raChainGroupBanner(chemin, referenceItems);
+    });
+    raArticle.group = group || null;
+    if (group) {
+        var ragBody = el('ac-ra-body');
+        if (ragBody) ragBody.style.display = 'none';
+        var refEl0 = el('ac-ra-ref');
+        if (refEl0) refEl0.textContent = '📦 Groupe : ' + group.label;
+        var groupView = el('ra-group-view');
+        if (groupView) groupView.style.display = '';
+        ov.classList.add('active');
+        _raRenderGroupView();
+        return;
+    }
+    var ragBodyShow = el('ac-ra-body');
+    if (ragBodyShow) ragBodyShow.style.display = '';
+    var groupViewHide = el('ra-group-view');
+    if (groupViewHide) groupViewHide.style.display = 'none';
     var refEl = el('ac-ra-ref');
     if (refEl) refEl.textContent = r.ref + (couleur ? ' — ' + couleur : '')
         + (taille ? ' — ' + taille : '');
@@ -8592,6 +10596,10 @@ async function openActionReassort(r, couleur, taille, base, whId) {
     var params = {
         article_id: r.id, couleur: couleur || '', taille: taille || '',
         shop_field: state.shop_field, societe_id: acState.societe_id || '',
+        // DEMANDE UTILISATRICE (2026-10-23) : le filtre Période du haut de
+        // page doit aussi s'appliquer ici, même quand la fenêtre par
+        // défaut est de 90 jours.
+        date_start: state.date_start, date_end: state.date_end,
     };
     if (taille) {
         var rp = _raParams();
@@ -8642,6 +10650,28 @@ function _raArticleRender() {
             var article = data._article;
             if (article) openActionReassort(article, data._couleur || '');
         });
+    }
+    // DEMANDE UTILISATRICE (2026-10-23) : photo + prix de vente, pour
+    // chiffrer l'intérêt du réassort sans rouvrir la fiche produit.
+    var prixEl = el('ac-ra-prix');
+    if (prixEl) {
+        if (data.prix_vente_ttc) {
+            prixEl.textContent = formatMAD(data.prix_vente_ttc);
+            prixEl.style.display = '';
+        } else {
+            prixEl.style.display = 'none';
+        }
+    }
+    var imgEl = el('ac-ra-image');
+    if (imgEl) {
+        if (data.has_image && data.image_url) {
+            imgEl.onerror = function() { imgEl.style.display = 'none'; };
+            imgEl.src = data.image_url;
+            imgEl.style.display = 'block';
+        } else {
+            imgEl.removeAttribute('src');
+            imgEl.style.display = 'none';
+        }
     }
     if (!body) return;
     var aEnvoyer = Object.keys(raArticle.qtes).reduce(function(a, k) { return a + (raArticle.qtes[k] || 0); }, 0);
@@ -8881,6 +10911,9 @@ async function _raGenerer(mode) {
         + (mode === 'achat' ? 'Achats → Commandes' : 'Ventes → Commandes')
         + ' · batch Base Pivot : ' + _escapeHtml(out.batch || '')
         + '</span></div>';
+    // BUG CORRIGÉ (2026-10-26) : même défaut que Solder/Transférer — la
+    // section Historique restait figée sur l'état d'avant la création.
+    if (isHistoryPage() && typeof loadHistory === 'function') loadHistory();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -9281,27 +11314,40 @@ function _spParams() {
 // pour les soldes.
 var prOnglet = 'soldes';
 var prTransfertsCharges = false;
+var prReassortCharge = false;
 
+// DEMANDE UTILISATRICE (2026-10-23) : « je dois avoir en basculant, quand
+// je clique à une, il affiche seulement ce que j'ai cliqué, pas tous les
+// deux un en dessous de l'autre » — retour à des onglets EXCLUSIFS, y
+// compris en vue unifiée (l'essai précédent les affichait tous les deux
+// empilés, ce n'était pas ce qu'elle voulait). Troisième onglet ajouté :
+// Réassort (même demande : « ajouter ici la proposition de réassort à
+// côté de ces deux onglets »).
+var PR_ONGLETS = ['soldes', 'transferts', 'reassort'];
 function _prOnglet(nom) {
     prOnglet = nom;
-    ['soldes', 'transferts'].forEach(function(o) {
+    PR_ONGLETS.forEach(function(o) {
         var zone = el('onglet-' + o);
         if (zone) zone.style.display = o === nom ? '' : 'none';
         var bouton = el('onglet-btn-' + o);
         if (bouton) bouton.className = 'pr-onglet' + (o === nom ? ' pr-on' : '');
     });
     // Les boutons Reglages et Exporter du bandeau ne valent que pour les
-    // soldes : l'onglet Transferts a les siens.
+    // soldes : les onglets Transferts et Réassort ont les leurs.
     var actions = el('sp-head-actions');
     if (actions) actions.style.display = nom === 'soldes' ? '' : 'none';
     if (nom === 'transferts' && !prTransfertsCharges) {
         prTransfertsCharges = true;
         loadTransferts();
     }
+    if (nom === 'reassort' && !prReassortCharge) {
+        prReassortCharge = true;
+        loadReassort();
+    }
 }
 
 function _prOngletsBindOnce() {
-    ['soldes', 'transferts'].forEach(function(o) {
+    PR_ONGLETS.forEach(function(o) {
         var bouton = el('onglet-btn-' + o);
         if (bouton) bouton.addEventListener('click', function() { _prOnglet(o); });
     });
@@ -9314,8 +11360,9 @@ async function loadPropositions() {
     _spChargerOperation();
     _asCharger();
     _traCharger();
-    // Un recalcul demande depuis l'onglet Transferts doit le rafraichir.
+    // Un recalcul demande depuis l'onglet Transferts/Reassort doit le rafraichir.
     if (prOnglet === 'transferts' && prTransfertsCharges) loadTransferts();
+    if (prOnglet === 'reassort' && prReassortCharge) loadReassort();
     var corps = el('sp-body');
     if (corps) corps.innerHTML = '<div class="rb-empty">Calcul en cours\u2026</div>';
     var seq = ++spState.seq;
@@ -9935,6 +11982,19 @@ function _asDetFermer() {
     asDet.ctx = null;
 }
 
+// BUG CORRIGÉ (2026-10-26, point 2 de l'audit UX : « on perd tout son
+// parcours dans l'assistant en ouvrant une fiche produit ») : ouvrir la
+// fiche produit depuis ce popup fermait l'assistant SANS poser de retour
+// (contrairement à tous les autres popups qui ouvrent la fiche produit —
+// Ruptures, Dormant, Soldes…) — fermer la fiche renvoyait donc sur la page
+// Propositions nue, tout le drill-down (questions successives) perdu.
+// Remet la pile et le contexte EXACTEMENT comme avant de l'avoir quittée.
+function _asDetRouvrir(pile, ctx) {
+    if (!pile || !pile.length) return;
+    asDet.pile = pile.slice(0, -1);
+    _asDetOuvrir(pile[pile.length - 1], ctx);
+}
+
 function _asDetBindOnce() {
     if (asDet.bound) return;
     asDet.bound = true;
@@ -9959,7 +12019,10 @@ function _asDetBindOnce() {
             ev.stopPropagation();
             var aid = parseInt(fiche.getAttribute('data-article'), 10);
             if (aid) {
+                var pileAvant1 = asDet.pile.slice();
+                var ctxAvant1 = asDet.ctx;
                 _asDetFermer();
+                _setRetour('detail-overlay', function() { _asDetRouvrir(pileAvant1, ctxAvant1); });
                 openDetail(aid, fiche.getAttribute('data-name') || fiche.textContent);
             }
             return;
@@ -9977,7 +12040,10 @@ function _asDetBindOnce() {
         if (c.indexOf('ref:') === 0) {
             var id = parseInt(c.slice(4), 10);
             if (id) {
+                var pileAvant2 = asDet.pile.slice();
+                var ctxAvant2 = asDet.ctx;
                 _asDetFermer();
+                _setRetour('detail-overlay', function() { _asDetRouvrir(pileAvant2, ctxAvant2); });
                 openDetail(id, tr.getAttribute('data-nom') || '');
             }
             return;
@@ -10069,7 +12135,13 @@ async function _asDetOuvrir(cle, ctx) {
         pied.innerHTML = bouts.join(' ');
         var bs = el('as-det-solder');
         if (bs) bs.addEventListener('click', function() {
+            // BUG CORRIGÉ (2026-10-26, point 2 de l'audit UX, même défaut
+            // que les clics « fiche produit » ci-dessus) : fermait
+            // l'assistant sans poser de retour.
+            var pileAvant3 = asDet.pile.slice();
+            var ctxAvant3 = asDet.ctx;
             _asDetFermer();
+            _setRetour('solde-overlay', function() { _asDetRouvrir(pileAvant3, ctxAvant3); });
             openSoldePanel(d.article_id, '', { remise: d.remise || 0 });
         });
     }
@@ -10101,6 +12173,11 @@ function _trParams() {
         batch_id: state.batch_id,
         shop_field: state.shop_field,
         shop_fields: state.shop_fields || [],
+        // DEMANDE UTILISATRICE (2026-10-23) : le filtre Période du haut de
+        // page prime désormais sur la fenêtre glissante par défaut côté
+        // serveur quand il est posé (_fenetre_vente_bornes).
+        date_start: state.date_start,
+        date_end: state.date_end,
         fenetre: v('tr-fenetre', 90),
         cible: v('tr-cible', 60),
         min_qte: v('tr-min-qte', 3),
@@ -10242,7 +12319,6 @@ async function _trChargerBons() {
     if (!d || d.error) return;
     trState.bonsCrees = d.bons || [];
     _trRenderBons();
-    _trChargerBilan();
 }
 
 function _trArticlesMagasin(bons, magasin) {
@@ -10308,14 +12384,28 @@ function _trRenderBons() {
         ? bons.filter(function(b) { return b.source === trBonsMagasin || b.dest === trBonsMagasin; })
         : bons;
     var sens = !!trBonsMagasin;
+    // DEMANDE UTILISATRICE (2026-10-23) : « la partie des bons en dessous
+    // de Transférer doit aussi contenir le nombre de lignes que je veux
+    // afficher » — même principe que top-limit/flop-limit : un champ
+    // modifiable, qui ne limite que l'AFFICHAGE (le PDF et le CSV
+    // restent sur la liste complète filtrée par magasin).
+    var limiteEl = el('tr-bons-limit');
+    var limite = (limiteEl && parseInt(limiteEl.value, 10) > 0) ? parseInt(limiteEl.value, 10) : 10;
+    var affichesVisibles = affiches.slice(0, limite);
     zone.innerHTML = '<div class="tr-bons-titre">Bons créés</div>'
-        + '<div style="margin:6px 0;"><select id="tr-bons-magasin" class="rx-select">'
+        + '<div style="margin:6px 0;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">'
+        + '<select id="tr-bons-magasin" class="rx-select">'
         + '<option value="">Tous les magasins</option>'
         + choix.map(function(m) {
               return '<option value="' + _escapeHtml(m) + '"'
                    + (m === trBonsMagasin ? ' selected="selected"' : '') + '>' + _escapeHtml(m) + '</option>';
           }).join('')
-        + '</select></div>'
+        + '</select>'
+        + '<label style="font-size:0.82rem;color:#64748B;display:flex;align-items:center;gap:4px;">Lignes'
+        + ' <input type="number" id="tr-bons-limit" value="' + limite + '" min="1" max="500" class="limit-input"/></label>'
+        + '<span class="rx-muted" style="font-size:0.78rem;">' + formatNumber(affichesVisibles.length)
+        + ' / ' + formatNumber(affiches.length) + ' affichés</span>'
+        + '</div>'
         + '<div class="rx-muted" style="margin-bottom:6px;"><a href="/mavie/transfer-bons-pdf?ids='
         + affiches.map(function(b) { return b.id; }).join(',')
         + '" target="_blank" rel="noopener">Tout imprimer (PDF)</a> · '
@@ -10324,7 +12414,7 @@ function _trRenderBons() {
         + (sens ? '<th>Sens</th>' : '')
         + '<th>État</th><th>Créé le</th><th>Fait le</th><th>Reçu le</th>'
         + '<th>Pièces</th><th>Vendu depuis l’envoi</th><th></th></tr></thead><tbody>'
-        + affiches.map(function(b) {
+        + affichesVisibles.map(function(b) {
               var sensCell = '';
               if (sens) {
                   sensCell = '<td>' + (b.source === trBonsMagasin ? 'Envoyé' : 'Reçu') + '</td>';
@@ -10356,6 +12446,8 @@ function _trRenderBons() {
         trBonsMagasin = sel.value;
         _trRenderBons();
     });
+    var limiteInput = el('tr-bons-limit');
+    if (limiteInput) limiteInput.addEventListener('change', function() { _trRenderBons(); });
     var csv = el('tr-bons-csv');
     if (csv) csv.addEventListener('click', function(ev) {
         ev.preventDefault();
@@ -11593,4 +13685,142 @@ function closeHistoriqueTransferts() {
 function closeActionReassort() {
     var ov = el('ac-reassort-overlay');
     if (ov) ov.classList.remove('active');
+    raArticle.group = null;
+}
+
+// ── Mode groupe (DEMANDE UTILISATRICE 2026-10-24) ──────────────────────
+function _raChainGroupBanner(chemin, referenceItems) {
+    var banner = el('ra-chain-group-banner');
+    if (!banner) return;
+    var actif = !!(chemin.collection || chemin.categorie || chemin.couleur) && !chemin.reference;
+    if (!actif) {
+        banner.style.display = 'none';
+        banner.innerHTML = '';
+        return;
+    }
+    var n = (referenceItems || []).length;
+    var resume = _chainGroupeResume(chemin);
+    // Sécurité (2026-10-26) : dédoublonne au cas où la même référence
+    // apparaîtrait deux fois dans la liste — évite de créer deux fois le
+    // même document (transfert/solde/réassort) pour une seule référence.
+    var ids = Array.from(new Set((referenceItems || []).map(function(it) { return it.id; })));
+    banner.style.display = '';
+    banner.innerHTML = '<div style="margin:8px 0;padding:10px 12px;border-radius:8px;background:#ECFDF5;border:1px solid #A7F3D0;font-size:0.85rem;color:#065F46;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
+        + '<span>📦 <b>' + formatNumber(n) + ' référence' + (n > 1 ? 's' : '') + '</b> correspond' + (n > 1 ? 'ent' : '') + ' à ' + _escapeHtml(resume) + '</span>'
+        + '<span style="margin-left:auto;display:flex;gap:8px;">'
+        + '<button type="button" id="ra-btn-group-cancel" style="background:#fff;color:#065F46;border:1px solid #A7F3D0;border-radius:6px;padding:6px 12px;font-size:0.82rem;font-weight:600;cursor:pointer;">Annuler</button>'
+        + '<button type="button" id="ra-btn-group-all" style="background:#059669;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:0.82rem;font-weight:600;cursor:pointer;" ' + (n === 0 ? 'disabled' : '') + '>Réassortir tout le groupe</button>'
+        + '</span></div>';
+    var btn = el('ra-btn-group-all');
+    if (btn) btn.addEventListener('click', function() {
+        // BUG CORRIGÉ (2026-10-26, même défaut que Transférer repéré par
+        // l'utilisatrice) : la couleur ayant servi à former le groupe doit
+        // aussi filtrer les variantes utilisées pour calculer le besoin —
+        // sinon on mélange le stock/les ventes de toutes les couleurs.
+        openActionReassort(null, null, null, null, null,
+            { ids: ids, label: resume, count: n, couleur: chemin.couleur ? chemin.couleur.label : null });
+    });
+    // DEMANDE UTILISATRICE (2026-10-26) : « je veux revenir et ne pas faire
+    // ça » — remet les 5 listes à zéro (le bandeau disparaît) sans fermer
+    // le popup.
+    var btnAnnuler = el('ra-btn-group-cancel');
+    if (btnAnnuler) btnAnnuler.addEventListener('click', function() {
+        var host = el('ra-chain');
+        if (host && host._chainClear) host._chainClear();
+    });
+}
+
+// Mode lot : pas de révision ligne par ligne (sinon ce serait une
+// référence à la fois) — juste le mode (achat/vente), les réglages par
+// défaut du bloc Réassort s'appliquent (fenêtre 90j, cible 30j, délai 21j,
+// comme partout ailleurs — voir _reassort_params côté serveur).
+function _raRenderGroupView() {
+    var container = el('ra-group-view');
+    if (!container) return;
+    var g = raArticle.group;
+    if (!g) { container.innerHTML = ''; return; }
+    container.innerHTML = '<div style="font-size:0.85rem;color:#64748B;margin-bottom:10px;">'
+        + '<b>' + formatNumber(g.count) + ' référence' + (g.count > 1 ? 's' : '') + '</b> · ' + _escapeHtml(g.label) + '</div>'
+        + '<label class="rx-field"><span class="rx-field-label">Mode</span>'
+        + '<span class="rx-input"><select id="rag-mode">'
+        + '<option value="vente">Vente inter-sociétés (depuis le dépôt)</option>'
+        + '<option value="achat">Achat fournisseur</option>'
+        + '</select></span></label>'
+        + '<div style="font-size:0.82rem;color:#64748B;margin:8px 0;">Mode vente : envoie ce que le dépôt peut réellement '
+        + 'donner à chaque magasin. Mode achat : commande au fournisseur ce qui manque, indépendamment du dépôt. '
+        + 'Jusqu\'à 100 références traitées par vague ; au-delà, plusieurs vagues se suivent automatiquement.</div>'
+        + '<div class="sd-foot">'
+        + '<div class="sd-summary" id="rag-summary"></div>'
+        + '<span style="display:flex;gap:8px;">'
+        + '<button type="button" id="btn-rag-cancel" class="rx-btn rx-btn-ghost">Annuler</button>'
+        + '<button type="button" id="btn-rag-apply" class="rx-btn rx-btn-primary">Réassortir tout le groupe</button>'
+        + '</span></div>'
+        + '<div class="sd-result" id="rag-result" style="display:none;"></div>';
+    var btn = el('btn-rag-apply');
+    if (btn) btn.addEventListener('click', _raApplyGroup);
+    // DEMANDE UTILISATRICE (2026-10-26) : revenir sans rien faire, même
+    // une fois entrée dans la vue groupe (pas seulement depuis le bandeau).
+    var btnCancel = el('btn-rag-cancel');
+    if (btnCancel) btnCancel.addEventListener('click', function() {
+        raArticle.group = null;
+        var body = el('ac-ra-body');
+        if (body) body.style.display = '';
+        container.style.display = 'none';
+        var host = el('ra-chain');
+        if (host && host._chainClear) host._chainClear();
+    });
+}
+
+async function _raApplyGroup() {
+    var g = raArticle.group;
+    if (!g || !g.ids.length) return;
+    var mode = (el('rag-mode') || {}).value || 'vente';
+    var resultEl = el('rag-result');
+    var msg = mode === 'achat'
+        ? 'Commander au fournisseur ce qui manque pour ' + g.count + ' référence(s) ? Les bons d\'achat sont créés directement dans Odoo.'
+        : 'Envoyer depuis le dépôt vers les magasins pour ' + g.count + ' référence(s) ? Les ventes inter-sociétés sont créées et confirmées directement dans Odoo.';
+    if (!window.confirm(msg)) return;
+
+    var btn = el('btn-rag-apply');
+    if (btn) { btn.disabled = true; btn.textContent = 'Traitement…'; }
+    var summaryEl = el('rag-summary');
+
+    // DEMANDE UTILISATRICE (2026-10-26) : « fais pareil pour réassort » —
+    // même repère de lot que Solder, pour que l'Historique fusionne toutes
+    // les références en une seule ligne cliquable.
+    var groupRef = 'rag' + Date.now();
+    var tous = [];
+    var paquets = [];
+    for (var i = 0; i < g.ids.length; i += 100) paquets.push(g.ids.slice(i, i + 100));
+    for (var p = 0; p < paquets.length; p++) {
+        if (summaryEl) summaryEl.textContent = 'Vague ' + (p + 1) + ' / ' + paquets.length + '…';
+        var out = await rpc('/mavie/api/reassort-generer-lot', {
+            article_ids: paquets[p], mode: mode, couleur: g.couleur || '',
+            group_ref: groupRef, group_label: g.label,
+        });
+        if (!out || out.error) {
+            tous.push({ article_id: null, reference: '—', ok: false, message: (out && out.error) || 'Erreur inconnue' });
+            continue;
+        }
+        tous = tous.concat(out.resultats || []);
+    }
+
+    if (btn) { btn.disabled = false; btn.textContent = 'Réassortir tout le groupe'; }
+    var faits = tous.filter(function(r) { return r.ok; }).length;
+    var echecs = tous.filter(function(r) { return !r.ok; });
+    if (resultEl) {
+        resultEl.style.display = 'block';
+        resultEl.className = faits > 0 ? 'sd-result ok' : 'sd-result ko';
+        var html = '<b>' + faits + ' / ' + tous.length + '</b> référence(s) réassortie(s).';
+        if (echecs.length) {
+            html += '<div style="margin-top:6px;font-size:0.82rem;">' + echecs.slice(0, 15).map(function(r) {
+                return '✗ ' + _escapeHtml(r.reference || '—') + ' — ' + _escapeHtml(r.message || 'erreur');
+            }).join('<br/>') + (echecs.length > 15 ? '<br/>… et ' + (echecs.length - 15) + ' autre(s).' : '') + '</div>';
+        }
+        resultEl.innerHTML = html;
+    }
+    if (summaryEl) summaryEl.textContent = faits + ' / ' + tous.length + ' traitées.';
+    // BUG CORRIGÉ (2026-10-26) : même défaut que Solder/Transférer — la
+    // section Historique restait figée sur l'état d'avant la création.
+    if (faits > 0 && isHistoryPage() && typeof loadHistory === 'function') loadHistory();
 }

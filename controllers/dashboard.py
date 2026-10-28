@@ -399,6 +399,36 @@ class MaVieDashboardController(http.Controller):
         )
         return request.env.cr.fetchall()
 
+    def _purchase_by_product_and_warehouse(self, purchase_domain):
+        """[(product_id, warehouse_id, company_id, ca_total, qty)] pour ce
+        domaine d'achat — même principe de perf que
+        _pos_sales_by_product_and_config (une seule agrégation SQL plutôt
+        qu'un read_group + résolution magasin par ligne).
+
+        L'entrepôt est résolu via purchase_order.picking_type_id.warehouse_id
+        — même niveau de précision que la colonne « reçu » du calcul de
+        réassort (_compute_reassort_article) : pas aussi fin que la
+        résolution par mouvement de stock réel utilisée pour Transférer,
+        mais suffisant pour une vue d'ensemble par arrivage, et déjà le
+        standard de ce dashboard pour les achats agrégés."""
+        Line = request.env['purchase.order.line'].sudo()
+        query = Line._where_calc(purchase_domain)
+        Line._apply_ir_rules(query, 'read')
+        from_clause, where_clause, params = query.get_sql()
+        request.env.cr.execute(
+            'SELECT "purchase_order_line"."product_id", spt_achat."warehouse_id", '
+            '       po_achat."company_id", '
+            '       SUM("purchase_order_line"."price_total"), '
+            '       SUM("purchase_order_line"."product_qty") '
+            'FROM %s '
+            'LEFT JOIN "purchase_order" AS po_achat ON po_achat."id" = "purchase_order_line"."order_id" '
+            'LEFT JOIN "stock_picking_type" AS spt_achat ON spt_achat."id" = po_achat."picking_type_id" '
+            'WHERE %s '
+            'GROUP BY 1, 2, 3' % (from_clause, where_clause or 'TRUE'),
+            params,
+        )
+        return request.env.cr.fetchall()
+
     def _group_sums(self, model_name, domain, sum_fields, group_fields=('product_id',), agg='SUM', ctx=None):
         """read_group par product_id (et éventuellement company_id) SANS le
         surcoût de libellé d'Odoo.
@@ -559,16 +589,38 @@ class MaVieDashboardController(http.Controller):
             return []
 
         # Stock par (référence, entrepôt).
+        #
+        # BUG CORRIGÉ (2026-10-16, repéré par l'utilisatrice : « tout est
+        # bien calculé sauf ce qui est dans Alerte rupture sous 30 jours »)
+        # : cette requête sommait directement TOUTES les variantes d'une
+        # référence dans un magasin (JK604 à Elite Menara Mall : −1 en
+        # taille 36 + 1 + 1 = net 1), alors que le reste du dashboard
+        # (_positive_stock, utilisé par la fiche produit) juge la
+        # positivité VARIANTE PAR VARIANTE avant de sommer — une taille en
+        # stock négatif (transfert jamais enregistré) ne doit pas annuler
+        # une autre taille réellement présente. D'où l'écart : l'alerte
+        # affichait 1 quand la fiche affichait 2 pour la même ligne. Même
+        # règle et même périmètre d'emplacements (lot_stock_id) que
+        # _positive_stock, pour que les deux écrans retombent toujours sur
+        # le même chiffre.
         request.env.cr.execute("""
-            SELECT pp.product_tmpl_id, w.id, SUM(q.quantity)
-              FROM stock_quant q
-              JOIN stock_location l ON l.id = q.location_id
-              JOIN stock_warehouse w ON l.parent_path LIKE '%%/' || w.view_location_id || '/%%'
-              JOIN product_product pp ON pp.id = q.product_id
-             WHERE l.usage = 'internal' AND w.id = ANY(%(wh)s)
-               AND pp.product_tmpl_id = ANY(%(tids)s)
+            WITH par_variante AS (
+                SELECT pp.product_tmpl_id AS tid, pp.id AS pid, w.id AS wh_id,
+                       SUM(q.quantity) AS qty
+                  FROM stock_quant q
+                  JOIN stock_location l ON l.id = q.location_id
+                  JOIN stock_warehouse w ON w.id = ANY(%(wh)s)
+                  JOIN stock_location wl ON wl.id = w.lot_stock_id
+                  JOIN product_product pp ON pp.id = q.product_id
+                 WHERE l.usage = 'internal'
+                   AND l.parent_path LIKE wl.parent_path || '%%'
+                   AND pp.product_tmpl_id = ANY(%(tids)s)
+                 GROUP BY 1, 2, 3
+            )
+            SELECT tid, wh_id, SUM(GREATEST(qty, 0))
+              FROM par_variante
              GROUP BY 1, 2
-            HAVING SUM(q.quantity) > 0
+            HAVING SUM(GREATEST(qty, 0)) > 0
         """, {'wh': wh_ids, 'tids': list(tmpl_ids)})
         stock = {(t, w): q for t, w, q in request.env.cr.fetchall()}
         if not stock:
@@ -4551,13 +4603,22 @@ class MaVieDashboardController(http.Controller):
     @http.route('/mavie/api/couleur-detail', type='json', auth='user', methods=['POST'], csrf=False)
     def api_couleur_detail(self, **kw):
         """Références vendues pour UNE couleur (clic sur une ligne du
-        Top/Flop Couleurs), mêmes filtres qu'à l'écran."""
+        Top/Flop Couleurs), mêmes filtres qu'à l'écran.
+
+        DEMANDE UTILISATRICE (2026-10-22) : en plus des références, ce
+        popup doit aussi dire « Qté achetée » / « CA Achat » par référence
+        (mêmes sources que la fiche produit), et quels MAGASINS vendent le
+        mieux/le moins bien cette couleur — avec, pour chaque référence, sa
+        répartition par magasin (`shops`) pour permettre un filtre magasin
+        côté client sans aller-retour serveur supplémentaire.
+        """
         try:
             couleur = (kw.get('couleur') or '').strip()
             if not couleur:
                 return {'error': 'Couleur manquante.'}
             grouped, couleur_by_pid, tmpl_info_by_pid = self._ventes_groupees_par_variante(kw)
             par_ref = {}
+            pids_couleur = []
             for g in grouped:
                 pid = g['product_id'][0] if g.get('product_id') else None
                 if not pid or couleur_by_pid.get(pid) != couleur:
@@ -4565,6 +4626,7 @@ class MaVieDashboardController(http.Controller):
                 info = tmpl_info_by_pid.get(pid)
                 if not info:
                     continue
+                pids_couleur.append(pid)
                 e = par_ref.setdefault(info['id'], {
                     'id': info['id'],
                     'ref': info['ref'],
@@ -4573,13 +4635,175 @@ class MaVieDashboardController(http.Controller):
                 })
                 e['qty'] += g.get('qty') or 0.0
                 e['ca'] += g.get('price_subtotal_incl') or 0.0
+
+            tmpl_ids = list(par_ref.keys())
+
+            # ── Qté achetée / CA achat par référence (même domaine que la
+            # fiche produit et le Top/Flop) ──
+            qty_purchased_by_tmpl = {}
+            ca_achat_by_tmpl = {}
+            if tmpl_ids:
+                purchase_domain = self._build_purchase_domain(kw, tmpl_ids)
+                po_grouped = self._group_sums(
+                    'purchase.order.line', purchase_domain, ['qty_received', 'price_total'])
+                po_pids = [g['product_id'][0] for g in po_grouped if g.get('product_id')]
+                po_prod_to_tmpl = {}
+                if po_pids:
+                    po_prods = request.env['product.product'].sudo().with_context(
+                        active_test=False).search_read(
+                        [('id', 'in', po_pids)], ['id', 'product_tmpl_id'])
+                    po_prod_to_tmpl = {p['id']: p['product_tmpl_id'][0] for p in po_prods
+                                       if p.get('product_tmpl_id')}
+                for g in po_grouped:
+                    pid = g['product_id'][0] if g.get('product_id') else None
+                    tid = po_prod_to_tmpl.get(pid)
+                    if not tid:
+                        continue
+                    qty_purchased_by_tmpl[tid] = qty_purchased_by_tmpl.get(tid, 0) + int(g.get('qty_received') or 0)
+                    ca_achat_by_tmpl[tid] = ca_achat_by_tmpl.get(tid, 0.0) + (g.get('price_total') or 0.0)
+
+            # ── Répartition par magasin : qui vend le mieux/moins bien
+            # cette couleur, et le détail par référence pour le filtre
+            # magasin côté client (même principe que v.shops). Clé =
+            # shop_field (identifiant stable, le même que le filtre Magasin
+            # du haut de page), PAS le nom affiché — BUG CORRIGÉ
+            # (2026-10-23, repéré par l'utilisatrice : « teste le popup
+            # couleur avec un vrai magasin aussi ») : cliquer Transférer
+            # après avoir filtré ce popup sur un magasin ne proposait pas
+            # ce magasin comme cible là-bas, faute d'un identifiant stable
+            # à transmettre (le nom affiché ne suffit pas). ──
+            shop_mappings = self._get_active_shop_mappings()
+            wh_field_by_id = {m.warehouse_id.id: m.shop_field
+                               for m in shop_mappings if m.warehouse_id}
+            wh_name_by_field = {m.shop_field: (m.warehouse_id.name if m.warehouse_id else m.shop_label)
+                                 for m in shop_mappings if m.shop_field}
+            wh_id_by_field = {m.shop_field: m.warehouse_id.id
+                               for m in shop_mappings if m.shop_field and m.warehouse_id}
+            ventes_mag = self._ventes_caisse_par_magasin(kw, pids_couleur) if pids_couleur else {}
+            qty_by_field = {}
+            ref_shops_by_tmpl = {}
+            for (wh_id, pid), qty in ventes_mag.items():
+                field = wh_field_by_id.get(wh_id)
+                if not field:
+                    continue
+                qty_by_field[field] = qty_by_field.get(field, 0) + qty
+                info = tmpl_info_by_pid.get(pid)
+                if not info:
+                    continue
+                d = ref_shops_by_tmpl.setdefault(info['id'], {})
+                d[field] = d.get(field, 0) + qty
+            magasins = sorted(
+                [{'shop_field': f, 'name': wh_name_by_field.get(f, f), 'qty': round(q),
+                  'wh_id': wh_id_by_field.get(f, 0)}
+                 for f, q in qty_by_field.items() if q],
+                key=lambda x: -x['qty'])
+            for i, m in enumerate(magasins):
+                m['rank'] = i + 1
+
             lignes = sorted(par_ref.values(), key=lambda x: -x['ca'])
             return {
                 'couleur': couleur,
-                'lignes': [dict(l, qty=round(l['qty']), ca=round(l['ca'], 2)) for l in lignes],
+                'lignes': [
+                    dict(l, qty=round(l['qty']), ca=round(l['ca'], 2), rank=i + 1,
+                         qty_purchased=qty_purchased_by_tmpl.get(l['id'], 0),
+                         ca_achat=round(ca_achat_by_tmpl.get(l['id'], 0.0), 2),
+                         shops={k: round(v) for k, v in ref_shops_by_tmpl.get(l['id'], {}).items()})
+                    for i, l in enumerate(lignes)
+                ],
+                'magasins': magasins,
             }
         except Exception as e:
             _logger.error("Erreur api_couleur_detail: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/nav-niveau', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_nav_niveau(self, **kw):
+        """Options d'un niveau pour le regroupement en chaîne (5 listes
+        déroulantes Collection → Catégorie → Couleur → Référence →
+        Variante) des popups Transférer / Solder / Réassort — DEMANDE
+        UTILISATRICE (2026-10-22, forme simplifiée en listes déroulantes
+        d'un besoin déjà exprimé).
+
+        kw : niveau ('categorie'|'couleur'|'reference'|'variante'), plus
+        le chemin déjà choisi : collection_id, categ_ids, couleur, ref_id.
+        """
+        try:
+            niveau = kw.get('niveau') or 'categorie'
+
+            if niveau == 'categorie':
+                # BUG CORRIGÉ (2026-10-24, repéré par l'utilisatrice : « il
+                # affiche pas ce que je recherche ») : le regroupement en
+                # chaîne permet désormais de choisir n'importe quel niveau
+                # en premier (plus besoin de filtrer par Collection avant),
+                # mais le `limit=3000` ici tronquait le catalogue avant
+                # d'avoir collecté toutes les catégories/couleurs/
+                # références — or le catalogue réel dépasse largement 3000
+                # fiches (3704 sur Elite, 6785 sur MaVie). Sans limite, le
+                # scan reste rapide (< 1s mesuré en base), donc on l'enlève.
+                domain = self._build_product_domain(dict(kw, categ_ids=[], categ_id=None))
+                tmpl = request.env['product.template'].sudo().with_context(
+                    active_test=False).search(domain)
+                cats = tmpl.mapped('categ_id')
+                excluded_names = {
+                    'all', 'expenses', 'saleable', 'pos', 'bons & fidélité',
+                    'demi0', 'solde test 2', 'étiquettes solde',
+                }
+                items = sorted(
+                    [{'id': c.id, 'label': c.name} for c in cats
+                     if c.name and c.name.lower().strip() not in excluded_names],
+                    key=lambda x: x['label'])
+                return {'items': items}
+
+            if niveau == 'couleur':
+                domain = self._build_product_domain(kw)
+                tmpl = request.env['product.template'].sudo().with_context(
+                    active_test=False).search(domain)
+                couleurs = set()
+                for t in tmpl:
+                    for line in t.attribute_line_ids:
+                        if (line.attribute_id.name or '').upper().startswith('COULEUR'):
+                            couleurs.update(v for v in line.value_ids.mapped('name') if v)
+                items = [{'id': c, 'label': c} for c in sorted(couleurs)]
+                return {'items': items}
+
+            if niveau == 'reference':
+                domain = self._build_product_domain(kw)
+                tmpl = request.env['product.template'].sudo().with_context(
+                    active_test=False).search(domain)
+                couleur = (kw.get('couleur') or '').strip().upper()
+                if couleur:
+                    tmpl = tmpl.filtered(lambda t: couleur in [
+                        (v or '').upper()
+                        for line in t.attribute_line_ids
+                        if (line.attribute_id.name or '').upper().startswith('COULEUR')
+                        for v in line.value_ids.mapped('name')
+                    ])
+                items = sorted(
+                    [{'id': t.id, 'label': t.base_pivot_reference or t.default_code or t.name or '—'}
+                     for t in tmpl],
+                    key=lambda x: x['label'])
+                # Plus de troncature à 500 : la liste doit contenir TOUTE
+                # référence correspondante, sinon « chercher une référence »
+                # qui trie après la 500e alphabétiquement ne la trouve jamais.
+                return {'items': items}
+
+            if niveau == 'variante':
+                tmpl = request.env['product.template'].sudo().with_context(
+                    active_test=False).browse(int(kw.get('ref_id') or 0))
+                if not tmpl.exists():
+                    return {'items': []}
+                couleur = (kw.get('couleur') or '').strip().upper()
+                items = []
+                for v in tmpl.product_variant_ids:
+                    c, s = resolve_variant_color_size(v)
+                    if couleur and (c or '').upper() != couleur:
+                        continue
+                    items.append({'id': v.id, 'label': (c or '—') + (' — ' + s if s else '')})
+                return {'items': items}
+
+            return {'items': []}
+        except Exception as e:
+            _logger.error("Erreur api_nav_niveau: %s", e, exc_info=True)
             return {'error': str(e)}
 
     @http.route('/mavie/api/top-flop-couleurs/export', type='http', auth='user',
@@ -4862,14 +5086,24 @@ class MaVieDashboardController(http.Controller):
                 t['id']: t['arrivage_id'][1] for t in tmpls if t.get('arrivage_id')
             }
 
-            # Libellé du magasin : nom du point de vente, repli sur la société
-            # (même règle qu'auparavant). Quelques dizaines d'enregistrements,
-            # résolus en deux requêtes au lieu d'une par commande.
+            # Libellé du magasin : le VRAI magasin (entrepôt), pas le point
+            # de vente — BUG CORRIGÉ (2026-10-22, repéré par l'utilisatrice :
+            # « normalement j'ai 7 magasins pas 6 ») : la boutique physique
+            # et son canal « En ligne » sont deux pos.config SÉPARÉS pour le
+            # même magasin (ex. « Elite Marjane — Boutique » et « — En
+            # ligne ») ; les résoudre par leur seul nom de config les
+            # comptait comme deux magasins différents, et un magasin dont
+            # TOUTE l'activité de la période passait par l'autre canal
+            # disparaissait purement et simplement du graphique au lieu
+            # d'apparaître à 0. On résout maintenant via l'entrepôt réel du
+            # point de vente (même principe que _ventes_caisse_par_magasin),
+            # qui fusionne les deux canaux sous le même nom de magasin.
             config_ids = list({r[1] for r in rows if r[1]})
-            config_name_by_id = {
-                c['id']: c['name'] for c in request.env['pos.config'].sudo().search_read(
-                    [('id', 'in', config_ids)], ['id', 'name'])
-            } if config_ids else {}
+            configs = request.env['pos.config'].sudo().browse(config_ids)
+            shop_name_by_config_id = {}
+            for cfg in configs:
+                wh = cfg.picking_type_id.warehouse_id if cfg.picking_type_id else False
+                shop_name_by_config_id[cfg.id] = wh.name if wh else cfg.name
             company_ids = list({r[2] for r in rows if r[2]})
             company_name_by_id = {
                 c['id']: c['name'] for c in request.env['res.company'].sudo().search_read(
@@ -4896,12 +5130,24 @@ class MaVieDashboardController(http.Controller):
                 stats['ca'] += ca
                 stats['qty'] += qty
 
-                shop_name = (config_name_by_id.get(config_id)
+                shop_name = (shop_name_by_config_id.get(config_id)
                              or company_name_by_id.get(company_id)
                              or 'Inconnu')
                 shop_stats = by_shop_map.setdefault((arrivage_name, shop_name), {'ca': 0.0, 'qty': 0})
                 shop_stats['ca'] += ca
                 shop_stats['qty'] += qty
+
+            # BUG CORRIGÉ (2026-10-22, repéré par l'utilisatrice : « le
+            # graphique reste illisible ») : « Non rattaché » est un
+            # fourre-tout (articles sans arrivage), PAS un vrai arrivage à
+            # comparer aux autres — vérifié sur Elite, il peut peser 27x
+            # plus qu'un vrai arrivage (2,88M vs 105k MAD). Sur une échelle
+            # linéaire partagée, ça réduit TOUS les vrais arrivages à des
+            # traits de quelques pixels, quelle que soit la mise en forme.
+            # On le sort du graphique (échelle réservée aux vrais arrivages,
+            # comparables entre eux) et on le montre à part, en toutes
+            # lettres, pour que le total reste visible sans écraser le reste.
+            non_rattache = sales_by_arrivage.pop('Non rattaché', None)
 
             daily_sales = [
                 {
@@ -4915,22 +5161,166 @@ class MaVieDashboardController(http.Controller):
             ]
             daily_sales.sort(key=lambda x: x['ca'], reverse=True)
 
+            # Tous les magasins connus, pour que chaque arrivage liste les 7
+            # (BUG CORRIGÉ 2026-10-22, voir plus haut) — un magasin à 0 pour
+            # CET arrivage apparaît explicitement à 0 plutôt que de
+            # disparaître, pour qu'on voie qu'il n'a rien vendu et non que
+            # la donnée manque.
+            tous_magasins = sorted({
+                m.warehouse_id.name for m in self._get_active_shop_mappings() if m.warehouse_id
+            })
+
             by_shop_grouped = {}
             for (arrivage_name, shop_name), stats in by_shop_map.items():
+                if arrivage_name == 'Non rattaché':
+                    continue
                 by_shop_grouped.setdefault(arrivage_name, []).append({
                     'shop': shop_name,
                     'ca': round(stats['ca'], 2),
                     'qty': stats['qty'],
                 })
-            by_shop = [
-                {'arrivage': arrivage_name, 'shops': sorted(shops, key=lambda s: s['ca'], reverse=True)}
-                for arrivage_name, shops in by_shop_grouped.items()
-            ]
+            by_shop = []
+            for arrivage_name, shops in by_shop_grouped.items():
+                vus = {s['shop'] for s in shops}
+                for nom in tous_magasins:
+                    if nom not in vus:
+                        shops.append({'shop': nom, 'ca': 0.0, 'qty': 0})
+                by_shop.append({'arrivage': arrivage_name, 'shops': sorted(shops, key=lambda s: s['ca'], reverse=True)})
             by_shop.sort(key=lambda a: sum(s['ca'] for s in a['shops']), reverse=True)
 
-            return {'daily': daily_sales, 'by_shop': by_shop}
+            return {
+                'daily': daily_sales,
+                'by_shop': by_shop,
+                'non_rattache': {
+                    'ca': round(non_rattache['ca'], 2),
+                    'qty': non_rattache['qty'],
+                } if non_rattache else None,
+            }
         except Exception as e:
             _logger.error(f"Erreur api_sales_daily: {str(e)}", exc_info=True)
+            return {'error': str(e), 'daily': [], 'by_shop': []}
+
+    # DEMANDE UTILISATRICE (2026-10-24) : « fait à côté graphe de CA achat »
+    # — même graphique que CA par Arrivage, mais côté achat (purchase.order.
+    # line) au lieu de vente (pos.order.line). Même structure de réponse
+    # (daily/by_shop/non_rattache), réutilisée telle quelle par le même code
+    # de rendu côté client.
+    @http.route('/mavie/api/achats-daily', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_achats_daily(self, **kw):
+        try:
+            is_filtered = bool(self._filtre_produit_actif(kw))
+
+            product_tmpl_ids = None
+            if is_filtered:
+                domain = self._build_product_domain(kw)
+                products = request.env['product.template'].sudo().with_context(
+                    active_test=False).search(domain)
+                if not products:
+                    return {'daily': [], 'by_shop': []}
+                product_tmpl_ids = products.ids
+
+            # Qté achetée / CA Achat ignorent volontairement le filtre
+            # Période partout ailleurs dans ce dashboard (demande du
+            # 2026-09-25, voir _build_purchase_domain) : la marchandise est
+            # achetée en une fois puis vendue sur des mois. Ce graphique
+            # suit la même convention pour rester cohérent avec les autres
+            # chiffres d'achat affichés ailleurs.
+            purchase_domain = self._build_purchase_domain(kw, product_tmpl_ids)
+            rows = self._purchase_by_product_and_warehouse(purchase_domain)
+            if not rows:
+                return {'daily': [], 'by_shop': []}
+
+            pids = list({r[0] for r in rows if r[0]})
+            prods = request.env['product.product'].sudo().with_context(
+                active_test=False).search_read(
+                [('id', 'in', pids)], ['id', 'product_tmpl_id']
+            )
+            prod_to_tmpl = {p['id']: p['product_tmpl_id'][0] for p in prods if p.get('product_tmpl_id')}
+
+            tmpls = request.env['product.template'].sudo().with_context(
+                active_test=False).search_read(
+                [('id', 'in', list(set(prod_to_tmpl.values())))], ['id', 'arrivage_id']
+            )
+            tmpl_to_arrivage = {
+                t['id']: t['arrivage_id'][1] for t in tmpls if t.get('arrivage_id')
+            }
+
+            warehouse_ids = list({r[1] for r in rows if r[1]})
+            warehouses = request.env['stock.warehouse'].sudo().browse(warehouse_ids)
+            shop_name_by_wh_id = {w.id: w.name for w in warehouses}
+            company_ids = list({r[2] for r in rows if r[2]})
+            company_name_by_id = {
+                c['id']: c['name'] for c in request.env['res.company'].sudo().search_read(
+                    [('id', 'in', company_ids)], ['id', 'name'])
+            } if company_ids else {}
+
+            achats_by_arrivage = {}
+            by_shop_map = {}
+            for product_id, warehouse_id, company_id, ca, qty in rows:
+                tid = prod_to_tmpl.get(product_id)
+                if not tid:
+                    continue
+                arrivage_name = tmpl_to_arrivage.get(tid) or 'Non rattaché'
+                ca = float(ca or 0.0)
+                qty = int(qty or 0)
+
+                stats = achats_by_arrivage.setdefault(arrivage_name, {'ca': 0.0, 'qty': 0})
+                stats['ca'] += ca
+                stats['qty'] += qty
+
+                shop_name = (shop_name_by_wh_id.get(warehouse_id)
+                             or company_name_by_id.get(company_id)
+                             or 'Inconnu')
+                shop_stats = by_shop_map.setdefault((arrivage_name, shop_name), {'ca': 0.0, 'qty': 0})
+                shop_stats['ca'] += ca
+                shop_stats['qty'] += qty
+
+            non_rattache = achats_by_arrivage.pop('Non rattaché', None)
+
+            daily_achats = [
+                {
+                    'date': arrivage_name,
+                    'label': arrivage_name,
+                    'ca': round(stats['ca'], 2),
+                    'qty': stats['qty'],
+                    'articles': stats['qty'],
+                }
+                for arrivage_name, stats in achats_by_arrivage.items()
+            ]
+            daily_achats.sort(key=lambda x: x['ca'], reverse=True)
+
+            tous_magasins = sorted({
+                m.warehouse_id.name for m in self._get_active_shop_mappings() if m.warehouse_id
+            })
+
+            by_shop_grouped = {}
+            for (arrivage_name, shop_name), stats in by_shop_map.items():
+                if arrivage_name == 'Non rattaché':
+                    continue
+                by_shop_grouped.setdefault(arrivage_name, []).append({
+                    'shop': shop_name,
+                    'ca': round(stats['ca'], 2),
+                    'qty': stats['qty'],
+                })
+            by_shop = []
+            for arrivage_name, shops in by_shop_grouped.items():
+                vus = {s['shop'] for s in shops}
+                for nom in tous_magasins:
+                    if nom not in vus:
+                        shops.append({'shop': nom, 'ca': 0.0, 'qty': 0})
+                by_shop.append({'arrivage': arrivage_name, 'shops': sorted(shops, key=lambda s: s['ca'], reverse=True)})
+            by_shop.sort(key=lambda a: sum(s['ca'] for s in a['shops']), reverse=True)
+
+            return {
+                'daily': daily_achats,
+                'by_shop': by_shop,
+                'non_rattache': {
+                    'ca': round(non_rattache['ca'], 2),
+                    'qty': non_rattache['qty'],
+                } if non_rattache else None,
+            }
+        except Exception as e:
+            _logger.error(f"Erreur api_achats_daily: {str(e)}", exc_info=True)
             return {'error': str(e), 'daily': [], 'by_shop': []}
 
     # ─────────────────────────────────────────────────────────────
@@ -5606,8 +5996,26 @@ class MaVieDashboardController(http.Controller):
             # filtré : le tableau "Stock par Magasin" montre volontairement
             # tout le réseau (utile pour décider d'un transfert), et
             # stock_total applique le filtre société de son côté.
+            #
+            # BUG CORRIGÉ (2026-10-16, repéré par l'utilisatrice sur
+            # MRC-3311 : « dans le stock 2 mais dans dispatch par couleurs
+            # ya ça et c'est pas logique ») : ce filtrage ne couvrait que la
+            # société (context_company_ids), jamais le magasin précis choisi
+            # dans « Filtrer par Magasin » (kw['shop_field']) — contrairement
+            # à recon_warehouses plus bas, qui applique bien les deux, dans
+            # le même ordre de priorité. Résultat : avec Elite Auderby
+            # sélectionné, la carte "Stock Réel Odoo" retombait sur ce seul
+            # magasin (2 pièces) pendant que "Stock attendu" par couleur
+            # restait calculé sur tout le réseau de la société (29+6+1), les
+            # deux ne pouvant plus jamais se recouper. Même ordre de
+            # priorité que recon_warehouses : magasin précis d'abord, sinon
+            # société(s) cochée(s), sinon tout le réseau retail.
             variant_warehouses = scoped_warehouses
-            if context_company_ids:
+            if kw.get('shop_field'):
+                scope_variant = self._get_shop_scope(kw['shop_field'])
+                if scope_variant and scope_variant['warehouse']:
+                    variant_warehouses = scope_variant['warehouse']
+            elif context_company_ids:
                 variant_warehouses = scoped_warehouses.filtered(
                     lambda w: w.company_id.id in context_company_ids
                 )
@@ -5826,18 +6234,27 @@ class MaVieDashboardController(http.Controller):
 
                 # Ni Base Pivot ni les achats n'ont de donnée pour CETTE
                 # couleur précise (dispatch_missing) : pas de "0 pièce"
-                # trompeur, on affiche clairement l'absence de donnée.
+                # trompeur sur "Total pièces", on affiche clairement
+                # l'absence de donnée — mais SEULEMENT sur cette colonne-là.
+                #
+                # BUG CORRIGÉ (2026-10-16, repéré par l'utilisatrice :
+                # « il y a ce qui reste dans le stock, ça n'a rien à voir
+                # avec le bon d'achat fournisseur »). Elle a raison : "Stock
+                # attendu" ne vient PAS des achats, il vient des MOUVEMENTS
+                # DE STOCK réels (attendu_v, déjà calculé plus haut pour
+                # toutes les couleurs, achat confirmé ou non). Un `continue`
+                # ici jetait ce calcul à la poubelle dès qu'il n'y avait pas
+                # de bon d'achat, alors que les deux sources sont totalement
+                # indépendantes — exactement le même calcul que le panneau
+                # "Stock attendu (mouvements validés)" plus bas, qui lui ne
+                # dépend jamais des achats.
                 if v.get('dispatch_missing'):
                     v['total_pieces'] = None
-                    v['reste'] = None
-                    v['discordance'] = False
-                    v['discordance_detail'] = None
-                    continue
-
-                # Total pièces = quantité réellement RÉCEPTIONNÉE sur les
-                # commandes fournisseur pour cette couleur (qty_received),
-                # nette des retours au fournisseur.
-                v['total_pieces'] = dispatched_v
+                else:
+                    # Total pièces = quantité réellement RÉCEPTIONNÉE sur les
+                    # commandes fournisseur pour cette couleur (qty_received),
+                    # nette des retours au fournisseur.
+                    v['total_pieces'] = dispatched_v
 
                 # "Reste" ne vaut plus "Total pièces − Vendu" : cette
                 # soustraction mélangeait des DOCUMENTS (achats, tickets) et
@@ -5848,7 +6265,8 @@ class MaVieDashboardController(http.Controller):
                 # de cette couleur, sur le même périmètre que la colonne
                 # Stock. Il est donc directement comparable, et l'écart qui
                 # subsiste est une vraie anomalie (quantité écrite sans
-                # mouvement), pas un artefact de calcul.
+                # mouvement), pas un artefact de calcul. Calculé que du bon
+                # d'achat existe ou non.
                 attendu_v = v.get('attendu', 0)
                 v['reste'] = attendu_v
                 # La discordance se juge contre le stock COMPTABLE : c'est le
@@ -5968,14 +6386,33 @@ class MaVieDashboardController(http.Controller):
                 ('order_id.state', 'in', ['purchase', 'done']),
                 ('product_id.product_tmpl_id', '=', product_tmpl.id),
             ] + self._sachet_exclude_domain('product_id.product_tmpl_id.collection_id'))
+            # BUG CORRIGÉ (2026-10-22, repéré par l'utilisatrice : « Qté
+            # Dispatché » toujours vide) : `picking_type_id.warehouse_id`
+            # pointe sur l'entrepôt GÉNÉRIQUE de la société (ex. « STE YAYA
+            # ALI MODELE »), pas sur le vrai magasin — même défaut que celui
+            # déjà corrigé côté réassort (location_dest_id du picking).
+            # Vérifié en base (P00015) : picking_type_id.warehouse_id =
+            # « STE YAYA ALI MODELE », mais le mouvement de stock validé
+            # arrive réellement dans « MJ/Stock » (Elite Marjane). On
+            # résout donc le magasin via la destination RÉELLE du
+            # mouvement de stock (déjà fait), avec le picking_type en
+            # repli uniquement si aucun mouvement validé n'existe encore.
+            lot_stock_ids = shop_mappings.filtered('warehouse_id').mapped('warehouse_id.lot_stock_id').ids
+            loc_to_wh_id = self._location_to_warehouse(lot_stock_ids)
             purchased_by_warehouse = {}
             for pol in po_lines_all_shops:
-                wh = pol.order_id.picking_type_id.warehouse_id
-                if not wh:
+                wh_id = False
+                for mv in pol.move_ids.filtered(lambda m: m.state == 'done'):
+                    wh_id = loc_to_wh_id.get(mv.location_dest_id.id)
+                    if wh_id:
+                        break
+                if not wh_id:
+                    wh_id = pol.order_id.picking_type_id.warehouse_id.id
+                if not wh_id:
                     continue
                 # qty_received, pour rester cohérent avec la carte
                 # "Qté achetée" (dont le total par magasin doit correspondre).
-                purchased_by_warehouse[wh.id] = purchased_by_warehouse.get(wh.id, 0) + pol.qty_received
+                purchased_by_warehouse[wh_id] = purchased_by_warehouse.get(wh_id, 0) + pol.qty_received
 
             shop_mappings_by_field = {sm.shop_field: sm for sm in shop_mappings if sm.shop_field}
 
@@ -6324,17 +6761,27 @@ class MaVieDashboardController(http.Controller):
     # EXTRACTION / TRANSFERT INTER-MAGASINS
     # ─────────────────────────────────────────────────────────────
 
-    def _stock_by_mapping_for_template(self, product_tmpl_id, mappings, color=None):
+    def _stock_by_mapping_for_template(self, product_tmpl_id, mappings, color=None, product_tmpl_ids=None):
         """Retourne {shop_field: qty disponible} pour ce template, par magasin
         (basé sur stock.quant réel dans mapping.warehouse_id.lot_stock_id).
 
         Si `color` est fourni, ne compte que les variantes de cette couleur —
         sans ce filtre, un magasin peut être suggéré comme source alors que
         tout son stock disponible est dans une AUTRE couleur que celle
-        réellement recherchée pour la destination."""
-        variants = request.env['product.product'].sudo().search(
-            [('product_tmpl_id', '=', product_tmpl_id)]
-        )
+        réellement recherchée pour la destination.
+
+        DEMANDE UTILISATRICE (2026-10-24) : mode groupe (Transférer tout une
+        Collection/Couleur) — `product_tmpl_ids` (liste) remplace alors le
+        `product_tmpl_id` singulier, le reste de la fonction est inchangé
+        puisqu'elle ne travaille déjà que sur des `variants.ids` à plat."""
+        if product_tmpl_ids:
+            variants = request.env['product.product'].sudo().search(
+                [('product_tmpl_id', 'in', product_tmpl_ids)]
+            )
+        else:
+            variants = request.env['product.product'].sudo().search(
+                [('product_tmpl_id', '=', product_tmpl_id)]
+            )
         if color:
             color = color.upper().strip()
             variants = variants.filtered(
@@ -6619,21 +7066,57 @@ class MaVieDashboardController(http.Controller):
     @http.route('/mavie/api/transfer-suggestions', type='json', auth='user', methods=['POST'], csrf=False)
     def api_transfer_suggestions(self, **kw):
         try:
-            product_tmpl_id = kw.get('product_tmpl_id')
-            dest_shop_field = kw.get('dest_shop_field')
-            if not product_tmpl_id:
-                return {'error': 'Produit manquant.', 'suggestions': []}
+            # DEMANDE UTILISATRICE (2026-10-24) : mode groupe (Transférer tout
+            # une Collection/Couleur d'un coup) — `product_tmpl_ids` (liste)
+            # remplace alors le `product_tmpl_id` singulier habituel. Les
+            # champs mono-référence (prix de vente, photo) n'ont pas de sens
+            # pour plusieurs références et sont omis dans ce mode.
+            group_ids_raw = kw.get('product_tmpl_ids')
+            group_mode = bool(group_ids_raw)
+            product_tmpl_id = None
+            product_tmpl_ids = None
+            if group_mode:
+                try:
+                    product_tmpl_ids = [int(i) for i in group_ids_raw]
+                except (TypeError, ValueError):
+                    return {'error': 'Groupe de références invalide.', 'suggestions': []}
+                if not product_tmpl_ids:
+                    return {'error': 'Produit manquant.', 'suggestions': []}
+                if len(product_tmpl_ids) > 3000:
+                    return {'error': "Trop de références dans ce groupe (3000 au maximum) — affinez le filtre.",
+                            'suggestions': []}
+            else:
+                product_tmpl_id = kw.get('product_tmpl_id')
+                if not product_tmpl_id:
+                    return {'error': 'Produit manquant.', 'suggestions': []}
+                product_tmpl_id = int(product_tmpl_id)
 
-            product_tmpl_id = int(product_tmpl_id)
+            dest_shop_field = kw.get('dest_shop_field')
             color = (kw.get('color') or '').strip() or None
             mappings = self._get_active_shop_mappings()
+
+            # DEMANDE UTILISATRICE (2026-10-23) : « je dois avoir toutes les
+            # informations qui vont aider » — prix de vente et photo
+            # manquaient ici alors qu'ils existent déjà pour d'autres
+            # popups (ex. Solder) ; sans ça, impossible de juger l'enjeu
+            # financier d'un transfert sans rouvrir la fiche produit.
+            # Non applicable en mode groupe (plusieurs références).
+            prix_vente_ttc = 0.0
+            image_url = None
+            src_image = None
+            if not group_mode:
+                tmpl_transfer = request.env['product.template'].sudo().browse(product_tmpl_id)
+                prix_vente_ttc = tmpl_transfer.list_price or 0.0
+                src_image = self._image_availability({product_tmpl_id}).get(product_tmpl_id)
+                image_url = self._image_url(product_tmpl_id, src_image)
 
             dest_mapping = mappings.filtered(lambda m: m.shop_field == dest_shop_field)[:1]
             dest_city = (dest_mapping.city or '').strip() if dest_mapping else ''
             nearby_cities = set(CITY_PROXIMITY.get(dest_city, [])) if dest_city else set()
 
             source_mappings = mappings.filtered(lambda m: m.shop_field != dest_shop_field)
-            stock_by_field = self._stock_by_mapping_for_template(product_tmpl_id, source_mappings, color=color)
+            stock_by_field = self._stock_by_mapping_for_template(
+                product_tmpl_id, source_mappings, color=color, product_tmpl_ids=product_tmpl_ids)
 
             suggestions = []
             for m in source_mappings:
@@ -6661,60 +7144,176 @@ class MaVieDashboardController(http.Controller):
 
             # ── Répartition et Stock pour TOUS les magasins (Dispatché, Vendu, Stock) ──
             all_stores = []
-            variants = request.env['product.product'].sudo().search(
-                [('product_tmpl_id', '=', product_tmpl_id)]
-            )
+            # BUG CORRIGÉ (2026-10-22) : sans active_test=False, une
+            # référence dont toutes les variantes sont archivées (normal
+            # pour un vieux modèle : la fiche Odoo reste, la variante
+            # commerciale est désactivée) ressortait avec 0 partout —
+            # Dispatché, Vendu, Stock, KPI — alors que ses achats/ventes
+            # passés existent bien. Vérifié sur THS-155 (7/7 variantes
+            # archivées, 42 lignes d'achat réelles).
+            variants_domain = [('product_tmpl_id', 'in', product_tmpl_ids)] if group_mode \
+                else [('product_tmpl_id', '=', product_tmpl_id)]
+            variants = request.env['product.product'].sudo().with_context(
+                active_test=False).search(variants_domain)
             if color:
                 color_upper = color.upper().strip()
                 variants = variants.filtered(
                     lambda v: (resolve_variant_color_size(v)[0] or '').upper().strip() == color_upper
                 )
 
-            all_stock_by_field = self._stock_by_mapping_for_template(product_tmpl_id, mappings, color=color)
+            all_stock_by_field = self._stock_by_mapping_for_template(
+                product_tmpl_id, mappings, color=color, product_tmpl_ids=product_tmpl_ids)
 
+            # DEMANDE UTILISATRICE (2026-10-22) : pour décider où envoyer et
+            # combien, il faut voir en un coup d'œil — en plus du stock —
+            # ce qui s'est vendu RÉCEMMENT (30 derniers jours) magasin par
+            # magasin, et les totaux Qté achetée / CA Achat / CA Vendu de la
+            # référence, sans devoir ouvrir la fiche produit à côté.
+            seuil_recent = datetime.now() - timedelta(days=30)
             sold_by_field = {}
+            sold_30j_by_field = {}
+            ca_sold_by_field = {}
+            qty_sold_brut = 0
+            ca_vendu_brut = 0.0
             if variants:
                 pos_lines = request.env['pos.order.line'].sudo().search([
                     ('product_id', 'in', variants.ids),
                     ('order_id.state', 'in', ['paid', 'done', 'invoiced'])
                 ])
                 for pline in pos_lines:
+                    qty_sold_brut += pline.qty or 0
+                    ca_vendu_brut += pline.price_subtotal_incl or 0.0
                     cfg = pline.order_id.session_id.config_id
                     if cfg and cfg.picking_type_id and cfg.picking_type_id.warehouse_id:
                         wh_id = cfg.picking_type_id.warehouse_id.id
                         for sm in mappings:
                             if sm.warehouse_id and sm.warehouse_id.id == wh_id:
                                 sold_by_field[sm.shop_field] = sold_by_field.get(sm.shop_field, 0) + int(pline.qty)
+                                ca_sold_by_field[sm.shop_field] = ca_sold_by_field.get(sm.shop_field, 0.0) + (pline.price_subtotal_incl or 0.0)
+                                if pline.order_id.date_order and pline.order_id.date_order >= seuil_recent:
+                                    sold_30j_by_field[sm.shop_field] = sold_30j_by_field.get(sm.shop_field, 0) + int(pline.qty)
                                 break
 
             dispatched_by_field = {}
+            ca_achat_by_field = {}
+            qty_purchased_brut = 0
+            ca_achat_brut = 0.0
             if variants:
                 po_lines = request.env['purchase.order.line'].sudo().search([
                     ('product_id', 'in', variants.ids),
                     ('order_id.state', 'in', ['purchase', 'done'])
                 ])
+                # BUG CORRIGÉ (2026-10-22) : même défaut que dans
+                # api_product_detail — picking_type_id.warehouse_id pointe
+                # l'entrepôt générique de la société, pas le vrai magasin.
+                # On résout via la destination réelle du mouvement de stock.
+                lot_stock_ids = mappings.filtered('warehouse_id').mapped('warehouse_id.lot_stock_id').ids
+                loc_to_wh_id = self._location_to_warehouse(lot_stock_ids)
+                field_by_wh_id = {sm.warehouse_id.id: sm.shop_field for sm in mappings if sm.warehouse_id}
                 for pol in po_lines:
-                    wh = pol.order_id.picking_type_id.warehouse_id
-                    if wh:
-                        for sm in mappings:
-                            if sm.warehouse_id and sm.warehouse_id.id == wh.id:
-                                dispatched_by_field[sm.shop_field] = dispatched_by_field.get(sm.shop_field, 0) + int(pol.product_qty)
-                                break
+                    qty_purchased_brut += pol.qty_received or 0
+                    ca_achat_brut += pol.price_total or 0.0
+                    wh_id = False
+                    for mv in pol.move_ids.filtered(lambda m: m.state == 'done'):
+                        wh_id = loc_to_wh_id.get(mv.location_dest_id.id)
+                        if wh_id:
+                            break
+                    if not wh_id:
+                        wh_id = pol.order_id.picking_type_id.warehouse_id.id
+                    field = field_by_wh_id.get(wh_id)
+                    if field:
+                        # DEMANDE UTILISATRICE (2026-10-23) : « au lieu de
+                        # dispatché je dois avoir le nombre exact qui est
+                        # entré dans le magasin » — qty_received (ce qui est
+                        # VRAIMENT arrivé), pas product_qty (ce qui a été
+                        # commandé, qui peut être plus grand si la commande
+                        # n'est pas encore totalement livrée).
+                        dispatched_by_field[field] = dispatched_by_field.get(field, 0) + int(pol.qty_received or 0)
+                        ca_achat_by_field[field] = ca_achat_by_field.get(field, 0.0) + (pol.price_total or 0.0)
+
+                # Le reste des entrées : tout ce qui est arrivé dans ce
+                # magasin SANS passer par un bon d'achat — essentiellement
+                # les transferts reçus d'un autre magasin (ex. ceux créés
+                # depuis ce popup même). Sans ça, « Dispatché » ne comptait
+                # que les achats et ne reflétait jamais le vrai stock
+                # (constaté : magasin à 37 pièces en stock, 0 achat direct,
+                # tout venu de 6 transferts reçus). Dans un dict À PART
+                # (entrees_by_field) : qty_purchased_total / le KPI « Qté
+                # achetée » plus haut doivent rester achats PURS, seul le
+                # tableau par magasin ci-dessous doit voir le total réel.
+                entrees_by_field = dict(dispatched_by_field)
+                if lot_stock_ids:
+                    transferts_recus = request.env['stock.move'].sudo().search([
+                        ('product_id', 'in', variants.ids),
+                        ('state', '=', 'done'),
+                        ('purchase_line_id', '=', False),
+                        ('location_dest_id', 'child_of', lot_stock_ids),
+                    ])
+                    for mv in transferts_recus:
+                        wh_dest = loc_to_wh_id.get(mv.location_dest_id.id)
+                        if not wh_dest:
+                            continue
+                        # Un mouvement interne au MÊME magasin (réorganisation
+                        # d'emplacement) n'est pas une vraie entrée : on ne
+                        # compte que ce qui vient d'ailleurs (un autre
+                        # magasin, le dépôt, un ajustement d'inventaire...).
+                        wh_source = loc_to_wh_id.get(mv.location_id.id)
+                        if wh_source == wh_dest:
+                            continue
+                        field = field_by_wh_id.get(wh_dest)
+                        if field:
+                            entrees_by_field[field] = entrees_by_field.get(field, 0) + int(mv.product_qty)
+            else:
+                entrees_by_field = {}
+
+            # BUG CORRIGÉ (2026-10-23, repéré par l'utilisatrice : « teste le
+            # filtre magasin dans les popups aussi ») : ces 4 totaux
+            # restaient réseau entier quel que soit le magasin filtré en
+            # haut de page — vérifié : identiques avec et sans shop_field.
+            # Le tableau détaillé par magasin ci-dessous reste volontairement
+            # réseau entier (on veut voir où transférer DEPUIS), mais ces
+            # totaux doivent, eux, respecter le filtre comme partout
+            # ailleurs dans le dashboard. Sans filtre, on garde les totaux
+            # bruts (toutes les lignes, même celles dont l'entrepôt ne
+            # correspond à aucun magasin mappé) pour rester cohérent avec la
+            # fiche produit ; avec un filtre, seules les lignes résolues
+            # jusqu'à CE magasin comptent.
+            scopes = self._get_shop_scopes(kw)
+            scope_fields = ({s['mapping'].shop_field for s in scopes if s.get('mapping') and s['mapping'].shop_field} or None) if scopes else None
+            if scope_fields:
+                qty_sold_total = sum(q for f, q in sold_by_field.items() if f in scope_fields)
+                ca_vendu_total = sum(c for f, c in ca_sold_by_field.items() if f in scope_fields)
+                qty_purchased_total = sum(q for f, q in dispatched_by_field.items() if f in scope_fields)
+                ca_achat_total = sum(c for f, c in ca_achat_by_field.items() if f in scope_fields)
+            else:
+                qty_sold_total = qty_sold_brut
+                ca_vendu_total = ca_vendu_brut
+                qty_purchased_total = qty_purchased_brut
+                ca_achat_total = ca_achat_brut
 
             for m in mappings:
                 if not m.warehouse_id or not m.warehouse_id.lot_stock_id:
                     continue
                 stk = all_stock_by_field.get(m.shop_field, 0.0)
-                disp = dispatched_by_field.get(m.shop_field, 0)
+                # DEMANDE UTILISATRICE (2026-10-23) : « au lieu de
+                # dispatché je dois avoir le nombre exact qui est entré
+                # dans le magasin » — achats réellement reçus + transferts
+                # reçus d'un autre magasin, pour que Entrées − Vendu colle
+                # au Stock dispo (sauf si ce magasin a aussi ENVOYÉ du
+                # stock ailleurs, auquel cas il manque encore les sorties
+                # pour boucler parfaitement).
+                entrees = entrees_by_field.get(m.shop_field, 0)
                 sold = sold_by_field.get(m.shop_field, 0)
+                sold_30j = sold_30j_by_field.get(m.shop_field, 0)
                 city = (m.city or '').strip()
                 all_stores.append({
                     'shop_field': m.shop_field,
                     'shop_label': m.warehouse_id.name if m.warehouse_id else (m.shop_label or m.shop_field),
                     'city': city or '—',
                     'company': m.company_id.name if m.company_id else '—',
-                    'dispatched': int(disp),
+                    'entrees': int(entrees),
                     'sold': int(sold),
+                    'sold_30j': int(sold_30j),
                     'stock': int(stk),
                     'is_target': m.shop_field == dest_shop_field,
                     'has_responsible': bool(m._get_store_managers()),
@@ -6722,7 +7321,20 @@ class MaVieDashboardController(http.Controller):
 
             all_stores.sort(key=lambda s: (0 if s['is_target'] else 1, -s['stock'], s['shop_label']))
 
-            return {'suggestions': suggestions, 'dest_city': dest_city or None, 'all_stores': all_stores}
+            return {
+                'suggestions': suggestions, 'dest_city': dest_city or None, 'all_stores': all_stores,
+                'prix_vente_ttc': round(prix_vente_ttc, 2),
+                'image_url': image_url,
+                'has_image': bool(src_image),
+                'group_mode': group_mode,
+                'nb_references': len(product_tmpl_ids) if group_mode else 1,
+                'kpis': {
+                    'qty_purchased': int(qty_purchased_total),
+                    'ca_achat': round(ca_achat_total, 2),
+                    'qty_sold': int(qty_sold_total),
+                    'ca_vendu': round(ca_vendu_total, 2),
+                },
+            }
         except Exception as e:
             _logger.error(f"Erreur api_transfer_suggestions: {str(e)}", exc_info=True)
             return {'error': str(e), 'suggestions': [], 'all_stores': []}
@@ -6734,12 +7346,31 @@ class MaVieDashboardController(http.Controller):
         quand on clique sur un magasin suggéré, pour choisir les quantités
         ligne par ligne au lieu d'une quantité globale devinée automatiquement."""
         try:
-            product_tmpl_id = kw.get('product_tmpl_id')
+            # DEMANDE UTILISATRICE (2026-10-24) : mode groupe — `product_tmpl_ids`
+            # (liste) remplace alors le `product_tmpl_id` singulier ; chaque
+            # ligne renvoyée porte alors aussi sa référence (`reference`),
+            # pour que la matrice sache à quel produit chaque ligne appartient.
+            group_ids_raw = kw.get('product_tmpl_ids')
+            group_mode = bool(group_ids_raw)
             source_shop_field = kw.get('source_shop_field')
-            if not (product_tmpl_id and source_shop_field):
-                return {'error': 'Produit ou magasin source manquant.', 'variants': []}
+            if group_mode:
+                try:
+                    product_tmpl_ids = [int(i) for i in group_ids_raw]
+                except (TypeError, ValueError):
+                    return {'error': 'Groupe de références invalide.', 'variants': []}
+                if not (product_tmpl_ids and source_shop_field):
+                    return {'error': 'Produit ou magasin source manquant.', 'variants': []}
+                if len(product_tmpl_ids) > 3000:
+                    return {'error': "Trop de références dans ce groupe (3000 au maximum) — affinez le filtre.",
+                            'variants': []}
+                variants_domain = [('product_tmpl_id', 'in', product_tmpl_ids)]
+            else:
+                product_tmpl_id = kw.get('product_tmpl_id')
+                if not (product_tmpl_id and source_shop_field):
+                    return {'error': 'Produit ou magasin source manquant.', 'variants': []}
+                product_tmpl_id = int(product_tmpl_id)
+                variants_domain = [('product_tmpl_id', '=', product_tmpl_id)]
 
-            product_tmpl_id = int(product_tmpl_id)
             color = (kw.get('color') or '').strip() or None
             mappings = self._get_active_shop_mappings()
             source_mapping = mappings.filtered(lambda m: m.shop_field == source_shop_field)[:1]
@@ -6747,9 +7378,7 @@ class MaVieDashboardController(http.Controller):
                 return {'error': 'Magasin source non configuré (entrepôt manquant).', 'variants': []}
 
             source_location = source_mapping.warehouse_id.lot_stock_id
-            variants = request.env['product.product'].sudo().search(
-                [('product_tmpl_id', '=', product_tmpl_id)]
-            )
+            variants = request.env['product.product'].sudo().search(variants_domain)
             if color:
                 color_upper = color.upper().strip()
                 variants = variants.filtered(
@@ -6765,15 +7394,22 @@ class MaVieDashboardController(http.Controller):
                 if available <= 0:
                     continue
                 color_name, size_name = resolve_variant_color_size(v)
-                rows.append({
+                row = {
                     'product_id': v.id,
                     'color': color_name or '—',
                     'size': size_name or '—',
                     'available_qty': int(available),
-                })
+                }
+                if group_mode:
+                    tmpl = v.product_tmpl_id
+                    row['reference'] = tmpl.base_pivot_reference or tmpl.default_code or tmpl.name or '—'
+                rows.append(row)
+                if group_mode and len(rows) > 2000:
+                    return {'error': "Trop de lignes dans ce groupe (2000 au maximum) — affinez le filtre "
+                                      "(Collection/Catégorie/Couleur) avant de transférer.", 'variants': []}
 
-            rows.sort(key=lambda r: (r['color'], r['size']))
-            return {'variants': rows}
+            rows.sort(key=lambda r: (r.get('reference', ''), r['color'], r['size']))
+            return {'variants': rows, 'group_mode': group_mode}
         except Exception as e:
             _logger.error(f"Erreur api_transfer_variant_stock: {str(e)}", exc_info=True)
             return {'error': str(e), 'variants': []}
@@ -6800,7 +7436,8 @@ class MaVieDashboardController(http.Controller):
 
         def acc(wh):
             return out.setdefault(wh, {'entree': 0, 'sortie': 0, 'reassort': 0,
-                                       'attente': 0, 'solde': 0, 'details': [], 'lignes': []})
+                                       'attente': 0, 'solde': 0, 'solde_pose': False,
+                                       'details': [], 'lignes': []})
 
         request.env.cr.execute("""
             SELECT t.name, t.state, COALESCE(t.origin, '') = %(orig)s,
@@ -6860,6 +7497,55 @@ class MaVieDashboardController(http.Controller):
                     'fait': fait,
                 })
 
+        # DEMANDE UTILISATRICE (2026-10-21) : « je dois avoir que cette pièce
+        # ajoutée vient de réassort comme ce qui est dans solde et
+        # transferts » — le bloc ci-dessus ne couvre que l'ANCIEN mécanisme
+        # de réassort (inter.internal.transfer, origin REASSORT_ORIGINE).
+        # Le réassort actuel (Action → Réassort, depuis le 2026-09-24) crée
+        # de vrais bons de vente inter-sociétés (sale.order), jamais des
+        # inter.internal.transfer : sans ce bloc, une pièce reçue par
+        # réassort n'apparaissait jamais ici, contrairement aux transferts
+        # et aux soldes. Le vrai magasin visé est lu dans `so.note`, écrite
+        # par _reassort_envoyer_avec_validation_magasin au moment de
+        # l'envoi — même méthode que _suivi_build_rows_reassort, pour que
+        # les deux tableaux soient toujours d'accord.
+        SaleLine = request.env['sale.order.line'].sudo()
+        reassort_lines = SaleLine.search([
+            ('product_id', 'in', variant_ids),
+            ('order_id.origin', 'like', 'VENTE inter-sociétés — Réassort%'),
+            ('order_id.state', 'not in', ('draft', 'sent', 'cancel')),
+        ])
+        for line in reassort_lines:
+            so = line.order_id
+            m_note = re.search(r'Magasin\s*:\s*([^|<]+?)\s*\|', so.note or '')
+            shop_label = m_note.group(1).strip() if m_note else None
+            mapping = (request.env['mv.batch.shop.mapping'].sudo().search(
+                [('shop_label', '=', shop_label)], limit=1)
+                if shop_label else request.env['mv.batch.shop.mapping'])
+            wh = mapping.warehouse_id.id if mapping and mapping.warehouse_id else False
+            if not wh:
+                continue
+            po = request.env['purchase.order'].sudo().search(
+                [('auto_sale_order_id', '=', so.id)], limit=1)
+            incoming = po.picking_ids.filtered(
+                lambda p: p.picking_type_id.code == 'incoming')[:1] if po else request.env['stock.picking']
+            fait = bool(incoming and incoming.state == 'done')
+            qte = int(round(line.product_uom_qty))
+            quand = str(so.create_date)[:10] if so.create_date else ''
+            a = acc(wh)
+            if not fait:
+                a['attente'] += qte
+            else:
+                a['reassort'] += qte
+            a['details'].append('Réassort +%s pcs · %s · %s%s' % (
+                qte, so.name, quand,
+                '' if fait else ' · EN ATTENTE de validation, stock pas encore déplacé'))
+            a['lignes'].append({
+                'date': quand, 'sens': 'recu', 'quoi': 'Réassort', 'qty': qte,
+                'bon': so.name, 'avec': so.company_id.name or '—',
+                'etat': 'Fait' if fait else 'En attente de validation', 'fait': fait,
+            })
+
         # Vendu en solde : prix réellement payé sous le prix catalogue.
         request.env.cr.execute("""
             SELECT spt.warehouse_id, SUM(pol.qty), MAX(po.date_order)
@@ -6889,6 +7575,51 @@ class MaVieDashboardController(http.Controller):
             a['lignes'].append({'date': str(derniere)[:10] if derniere else '',
                                 'sens': 'solde', 'quoi': 'Vendu en solde', 'qty': a['solde'],
                                 'bon': '—', 'avec': 'caisse', 'etat': 'Fait', 'fait': True})
+
+        # BUG CORRIGÉ (2026-10-28, repéré par l'utilisatrice : « pour le
+        # solde c'est même prob de popup couleur ») : le bloc ci-dessus ne
+        # voit que les ventes DÉJÀ faites sous le prix catalogue — une solde
+        # posée depuis le dashboard (promotion loyalty.program, voir
+        # _solde_creer_promotion) mais pas encore vendue n'allumait donc
+        # jamais le rouge ici, alors qu'elle est bien active en caisse. Même
+        # défaut, même classe de correctif que _actions_references.
+        Program = request.env['loyalty.program'].sudo()
+        now = fields.Datetime.now()
+        programmes = Program.search([
+            ('program_type', '=', 'promotion'),
+            '|', ('date_to', '=', False), ('date_to', '>=', now),
+            ('rule_ids.product_ids', 'in', variant_ids),
+        ])
+        variant_set = set(variant_ids)
+        for prog in programmes:
+            remise_pct = 0.0
+            for r in prog.reward_ids:
+                if r.reward_type == 'discount' and r.discount_mode == 'percent':
+                    remise_pct = max(remise_pct, r.discount or 0.0)
+            if remise_pct <= 0:
+                continue
+            if not (set(prog.rule_ids.mapped('product_ids').ids) & variant_set):
+                continue
+            whs = {w for w in prog.pos_config_ids.mapped('warehouse_id').ids if w}
+            for wh in whs:
+                a = acc(wh)
+                if a['solde_pose']:
+                    continue
+                a['solde_pose'] = True
+                # BUG CORRIGÉ (2026-10-28, repéré par l'utilisatrice : « il
+                # est en 28 dans la fiche » alors que la solde avait été
+                # posée le 26) : la date affichée ici était celle du JOUR DE
+                # LA CONSULTATION (today), pas celle de la pose réelle de la
+                # promotion — même convention que api_soldes_journal
+                # (depuis_dt = date_from ou write_date ou create_date).
+                date_pose = prog.date_from or prog.write_date or prog.create_date
+                a['details'].append('Solde posée le %s : -%s %% (en attente de vente)' % (
+                    fields.Date.to_string(date_pose) if date_pose else '—',
+                    str(round(remise_pct, 1)).replace('.0', '')))
+                a['lignes'].append({'date': fields.Date.to_string(date_pose) if date_pose else '',
+                                    'sens': 'solde', 'quoi': 'Solde posée', 'qty': 0,
+                                    'bon': prog.name, 'avec': 'caisse',
+                                    'etat': 'Active — en attente de vente', 'fait': True})
         # Infobulle lisible : les 8 mouvements les plus récents suffisent.
         for a in out.values():
             a['lignes'].sort(key=lambda x: x['date'], reverse=True)
@@ -8065,6 +8796,177 @@ class MaVieDashboardController(http.Controller):
             })
         return rows
 
+    def _reassort_history_rows(self, kw, limit=300):
+        """Bons de réassort (dépôt → magasin), dans le même format que
+        _transfer_history_rows — DEMANDE UTILISATRICE (2026-10-21) : « ajoute
+        aussi dans l'historique de réassort » sur la carte « Historique »
+        du Tableau de bord, à côté des onglets Transferts et Soldes déjà
+        présents. Ne reprend que la jambe vente (dépôt → magasin, via
+        _reassort_envoyer_avec_validation_magasin) : c'est elle qui
+        correspond à un déplacement de stock entre deux emplacements, comme
+        un transfert ; la jambe achat (fournisseur → dépôt) ne concerne
+        aucun magasin et reste hors de cette carte.
+        """
+        Batch = request.env['mv.article.batch'].sudo()
+        domain = [('name', 'like', 'VENTE inter-sociétés — Réassort%'),
+                  ('sale_order_ids', '!=', False)]
+        if kw.get('date_start'):
+            domain.append(('create_date', '>=', kw['date_start'] + ' 00:00:00'))
+        if kw.get('date_end'):
+            domain.append(('create_date', '<=', kw['date_end'] + ' 23:59:59'))
+        # DEMANDE UTILISATRICE (2026-10-28) : « dans l'historique qui est
+        # dans la fiche de l'article il a pas le reassort » — réutilisé par
+        # api_product_history pour filtrer sur UNE référence (un batch ne
+        # couvre qu'une seule référence, voir _reassort_batch_base_pivot :
+        # filtrer les batches suffit, pas besoin de filtrer aussi les lignes
+        # des bons à l'intérieur).
+        if kw.get('article_id'):
+            try:
+                domain.append(('sale_order_ids.order_line.product_id.product_tmpl_id',
+                               '=', int(kw['article_id'])))
+            except (TypeError, ValueError):
+                pass
+        batches = Batch.search(domain, order='id desc', limit=limit)
+
+        mappings_by_company = {}
+        for m in self._get_active_shop_mappings():
+            if m.company_id and m.company_id.id not in mappings_by_company:
+                mappings_by_company[m.company_id.id] = m
+        mappings_by_shop_label = {
+            m.shop_label: m for m in self._get_active_shop_mappings() if m.shop_label
+        }
+
+        scope = self._get_shop_scope(kw.get('shop_field'))
+        scope_company_id = (scope['warehouse'].company_id.id
+                             if scope and scope.get('warehouse') else None)
+        context_company_ids = self._get_context_company_ids()
+
+        # DEMANDE UTILISATRICE (2026-10-26) : repère de lot posé par
+        # _reassort_batch_base_pivot (suffixe_groupe) — exposé sur chaque
+        # ligne pour que _reassort_history_rows_groupees puisse fusionner
+        # les batches d'un même lot en une seule ligne, et que le popup de
+        # détail puisse filtrer dessus.
+        m_groupe_re = re.compile(r'‹G:([^|›]+)\|([^›]*)›')
+
+        rows = []
+        for batch in batches:
+            m_groupe = m_groupe_re.search(batch.name or '')
+            group_ref = m_groupe.group(1) if m_groupe else None
+            group_label = m_groupe.group(2) if m_groupe else None
+            for so in batch.sale_order_ids:
+                dest_company = request.env['res.company'].sudo().search(
+                    [('partner_id', '=', so.partner_id.id)], limit=1)
+                if scope_company_id:
+                    if not dest_company or dest_company.id != scope_company_id:
+                        continue
+                elif context_company_ids:
+                    if not dest_company or dest_company.id not in context_company_ids:
+                        continue
+
+                # Même résolution du magasin réel que _suivi_build_rows_
+                # reassort : so.note d'abord (écrit au moment de l'envoi),
+                # la société en repli pour les anciens bons sans note.
+                shop_label_note = None
+                m_note = re.search(r'Magasin\s*:\s*([^|<]+?)\s*\|', so.note or '')
+                if m_note:
+                    shop_label_note = m_note.group(1).strip()
+                mapping = mappings_by_shop_label.get(shop_label_note) if shop_label_note else None
+                if not mapping:
+                    mapping = mappings_by_company.get(dest_company.id) if dest_company else None
+                dest_label = (
+                    (mapping.warehouse_id.name if mapping and mapping.warehouse_id else None)
+                    or (mapping.shop_label if mapping else None)
+                    or (dest_company.name if dest_company else so.partner_id.name)
+                )
+
+                po = request.env['purchase.order'].sudo().search(
+                    [('auto_sale_order_id', '=', so.id)], limit=1)
+                incoming = po.picking_ids.filtered(
+                    lambda p: p.picking_type_id.code == 'incoming')[:1] if po else request.env['stock.picking']
+
+                envoye = int(round(sum(so.order_line.mapped('product_uom_qty'))))
+                recu = None
+                if incoming and incoming.state == 'done':
+                    recu = int(round(sum(incoming.move_line_ids.mapped('quantity'))))
+
+                if so.state == 'cancel':
+                    state, state_label = 'cancelled', 'Annulé'
+                elif recu is None:
+                    state, state_label = 'submitted', 'En attente de réception magasin'
+                else:
+                    state, state_label = 'done', 'Reçu'
+
+                refs = so.order_line.mapped('product_id.product_tmpl_id')
+                rows.append({
+                    'id': so.id,
+                    'name': so.name,
+                    'date': str(so.create_date)[:16] if so.create_date else '—',
+                    'state': state,
+                    'state_label': state_label,
+                    'source_societe': so.company_id.name or '—',
+                    'source_magasin': 'Dépôt (%s)' % (so.company_id.name or '—'),
+                    'dest_societe': dest_company.name if dest_company else '—',
+                    'dest_magasin': dest_label or '—',
+                    'picking_name': incoming.name if incoming else '',
+                    'picking_id': incoming.id if incoming else None,
+                    'nb_references': len(refs),
+                    'qty': envoye,
+                    'group_ref': group_ref,
+                    'group_label': group_label,
+                    'article_id': refs[0].id if len(refs) == 1 else None,
+                    'reference': (refs[0].base_pivot_reference or refs[0].default_code or refs[0].name)
+                                 if len(refs) == 1 else None,
+                })
+        rows.sort(key=lambda r: r['date'], reverse=True)
+        return rows
+
+    def _reassort_history_rows_groupees(self, kw, limit=300):
+        """`_reassort_history_rows`, mais avec les bons d'un même lot
+        (Collection/Catégorie/Couleur, voir api_reassort_generer_lot)
+        fusionnés en une seule ligne — DEMANDE UTILISATRICE (2026-10-26),
+        même principe que `_solde_posees_rows` pour les soldes. N'affecte
+        QUE l'Historique du Tableau de bord : l'export CSV continue
+        d'appeler `_reassort_history_rows` directement, un bon par ligne,
+        pour garder le détail complet."""
+        rows = []
+        lots = {}
+        for r in self._reassort_history_rows(kw, limit=limit):
+            group_ref = r.get('group_ref')
+            if not group_ref:
+                rows.append(r)
+                continue
+            lot = lots.get(group_ref)
+            if not lot:
+                lot = lots[group_ref] = dict(r)
+                lot['name'] = r.get('group_label') or 'Groupe'
+                lot['nb_references'] = 0
+                lot['qty'] = 0
+                lot['_bons'] = []
+                lot['_refs_vues'] = set()
+            # BUG CORRIGÉ (2026-10-28, repéré en retestant le réassort en
+            # lot : « nb_references: 9 » affiché pour un lot de 2
+            # références) : un réassort crée PLUSIEURS bons par référence
+            # (un par magasin destinataire) — additionner le
+            # `nb_references` de chaque BON (toujours 1) comptait les bons,
+            # pas les références distinctes du lot. Même défaut, même
+            # correctif que `_solde_posees_rows` : on déduplique par
+            # référence (article_id).
+            cle_ref = r.get('article_id')
+            if cle_ref not in lot['_refs_vues']:
+                lot['_refs_vues'].add(cle_ref)
+                lot['nb_references'] += 1
+            lot['qty'] += r.get('qty') or 0
+            lot['_bons'].append(r['id'])
+            # La date affichée reste la plus ancienne (le lancement du lot).
+            if r['date'] < lot['date']:
+                lot['date'] = r['date']
+        for lot in lots.values():
+            del lot['_bons']
+            del lot['_refs_vues']
+            rows.append(lot)
+        rows.sort(key=lambda r: r['date'], reverse=True)
+        return rows
+
     def _suivi_pickings_resolus(self, picking):
         """Le picking original + toute sa chaîne de reliquats (backorders).
 
@@ -8336,6 +9238,218 @@ class MaVieDashboardController(http.Controller):
         delai_moyen_global = round(sum(tous_delais) / tous_nb, 1) if tous_nb else None
         return out, nb_anomalies, round(valeur_en_transit, 2), delai_moyen_global
 
+    def _suivi_build_rows_reassort(self, kw):
+        """Lignes de réassort (dépôt → magasin), dans le même format que
+        les lignes de _suivi_build_rows — page « Suivi », onglet « Réassort ».
+
+        DEMANDE UTILISATRICE (2026-10-19) : d'abord fusionné dans la même
+        liste que les transferts, puis séparé en onglet propre (« comme de
+        solde et transferts », même motif que la page Propositions) : le
+        réassort (sale.order via _reassort_envoyer_avec_validation_magasin)
+        et les transferts (inter.internal.transfer) sont deux circuits de
+        documents trop différents pour une seule liste — pas de
+        validation/note manuelle côté réassort, pas le même modèle à
+        ouvrir, pas les mêmes filtres utiles.
+        """
+        Batch = request.env['mv.article.batch'].sudo()
+        domain = [('name', 'like', 'VENTE inter-sociétés — Réassort%'),
+                  ('sale_order_ids', '!=', False)]
+        if kw.get('date_start'):
+            domain.append(('create_date', '>=', kw['date_start'] + ' 00:00:00'))
+        if kw.get('date_end'):
+            domain.append(('create_date', '<=', kw['date_end'] + ' 23:59:59'))
+        batches = Batch.search(domain, order='id desc', limit=300)
+
+        mappings_by_company = {}
+        for m in self._get_active_shop_mappings():
+            if m.company_id and m.company_id.id not in mappings_by_company:
+                mappings_by_company[m.company_id.id] = m
+        mappings_by_shop_label = {
+            m.shop_label: m for m in self._get_active_shop_mappings() if m.shop_label
+        }
+
+        scope = self._get_shop_scope(kw.get('shop_field'))
+        scope_company_id = (scope['warehouse'].company_id.id
+                             if scope and scope.get('warehouse') else None)
+        context_company_ids = self._get_context_company_ids()
+
+        out = []
+        for batch in batches:
+            for so in batch.sale_order_ids:
+                dest_company = request.env['res.company'].sudo().search(
+                    [('partner_id', '=', so.partner_id.id)], limit=1)
+                if scope_company_id:
+                    if not dest_company or dest_company.id != scope_company_id:
+                        continue
+                elif context_company_ids:
+                    if not dest_company or dest_company.id not in context_company_ids:
+                        continue
+
+                # BUG CORRIGÉ (2026-10-21, repéré par l'utilisatrice : un
+                # réassort envoyé vers Elite Mohamed V s'affichait ici comme
+                # « Elite Carré Eden ») : quand une société regroupe
+                # plusieurs magasins (ex. STE YAYA ALI MODELE), deviner le
+                # magasin depuis la seule société du bon de vente est
+                # ambigu — ça prenait toujours le premier mapping de la
+                # société, pas forcément le bon réellement visé. Le vrai
+                # magasin est en revanche écrit noir sur blanc dans
+                # `so.note` au moment de l'envoi (_reassort_envoyer_avec_
+                # validation_magasin) : on le relit en priorité, la
+                # résolution par société ne sert plus que de repli si la
+                # note est absente ou illisible (anciens bons).
+                shop_label_note = None
+                m_note = re.search(r'Magasin\s*:\s*([^|<]+?)\s*\|', so.note or '')
+                if m_note:
+                    shop_label_note = m_note.group(1).strip()
+                mapping = mappings_by_shop_label.get(shop_label_note) if shop_label_note else None
+                if not mapping:
+                    mapping = mappings_by_company.get(dest_company.id) if dest_company else None
+                dest_label = (
+                    (mapping.warehouse_id.name if mapping and mapping.warehouse_id else None)
+                    or (mapping.shop_label if mapping else None)
+                    or (dest_company.name if dest_company else so.partner_id.name)
+                )
+
+                po = request.env['purchase.order'].sudo().search(
+                    [('auto_sale_order_id', '=', so.id)], limit=1)
+                incoming = po.picking_ids.filtered(
+                    lambda p: p.picking_type_id.code == 'incoming')[:1] if po else request.env['stock.picking']
+
+                envoye = int(round(sum(so.order_line.mapped('product_uom_qty'))))
+                recu = None
+                if incoming and incoming.state == 'done':
+                    recu = int(round(sum(incoming.move_line_ids.mapped('quantity'))))
+                ecart = (envoye - recu) if recu is not None else None
+                anomalie = bool(ecart)
+
+                valeur_ttc = 0.0
+                for line in so.order_line:
+                    tmpl = line.product_id.product_tmpl_id
+                    ratio = self._solde_tax_ratio(tmpl, so.company_id)
+                    valeur_ttc += line.product_uom_qty * (line.product_id.lst_price or 0.0) * ratio
+
+                out.append({
+                    'id': 'reassort-%d' % so.id,
+                    'name': so.name,
+                    'trajet': '%s → %s' % (so.company_id.name, dest_label),
+                    'source_magasin': so.company_id.name,
+                    # DEMANDE UTILISATRICE (2026-10-20) : « vérifie qu'il n'y
+                    # a pas d'autres anomalies ailleurs » — le filtre « Tous
+                    # les magasins » construisait sa liste en découpant
+                    # `trajet` sur les deux jambes, ce qui y mélangeait des
+                    # noms de dépôt/fournisseur. Seule la jambe vente a un
+                    # vrai magasin (la destination) ; ce champ dédié le dit
+                    # explicitement au lieu de deviner depuis `trajet`.
+                    'magasin': dest_label,
+                    # BUG CORRIGÉ (2026-10-21, repéré par l'utilisatrice :
+                    # après avoir cliqué Annuler, le bon restait affiché
+                    # « en attente de réception » avec le lien Annuler
+                    # toujours cliquable) : un so.state == 'cancel' a
+                    # forcément recu = None (sa réception a elle aussi été
+                    # annulée par api_suivi_reassort_cancel), donc tombait
+                    # dans le même cas que « en attente » sans jamais le
+                    # dire — il faut le vérifier en premier.
+                    # 'submitted' réutilise volontairement le même seuil
+                    # d'alerte « bloqué depuis X jours » déjà câblé côté JS
+                    # pour les transferts (_suiviRowHtml, SUIVI_SEUIL_
+                    # BLOQUE_JOURS) : pas de logique à dupliquer.
+                    'state': ('cancelled' if so.state == 'cancel'
+                               else ('submitted' if recu is None else 'done')),
+                    'state_label': ('Réassort — annulé' if so.state == 'cancel'
+                                     else ('Réassort — en attente de réception magasin'
+                                           if recu is None else 'Réassort — reçu')),
+                    'date': str(so.create_date)[:16] if so.create_date else '—',
+                    'envoye': envoye,
+                    'recu': recu,
+                    'verifiable': bool(incoming),
+                    'ecart': ecart,
+                    'anomalie': anomalie,
+                    'valeur_ttc': round(valeur_ttc, 2),
+                    'picking_id': incoming.id if incoming else False,
+                    'modele': 'sale.order',
+                    'record_id': so.id,
+                    'dashboard_valide': False,
+                    'dashboard_valide_par': None,
+                    'dashboard_valide_date': None,
+                    'dashboard_anomalie_note': None,
+                    'dashboard_anomalie_par': None,
+                    'delai_jours': None,
+                    'stock_verif': None,
+                    'stock_verif_detail': None,
+                })
+
+        # DEMANDE UTILISATRICE (2026-10-19) : « pourquoi dans réassort j'ai
+        # juste de dépôt au magasin et pas de fournisseur au dépôt » — le
+        # réassort a deux jambes (achat fournisseur → dépôt, puis dépôt →
+        # magasin), et seule la seconde était listée ici. La première
+        # (batch.action_generate_purchase_orders(), jamais modifiée) reçoit
+        # toujours automatiquement — vérifié en base, qty_received =
+        # commandé sur tous les bons existants — donc pas de filtre de
+        # société/magasin à lui appliquer (la jambe fournisseur ne concerne
+        # aucun magasin précis).
+        domain_achat = [('name', 'like', 'ACHAT fournisseur — Réassort%'),
+                         ('purchase_order_ids', '!=', False)]
+        if kw.get('date_start'):
+            domain_achat.append(('create_date', '>=', kw['date_start'] + ' 00:00:00'))
+        if kw.get('date_end'):
+            domain_achat.append(('create_date', '<=', kw['date_end'] + ' 23:59:59'))
+        for batch in Batch.search(domain_achat, order='id desc', limit=300):
+            for po in batch.purchase_order_ids:
+                commande = int(round(sum(po.order_line.mapped('product_qty'))))
+                recu_po = int(round(sum(po.order_line.mapped('qty_received'))))
+                incoming_po = po.picking_ids.filtered(
+                    lambda p: p.picking_type_id.code == 'incoming')[:1]
+                recu = recu_po if (po.state in ('purchase', 'done') and recu_po) else (
+                    None if po.state not in ('purchase', 'done') else recu_po)
+                ecart = (commande - recu) if recu is not None else None
+
+                valeur_ttc = 0.0
+                for line in po.order_line:
+                    tmpl = line.product_id.product_tmpl_id
+                    ratio = self._solde_tax_ratio(tmpl, po.company_id)
+                    valeur_ttc += line.product_qty * (line.product_id.lst_price or 0.0) * ratio
+
+                out.append({
+                    'id': 'reassort-achat-%d' % po.id,
+                    'name': po.name,
+                    'trajet': '%s → %s' % (po.partner_id.name, po.company_id.name),
+                    'source_magasin': po.partner_id.name,
+                    # Jambe fournisseur → dépôt : aucun magasin concerné.
+                    'magasin': None,
+                    'state': 'submitted' if recu is None else 'done',
+                    'state_label': ('Réassort — en attente de réception dépôt'
+                                     if recu is None else 'Réassort — reçu du fournisseur'),
+                    'date': str(po.create_date)[:16] if po.create_date else '—',
+                    'envoye': commande,
+                    'recu': recu,
+                    'verifiable': bool(incoming_po),
+                    'ecart': ecart,
+                    'anomalie': bool(ecart),
+                    'valeur_ttc': round(valeur_ttc, 2),
+                    'picking_id': incoming_po.id if incoming_po else False,
+                    'modele': 'purchase.order',
+                    'record_id': po.id,
+                    'dashboard_valide': False,
+                    'dashboard_valide_par': None,
+                    'dashboard_valide_date': None,
+                    'dashboard_anomalie_note': None,
+                    'dashboard_anomalie_par': None,
+                    'delai_jours': None,
+                    'stock_verif': None,
+                    'stock_verif_detail': None,
+                })
+
+        # BUG CORRIGÉ (2026-10-21, repéré par l'utilisatrice : « il était en
+        # dessous, normalement il doit être en haut parce qu'il est
+        # nouveau ») : la jambe vente est ajoutée en entier avant la jambe
+        # achat, donc un achat du jour atterrissait toujours sous TOUS les
+        # envois vente, même vieux de plusieurs semaines. On trie l'ensemble
+        # par date une seule fois à la fin, le plus récent en premier, sans
+        # distinction de jambe — `date` est déjà au format AAAA-MM-JJ HH:MM,
+        # le tri alphabétique suffit.
+        out.sort(key=lambda r: r['date'], reverse=True)
+        return out
+
     @http.route('/mavie/api/suivi-transferts', type='json', auth='user', methods=['POST'], csrf=False)
     def api_suivi_transferts(self, **kw):
         try:
@@ -8350,6 +9464,50 @@ class MaVieDashboardController(http.Controller):
             }
         except Exception as e:
             _logger.error("Erreur api_suivi_transferts: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/suivi-reassort', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_suivi_reassort(self, **kw):
+        try:
+            rows = self._suivi_build_rows_reassort(kw)
+            nb_anomalies = sum(1 for r in rows if r['anomalie'])
+            nb_attente = sum(1 for r in rows if r['recu'] is None)
+            # DEMANDE UTILISATRICE (2026-10-20) : « je dois avoir tout les
+            # magasins aussi ici pas juste carré eden et carrefour targa »
+            # PUIS « mais non dans réassort laisse aussi les dépôts juste
+            # j'ai dit d'ajouter les magasins » PUIS « meme probleme tu as
+            # ajouter que magasin et mood for life je veux dire les
+            # fournisseurs » — même logique pour les fournisseurs : la liste
+            # ne doit pas se limiter à ceux ayant déjà un bon d'achat
+            # aujourd'hui (ex. GIVANA), mais lister tout fournisseur
+            # configuré sur le catalogue (mv.article.base.supplier_id),
+            # même source que Base Pivot. Union de tout : magasins
+            # configurés + fournisseurs configurés + tout ce qui apparaît
+            # déjà dans les trajets affichés (dépôts compris).
+            magasins_config = set(
+                (m.warehouse_id.name if m.warehouse_id else (m.shop_label or m.shop_field))
+                for m in self._get_active_shop_mappings()
+                if (m.warehouse_id and m.warehouse_id.name) or m.shop_label
+            )
+            fournisseurs_config = set(
+                request.env['mv.article.base'].sudo().search([('supplier_id', '!=', False)])
+                .mapped('supplier_id.name')
+            )
+            magasins_lignes = set()
+            for r in rows:
+                for part in (r.get('trajet') or '').split(' → '):
+                    if part:
+                        magasins_lignes.add(part)
+            magasins = sorted(magasins_config | fournisseurs_config | magasins_lignes)
+            return {
+                'rows': rows,
+                'total': len(rows),
+                'nb_anomalies': nb_anomalies,
+                'nb_attente': nb_attente,
+                'magasins': magasins,
+            }
+        except Exception as e:
+            _logger.error("Erreur api_suivi_reassort: %s", e, exc_info=True)
             return {'error': str(e)}
 
     @http.route('/mavie/api/suivi-anomalie-note', type='json', auth='user', methods=['POST'], csrf=False)
@@ -8496,6 +9654,95 @@ class MaVieDashboardController(http.Controller):
             _logger.error("Erreur api_suivi_export: %s", e, exc_info=True)
             return request.make_response("Erreur : %s" % e, [('Content-Type', 'text/plain; charset=utf-8')])
 
+    @http.route('/mavie/api/suivi-reassort/export', type='http', auth='user', methods=['GET'], csrf=False)
+    def api_suivi_reassort_export(self, **kw):
+        """Export Excel de l'onglet Réassort de la page Suivi — même motif
+        que api_suivi_export (filtre actif = un seul onglet filtré, sinon un
+        onglet par catégorie), demandé en même temps que les boutons
+        Exporter/Rafraîchir de cet onglet (2026-10-19)."""
+        try:
+            rows = self._suivi_build_rows_reassort(kw)
+
+            def _categorie(r):
+                if r['recu'] is None:
+                    return 'attente'
+                if r['anomalie']:
+                    return 'anomalies'
+                return 'recu'
+
+            stream, book, fmt = self._xlsx_workbook()
+            columns = ['Bon', 'Trajet', 'État', 'Envoyé', 'Reçu', 'Écart', 'Valeur (TTC)', 'Créé le']
+
+            def _write_sheet(nom, titre, rows_):
+                sheet = book.add_worksheet(nom)
+                sheet.write(0, 0, titre, fmt['title'])
+                sheet.write(1, 0, '%s bon(s)' % len(rows_), fmt['meta'])
+                for col, label in enumerate(columns):
+                    sheet.write(3, col, label, fmt['header'])
+                sheet.set_column(0, 0, 14)
+                sheet.set_column(1, 1, 40)
+                sheet.set_column(2, 2, 32)
+                sheet.set_column(3, 5, 10)
+                sheet.set_column(6, 6, 16)
+                sheet.set_column(7, 7, 16)
+                sheet.freeze_panes(4, 0)
+                for idx, r in enumerate(rows_, start=1):
+                    row = 3 + idx
+                    sheet.write(row, 0, r['name'], fmt['cell'])
+                    sheet.write(row, 1, r['trajet'], fmt['cell'])
+                    sheet.write(row, 2, r['state_label'], fmt['cell'])
+                    sheet.write(row, 3, r['envoye'], fmt['num'])
+                    sheet.write(row, 4, r['recu'] if r['recu'] is not None else '—', fmt['num'])
+                    sheet.write(row, 5, r['ecart'] if r['ecart'] is not None else '—', fmt['num'])
+                    sheet.write(row, 6, r['valeur_ttc'], fmt['money'])
+                    sheet.write(row, 7, r['date'], fmt['cell'])
+                if not rows_:
+                    sheet.write(4, 0, 'Aucun bon dans cette catégorie.', fmt['muted'])
+                return sheet
+
+            filtre = (kw.get('filtre') or 'tous').strip()
+            magasin = (kw.get('magasin') or '').strip()
+            recherche = (kw.get('recherche') or '').strip().lower()
+            CATEGORIE_LABELS = {'attente': 'En attente de réception', 'anomalies': 'Anomalies', 'recu': 'Reçus'}
+            filtre_actif = filtre != 'tous' or magasin or recherche
+
+            if filtre_actif:
+                rows_f = rows
+                if filtre != 'tous':
+                    rows_f = [r for r in rows_f if _categorie(r) == filtre]
+                if magasin:
+                    # DEMANDE UTILISATRICE (2026-10-20) : le filtre doit
+                    # matcher n'importe quel bout du trajet (magasin, dépôt
+                    # ou fournisseur), pas seulement le magasin réel de la
+                    # jambe vente — même logique que le filtre à l'écran.
+                    rows_f = [r for r in rows_f if magasin in r['trajet']]
+                if recherche:
+                    rows_f = [r for r in rows_f if recherche in (r['name'] + ' ' + r['trajet']).lower()]
+                morceaux = []
+                if filtre != 'tous':
+                    morceaux.append(CATEGORIE_LABELS.get(filtre, filtre))
+                if magasin:
+                    morceaux.append(magasin)
+                if recherche:
+                    morceaux.append('« %s »' % recherche)
+                titre = 'Suivi du réassort — ' + ' · '.join(morceaux)
+                _write_sheet('Réassort filtré', titre, rows_f)
+                return self._xlsx_response(stream, book, 'mavie_suivi_reassort_filtre.xlsx')
+
+            par_categorie = {'attente': [], 'anomalies': [], 'recu': []}
+            for r in rows:
+                par_categorie[_categorie(r)].append(r)
+
+            _write_sheet('Tous', 'Suivi du réassort — tous (%s bon(s))' % len(rows), rows)
+            _write_sheet('En attente', 'En attente de réception', par_categorie['attente'])
+            _write_sheet('Anomalies', 'Anomalies', par_categorie['anomalies'])
+            _write_sheet('Recus', 'Reçus', par_categorie['recu'])
+
+            return self._xlsx_response(stream, book, 'mavie_suivi_reassort.xlsx')
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_suivi_reassort_export: %s", e, exc_info=True)
+            return request.make_response("Erreur : %s" % e, [('Content-Type', 'text/plain; charset=utf-8')])
+
     @http.route('/mavie/api/suivi-transfert-detail', type='json', auth='user', methods=['POST'], csrf=False)
     def api_suivi_transfert_detail(self, **kw):
         """Détail article par article d'UN bon, pour la ligne dépliée de la
@@ -8610,9 +9857,175 @@ class MaVieDashboardController(http.Controller):
                 'verifiable': verifiable,
                 'picking_done': picking_done,
                 'valeur_ecart_totale': round(valeur_ecart_totale, 2),
+                # Transfert = toujours magasin → magasin (voir
+                # _suivi_build_rows) — explicite ici comme pour les deux
+                # jambes du réassort, pour que le libellé par défaut côté JS
+                # ne soit plus qu'un filet de sécurité, jamais la source de
+                # vérité.
+                'label_source': 'Stock magasin source',
+                'label_dest': 'Stock magasin destination',
             }
         except Exception as e:  # noqa: BLE001
             _logger.error("Erreur api_suivi_transfert_detail: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    @http.route('/mavie/api/suivi-reassort-detail', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_suivi_reassort_detail(self, **kw):
+        """Détail article par article d'UN bon de réassort, même format que
+        api_suivi_transfert_detail (réutilise le même rendu côté JS) —
+        DEMANDE UTILISATRICE (2026-10-19) : « je dois aussi avoir le détail
+        de chaque réassort comme ce qui est fait dans transferts ».
+
+        Le réassort a deux jambes, deux modèles différents (voir
+        _suivi_build_rows_reassort) : `modele` dit laquelle détailler.
+        """
+        if kw.get('modele') == 'purchase.order':
+            return self._suivi_reassort_detail_achat(kw)
+        try:
+            so = request.env['sale.order'].sudo().browse(int(kw.get('id') or 0))
+            if not so.exists():
+                return {'error': 'Bon de vente introuvable.'}
+
+            po = request.env['purchase.order'].sudo().search(
+                [('auto_sale_order_id', '=', so.id)], limit=1)
+            incoming = po.picking_ids.filtered(
+                lambda p: p.picking_type_id.code == 'incoming')[:1] if po else request.env['stock.picking']
+            picking_done = bool(incoming and incoming.state == 'done')
+            recu_par_produit = {}
+            if picking_done:
+                for ml in incoming.move_line_ids:
+                    recu_par_produit[ml.product_id.id] = recu_par_produit.get(ml.product_id.id, 0) + ml.quantity
+
+            source_location = so.warehouse_id.lot_stock_id if so.warehouse_id else False
+            dest_company = request.env['res.company'].sudo().search(
+                [('partner_id', '=', so.partner_id.id)], limit=1)
+            dest_mapping = None
+            for m in self._get_active_shop_mappings():
+                if m.company_id and dest_company and m.company_id.id == dest_company.id:
+                    dest_mapping = m
+                    break
+            dest_location = dest_mapping.warehouse_id.lot_stock_id if dest_mapping and dest_mapping.warehouse_id else False
+
+            def _stock(product, location):
+                if not location:
+                    return None
+                return int(round(request.env['stock.quant'].sudo()
+                                  ._get_available_quantity(product, location)))
+
+            valeur_ecart_totale = 0.0
+            lignes = []
+            for l in so.order_line:
+                envoye = int(round(l.product_uom_qty))
+                recu = int(round(recu_par_produit.get(l.product_id.id, 0))) if picking_done else None
+                ecart = (envoye - recu) if recu is not None else None
+                ratio = self._solde_tax_ratio(l.product_id.product_tmpl_id, so.company_id)
+                valeur_unitaire = (l.product_id.lst_price or 0.0) * ratio
+                valeur_ecart = round(abs(ecart) * valeur_unitaire, 2) if ecart else 0.0
+                if ecart:
+                    valeur_ecart_totale += valeur_ecart
+                lignes.append({
+                    'reference': (l.product_id.product_tmpl_id.base_pivot_reference
+                                  or l.product_id.default_code
+                                  or l.product_id.display_name or '—'),
+                    'produit': l.product_id.display_name or '',
+                    'envoye': envoye,
+                    'recu': recu,
+                    'ecart': ecart,
+                    'anomalie': bool(ecart),
+                    'stock_source': _stock(l.product_id, source_location),
+                    'stock_dest': _stock(l.product_id, dest_location),
+                    'valeur_unitaire': round(valeur_unitaire, 2),
+                    'valeur_ecart': valeur_ecart,
+                    'pickings': ([{
+                        'id': incoming.id, 'name': incoming.name, 'qty': recu or 0,
+                        'state_label': 'Fait',
+                    }] if picking_done else []),
+                })
+            return {
+                'lignes': lignes,
+                'verifiable': bool(incoming),
+                'picking_done': picking_done,
+                'valeur_ecart_totale': round(valeur_ecart_totale, 2),
+                # DEMANDE UTILISATRICE (2026-10-20) : « ici c'est réassort de
+                # dépôt je dois avoir dépôt pas magasin » — _suiviDetailContentHtml
+                # réutilise le même tableau pour les transferts (magasin→magasin)
+                # ET le réassort (dépôt→magasin ici) : les deux côtés n'ont
+                # jamais le même sens, donc chaque route dit elle-même ce que
+                # chaque colonne représente au lieu d'un libellé figé côté JS.
+                'label_source': 'Stock dépôt source',
+                'label_dest': 'Stock magasin destination',
+            }
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_suivi_reassort_detail: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    def _suivi_reassort_detail_achat(self, kw):
+        """Détail article par article de la jambe fournisseur → dépôt du
+        réassort (bon d'achat), même format que la jambe dépôt → magasin
+        ci-dessus — voir api_suivi_reassort_detail."""
+        try:
+            po = request.env['purchase.order'].sudo().browse(int(kw.get('id') or 0))
+            if not po.exists():
+                return {'error': 'Bon de commande introuvable.'}
+
+            incoming = po.picking_ids.filtered(lambda p: p.picking_type_id.code == 'incoming')[:1]
+            picking_done = bool(incoming and incoming.state == 'done')
+            recu_par_produit = {}
+            if picking_done:
+                for ml in incoming.move_line_ids:
+                    recu_par_produit[ml.product_id.id] = recu_par_produit.get(ml.product_id.id, 0) + ml.quantity
+            dest_location = incoming.location_dest_id if incoming else False
+
+            def _stock(product, location):
+                if not location:
+                    return None
+                return int(round(request.env['stock.quant'].sudo()
+                                  ._get_available_quantity(product, location)))
+
+            valeur_ecart_totale = 0.0
+            lignes = []
+            for l in po.order_line:
+                envoye = int(round(l.product_qty))
+                recu = int(round(recu_par_produit.get(l.product_id.id, 0))) if picking_done else None
+                ecart = (envoye - recu) if recu is not None else None
+                ratio = self._solde_tax_ratio(l.product_id.product_tmpl_id, po.company_id)
+                valeur_unitaire = (l.product_id.lst_price or 0.0) * ratio
+                valeur_ecart = round(abs(ecart) * valeur_unitaire, 2) if ecart else 0.0
+                if ecart:
+                    valeur_ecart_totale += valeur_ecart
+                lignes.append({
+                    'reference': (l.product_id.product_tmpl_id.base_pivot_reference
+                                  or l.product_id.default_code
+                                  or l.product_id.display_name or '—'),
+                    'produit': l.product_id.display_name or '',
+                    'envoye': envoye,
+                    'recu': recu,
+                    'ecart': ecart,
+                    'anomalie': bool(ecart),
+                    # Pas de stock « côté fournisseur » (hors Odoo) : seul le
+                    # stock dépôt (destination de la réception) a un sens ici.
+                    'stock_source': None,
+                    'stock_dest': _stock(l.product_id, dest_location),
+                    'valeur_unitaire': round(valeur_unitaire, 2),
+                    'valeur_ecart': valeur_ecart,
+                    'pickings': ([{
+                        'id': incoming.id, 'name': incoming.name, 'qty': recu or 0,
+                        'state_label': 'Fait',
+                    }] if picking_done else []),
+                })
+            return {
+                'lignes': lignes,
+                'verifiable': bool(incoming),
+                'picking_done': picking_done,
+                'valeur_ecart_totale': round(valeur_ecart_totale, 2),
+                # Jambe fournisseur → dépôt : pas de stock « source » suivi
+                # par Odoo (le fournisseur est hors système), et la
+                # destination est le dépôt — jamais un magasin.
+                'label_source': 'Stock source',
+                'label_dest': 'Stock dépôt destination',
+            }
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur _suivi_reassort_detail_achat: %s", e, exc_info=True)
             return {'error': str(e)}
 
     @http.route('/mavie/api/suivi-valider', type='json', auth='user', methods=['POST'], csrf=False)
@@ -8678,6 +10091,99 @@ class MaVieDashboardController(http.Controller):
             _logger.error("Erreur api_suivi_valider: %s", e, exc_info=True)
             return {'error': str(e)}
 
+    @http.route('/mavie/api/suivi-reassort-cancel', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_suivi_reassort_cancel(self, **kw):
+        """Annule un réassort (jambe vente, dépôt → magasin) pas encore reçu
+        par le magasin — demandé « comme pour les transferts » (2026-10-21).
+
+        Contrairement à un transfert, la sortie du DÉPÔT est déjà validée
+        dès l'envoi (voir _reassort_envoyer_avec_validation_magasin) : il y
+        a donc un vrai mouvement de stock à défaire, pas juste des
+        documents à marquer « annulé ». Séquence validée en test réel
+        (cas S00205, 2026-10-21, doublon d'envoi) :
+          1. annuler la réception magasin (encore en attente, rien à défaire) ;
+          2. RETOURNER la livraison dépôt déjà faite (stock.return.picking),
+             pour que les pièces reviennent vraiment dans le stock du dépôt ;
+          3. annuler le bon d'achat miroir, puis le bon de vente lui-même
+             (so.action_cancel() ouvre un assistant mail — on passe par
+             _action_cancel() directement, qui fait le travail sans lui).
+        """
+        try:
+            so = request.env['sale.order'].sudo().browse(int(kw.get('id') or 0))
+            if not so.exists():
+                return {'error': 'Bon de vente introuvable.'}
+            if so.state == 'cancel':
+                return {'error': 'Ce réassort est déjà annulé.'}
+
+            po = request.env['purchase.order'].sudo().search(
+                [('auto_sale_order_id', '=', so.id)], limit=1)
+            incoming = po.picking_ids.filtered(
+                lambda p: p.picking_type_id.code == 'incoming')[:1] if po else request.env['stock.picking']
+            if incoming and incoming.state == 'done':
+                return {'error': "La marchandise a déjà été reçue par le magasin : "
+                                  "ce réassort ne peut plus être annulé depuis ici."}
+
+            if incoming and incoming.state not in ('cancel',):
+                incoming.action_cancel()
+
+            depot_picking = so.picking_ids.filtered(
+                lambda p: p.picking_type_id.code == 'outgoing' and p.state == 'done')[:1]
+            if depot_picking:
+                return_wiz = request.env['stock.return.picking'].sudo().with_context(
+                    active_id=depot_picking.id, active_model='stock.picking'
+                ).create({})
+                result = return_wiz.create_returns()
+                return_picking = request.env['stock.picking'].sudo().browse(result['res_id'])
+                return_picking.action_confirm()
+                return_picking.action_assign()
+                for move in return_picking.move_ids:
+                    move.quantity = move.product_uom_qty
+                return_picking.with_context(skip_backorder=True).button_validate()
+
+            if po and po.state not in ('done', 'cancel'):
+                po.button_cancel()
+
+            so._action_cancel()
+
+            m_note = re.search(r'Magasin\s*:\s*([^|<]+?)\s*\|', so.note or '')
+            shop_label = m_note.group(1).strip() if m_note else None
+            mapping = (request.env['mv.batch.shop.mapping'].sudo().search(
+                [('shop_label', '=', shop_label)], limit=1)
+                if shop_label else request.env['mv.batch.shop.mapping'])
+            notified = self._notify_reassort_cancelled(mapping, so)
+
+            _vider_cache_dashboard()
+            _logger.info("Réassort %s annulé par %s", so.name, request.env.user.login)
+            return {'ok': True, 'notified': notified}
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Erreur api_suivi_reassort_cancel: %s", e, exc_info=True)
+            request.env.cr.rollback()
+            return {'error': str(e)}
+
+    def _notify_reassort_cancelled(self, mapping, so):
+        """Prévient le responsable du magasin qu'un réassort en route a été
+        annulé — même mécanisme que _notify_transfer_cancelled (boîte Odoo
+        uniquement, jamais d'email)."""
+        if not mapping:
+            return []
+        managers = mapping._get_store_managers()
+        if not managers:
+            return []
+        label = mapping.warehouse_id.name or mapping.shop_label or mapping.shop_field
+        mail_thread = request.env['mail.thread'].sudo().with_context(
+            mavie_notify_inbox_only=True, mail_notify_author=False)
+        mail_thread.message_notify(
+            partner_ids=managers.mapped('partner_id').ids,
+            subject="Réassort %s annulé — %s" % (so.name, label),
+            body=Markup(
+                "<p><strong>Réassort %s</strong> annulé avant réception : "
+                "la marchandise n'a pas bougé côté magasin, le stock du "
+                "dépôt a été remis en l'état. Rien à faire ni à contrôler."
+            ) % escape(so.name),
+            model='sale.order', res_id=so.id,
+        )
+        return managers.mapped('name')
+
     # Condition SQL « vendu sous le prix catalogue » — partagée par la liste
     # et par le comptage, pour que les deux parlent bien de la même chose.
     SOLDE_SQL_WHERE = """
@@ -8706,8 +10212,19 @@ class MaVieDashboardController(http.Controller):
         return {'count': int(n or 0), 'qty': int(qty or 0), 'ca': round(float(ca or 0.0), 2)}
 
     def _solde_posees_rows(self, kw):
-        """Les remises posées, dès leur pose, même sans vente encore."""
+        """Les remises posées, dès leur pose, même sans vente encore.
+
+        DEMANDE UTILISATRICE (2026-10-26) : « je dois avoir une seule ligne
+        avec tout les articles soldés » — une solde posée en lot (Collection/
+        Catégorie/Couleur, voir api_soldes_appliquer_lot) crée une promotion
+        PAR référence (_solde_creer_promotion), donc autant d'entrées dans
+        le journal ; on les regroupe ici en UNE seule ligne cliquable par
+        lot (group_ref), le détail par référence restant disponible via le
+        popup qui rappelle /mavie/api/soldes-journal et filtre sur ce
+        group_ref (voir dashboard.js, _sdOuvrirGroupeDetail).
+        """
         rows = []
+        lots = {}  # group_ref -> ligne agrégée
         for r in self.api_soldes_journal().get('rows') or []:
             pose = (r.get('pose_le') or '').strip()
             jour = pose[:10]
@@ -8717,19 +10234,61 @@ class MaVieDashboardController(http.Controller):
                 continue
             if kw.get('date_end') and jour > kw['date_end']:
                 continue
-            rows.append({
-                'id': r.get('article_id'),
-                'date': pose[:16],
-                'ticket': 'Remise posée',
-                'magasin': r.get('magasin') or '—',
-                'ref': r.get('reference') or '—',
-                'name': r.get('produit') or '—',
-                'qty': 0,
-                'prix_catalogue': round(float(r.get('prix_catalogue') or 0), 2),
-                'prix_paye': round(float(r.get('prix_solde') or 0), 2),
-                'remise_pct': round(float(r.get('remise') or 0), 1),
-                'ca': 0.0,
-            })
+            group_ref = r.get('group_ref')
+            # BUG CORRIGÉ (2026-10-28, repéré par l'utilisatrice : « pourquoi
+            # dans qte est 0 ? ») : la Qté (et le CA) de ces lignes étaient
+            # mis à 0 en dur, alors que api_soldes_journal calcule déjà
+            # combien de pièces se sont vendues DEPUIS la pose de la remise
+            # (vendu_depuis/recette_depuis) — jamais relu ici. 0 n'était donc
+            # pas « rien n'a encore été vendu », mais toujours 0 même après
+            # de vraies ventes à prix soldé.
+            if not group_ref:
+                rows.append({
+                    'id': r.get('article_id'),
+                    'date': pose[:16],
+                    'ticket': 'Remise posée',
+                    'magasin': r.get('magasin') or '—',
+                    'ref': r.get('reference') or '—',
+                    'name': r.get('produit') or '—',
+                    'qty': int(r.get('vendu_depuis') or 0),
+                    'prix_catalogue': round(float(r.get('prix_catalogue') or 0), 2),
+                    'prix_paye': round(float(r.get('prix_solde') or 0), 2),
+                    'remise_pct': round(float(r.get('remise') or 0), 1),
+                    'ca': round(float(r.get('recette_depuis') or 0), 2),
+                })
+                continue
+            lot = lots.get(group_ref)
+            if not lot:
+                lot = lots[group_ref] = {
+                    'id': 'grp:' + group_ref,
+                    'date': pose[:16],
+                    'ticket': 'Remise posée (lot)',
+                    'group_ref': group_ref,
+                    'magasin': '—',
+                    'ref': r.get('group_label') or 'Groupe',
+                    'name': r.get('group_label') or 'Groupe',
+                    'qty': 0,
+                    'prix_catalogue': 0.0,
+                    'prix_paye': 0.0,
+                    'remise_pct': round(float(r.get('remise') or 0), 1),
+                    'ca': 0.0,
+                    'nb_references': 0,
+                    '_refs_vues': set(),
+                }
+            cle_ref = r.get('article_id')
+            if cle_ref not in lot['_refs_vues']:
+                lot['_refs_vues'].add(cle_ref)
+                lot['nb_references'] += 1
+            lot['qty'] += int(r.get('vendu_depuis') or 0)
+            lot['ca'] += float(r.get('recette_depuis') or 0)
+            # La date affichée reste la plus ancienne pose du lot (le
+            # moment où l'action groupée a été lancée).
+            if pose[:16] < lot['date']:
+                lot['date'] = pose[:16]
+        for lot in lots.values():
+            del lot['_refs_vues']
+            lot['ca'] = round(lot['ca'], 2)
+            rows.append(lot)
         return rows
 
     def _solde_history_rows(self, kw, limit=500):
@@ -8792,6 +10351,7 @@ class MaVieDashboardController(http.Controller):
     def api_history(self, **kw):
         try:
             transfers = self._transfer_history_rows(kw)
+            reassort = self._reassort_history_rows_groupees(kw)
             soldes = sorted(self._solde_history_rows(kw) + self._solde_posees_rows(kw),
                             key=lambda x: x['date'], reverse=True)[:500]
             # A11 : les totaux viennent du comptage complet, la liste reste
@@ -8801,6 +10361,9 @@ class MaVieDashboardController(http.Controller):
                 'transfers': transfers,
                 'transfers_count': len(transfers),
                 'transfers_qty': sum(t['qty'] for t in transfers),
+                'reassort': reassort,
+                'reassort_count': len(reassort),
+                'reassort_qty': sum(r['qty'] for r in reassort),
                 'soldes': soldes,
                 'soldes_count': totaux['count'],
                 'soldes_qty': totaux['qty'],
@@ -8810,7 +10373,23 @@ class MaVieDashboardController(http.Controller):
             }
         except Exception as e:
             _logger.error(f"Erreur api_history: {str(e)}", exc_info=True)
-            return {'error': str(e), 'transfers': [], 'soldes': []}
+            return {'error': str(e), 'transfers': [], 'reassort': [], 'soldes': []}
+
+    @http.route('/mavie/api/reassort-groupe-detail', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_reassort_groupe_detail(self, **kw):
+        """Le détail (un bon par référence) d'un réassort posé en lot —
+        DEMANDE UTILISATRICE (2026-10-26), alimente le popup ouvert en
+        cliquant la ligne groupée de l'Historique (voir
+        _reassort_history_rows_groupees)."""
+        try:
+            group_ref = (kw.get('group_ref') or '').strip()
+            if not group_ref:
+                return {'rows': []}
+            rows = [r for r in self._reassort_history_rows(kw) if r.get('group_ref') == group_ref]
+            return {'rows': rows}
+        except Exception as e:
+            _logger.error("Erreur api_reassort_groupe_detail: %s", e, exc_info=True)
+            return {'error': str(e), 'rows': []}
 
     @http.route('/mavie/api/history/export', type='http', auth='user', methods=['GET'], csrf=False)
     def api_history_export(self, **kw):
@@ -8836,6 +10415,20 @@ class MaVieDashboardController(http.Controller):
                         row['prix_paye'], row['ca'],
                     ])
                 filename = 'mavie_historique_soldes.csv'
+            elif kind == 'reassort':
+                writer.writerow(['Historique des réassorts (dépôt → magasin)'])
+                writer.writerow([])
+                writer.writerow(['Bon', 'Date', 'État', 'Opération', 'Société source',
+                                 'Magasin source', 'Société cible', 'Magasin cible',
+                                 'Type', 'Références', 'Qté totale'])
+                for row in self._reassort_history_rows(kw):
+                    writer.writerow([
+                        row['name'], row['date'], row['state_label'], row['picking_name'],
+                        row['source_societe'], row['source_magasin'],
+                        row['dest_societe'], row['dest_magasin'],
+                        'Réassort', row['nb_references'], row['qty'],
+                    ])
+                filename = 'mavie_historique_reassort.csv'
             else:
                 writer.writerow(['Historique des transferts entre magasins'])
                 writer.writerow([])
@@ -8946,6 +10539,18 @@ class MaVieDashboardController(http.Controller):
             except Exception as e:
                 _logger.warning("Historique transferts indisponible pour %s: %s", product_tmpl_id, e)
 
+            # ── Réassort (dépôt → magasins, Base Pivot) ──
+            # BUG CORRIGÉ (2026-10-28, repéré par l'utilisatrice : « il a
+            # pas le reassort ya que solde et transferts ») : cette fiche ne
+            # listait jamais le réassort — _reassort_history_rows existe
+            # déjà pour le Tableau de bord, on la réutilise filtrée sur
+            # cette référence plutôt que de dupliquer la requête.
+            reassort = []
+            try:
+                reassort = self._reassort_history_rows({'article_id': product_tmpl_id}, limit=500)
+            except Exception as e:
+                _logger.warning("Historique réassort indisponible pour %s: %s", product_tmpl_id, e)
+
             # ── Ventes en solde (sous le prix catalogue) ──
             soldes = []
             has_promo_campaign = 'promo_campaign_id' in request.env['pos.order']._fields
@@ -9043,6 +10648,10 @@ class MaVieDashboardController(http.Controller):
                 'transfers_count': len(transfers),
                 'transfers_qty': sum(t['qty'] for t in transfers),
                 'transfers_bons': len({t['transfer_id'] for t in transfers}),
+                'reassort': reassort,
+                'reassort_count': len(reassort),
+                'reassort_qty': sum(r['qty'] for r in reassort),
+                'reassort_bons': len(reassort),
                 'soldes': soldes,
                 'soldes_count': len(soldes),
                 'soldes_qty': sum(s['qty'] for s in soldes),
@@ -9157,6 +10766,29 @@ class MaVieDashboardController(http.Controller):
             return today
         return last
 
+    def _fenetre_vente_bornes(self, kw, warehouse_ids, jours_par_defaut):
+        """(debut, fin) de la fenêtre de vente pour un calcul de
+        proposition (réassort, transferts, soldes).
+
+        DEMANDE UTILISATRICE (2026-10-23) : « il doit aussi être appliqué
+        le filtre même si y'a 90 jours, si je veux faire le filtre de haut
+        il doit aussi être fait » — le filtre Période du haut de page,
+        quand il est explicitement posé, prime désormais sur la fenêtre
+        glissante par défaut (qui ne s'applique que si aucune période
+        n'est choisie, en retombant sur la dernière vente réelle en base,
+        voir _reassort_reference_date)."""
+        if kw.get('date_start') and kw.get('date_end'):
+            try:
+                debut = date.fromisoformat(kw['date_start'])
+                fin = date.fromisoformat(kw['date_end'])
+                if debut <= fin:
+                    return debut, fin
+            except (TypeError, ValueError):
+                pass
+        fin = self._reassort_reference_date(warehouse_ids)
+        debut = fin - timedelta(days=jours_par_defaut)
+        return debut, fin
+
     # ─────────────────────────────────────────────────────────────
     # ACTIONS FAITES SUR UNE RÉFÉRENCE (2026-09-22)
     #
@@ -9225,7 +10857,86 @@ class MaVieDashboardController(http.Controller):
                 for pl in (cfg.available_pricelist_ids | cfg.pricelist_id) & listes:
                     wh_par_liste.setdefault(pl.id, set()).add(wh)
 
-        pids = {r[1] for r in lignes} | set(items.mapped('product_id').ids)
+        # BUG CORRIGÉ (2026-10-28, repéré par l'utilisatrice en retestant un
+        # solde posé en lot : la couleur soldée ne devenait pas rouge dans
+        # « Variantes couleurs ») : cette fonction ne regardait que les
+        # listes de prix (product.pricelist.item) — le même mécanisme
+        # abandonné déjà corrigé dans _solde_history. Les soldes posées
+        # depuis le dashboard sont des promotions loyalty.program ; on les
+        # ajoute ici comme deuxième source, même principe que
+        # api_soldes_journal.
+        Program = request.env['loyalty.program'].sudo()
+        programmes = Program.search([
+            ('program_type', '=', 'promotion'),
+            '|', ('date_to', '=', False), ('date_to', '>=', now),
+            ('rule_ids.product_ids.product_tmpl_id', 'in', tmpl_ids),
+        ])
+        prog_variantes = {}  # prog.id -> variantes (de tmpl_ids) couvertes
+        prog_wh = {}  # prog.id -> {wh_id}
+        for prog in programmes:
+            a_remise = any(r.reward_type == 'discount' and (r.discount or 0) > 0 for r in prog.reward_ids)
+            if not a_remise:
+                continue
+            variantes = prog.rule_ids.mapped('product_ids').filtered(
+                lambda p: p.product_tmpl_id.id in tmpl_ids)
+            if not variantes:
+                continue
+            whs = {w for w in prog.pos_config_ids.mapped('warehouse_id').ids if w}
+            if not whs:
+                continue
+            prog_variantes[prog.id] = variantes
+            prog_wh[prog.id] = whs
+
+        # BUG CORRIGÉ (2026-10-28, même retest : « même chose pour le
+        # réassort ») : le réassort posé depuis le popup Réassort (Base
+        # Pivot, voir _reassort_batch_base_pivot / api_reassort_generer) ne
+        # crée PAS de inter.internal.transfer — seule une ancienne variante
+        # du réassort (origin REASSORT_ORIGINE, ci-dessus) en créait. La
+        # quasi-totalité des réassorts réels passent par Base Pivot
+        # (ventes inter-sociétés, mv.article.batch) et n'allumaient donc
+        # jamais le vert. Même résolution du magasin cible que
+        # _reassort_history_rows.
+        Batch = request.env['mv.article.batch'].sudo()
+        batches = Batch.search([
+            ('name', 'like', 'VENTE inter-sociétés — Réassort%'),
+            ('sale_order_ids.order_line.product_id.product_tmpl_id', 'in', tmpl_ids),
+        ])
+        reassort_bp_lignes = []  # (tid, pid, so_id, wh_id)
+        if batches:
+            mappings_by_company = {}
+            for m in self._get_active_shop_mappings():
+                if m.company_id and m.company_id.id not in mappings_by_company:
+                    mappings_by_company[m.company_id.id] = m
+            mappings_by_shop_label = {
+                m.shop_label: m for m in self._get_active_shop_mappings() if m.shop_label
+            }
+            vus_so = set()
+            for batch in batches:
+                for so in batch.sale_order_ids:
+                    if so.id in vus_so:
+                        continue
+                    vus_so.add(so.id)
+                    lignes_so = so.order_line.filtered(
+                        lambda l: l.product_id.product_tmpl_id.id in tmpl_ids)
+                    if not lignes_so:
+                        continue
+                    dest_company = request.env['res.company'].sudo().search(
+                        [('partner_id', '=', so.partner_id.id)], limit=1)
+                    shop_label_note = None
+                    m_note = re.search(r'Magasin\s*:\s*([^|<]+?)\s*\|', so.note or '')
+                    if m_note:
+                        shop_label_note = m_note.group(1).strip()
+                    mapping = mappings_by_shop_label.get(shop_label_note) if shop_label_note else None
+                    if not mapping:
+                        mapping = mappings_by_company.get(dest_company.id) if dest_company else None
+                    wh = mapping.warehouse_id.id if mapping and mapping.warehouse_id else None
+                    for l in lignes_so:
+                        reassort_bp_lignes.append(
+                            (l.product_id.product_tmpl_id.id, l.product_id.id, so.id, wh))
+
+        pids = ({r[1] for r in lignes} | set(items.mapped('product_id').ids)
+                | {p.id for v in prog_variantes.values() for p in v}
+                | {r[1] for r in reassort_bp_lignes})
         couleurs = {}
         if pids:
             cr.execute("""
@@ -9267,6 +10978,27 @@ class MaVieDashboardController(http.Controller):
                     a['couleur'].setdefault(c, set()).add('solde')
             else:
                 a['couleur'].setdefault('*', set()).add('solde')
+
+        for prog_id, variantes in prog_variantes.items():
+            whs = prog_wh[prog_id]
+            for v in variantes:
+                tid = v.product_tmpl_id.id
+                a = acc(tid)
+                a['solde'] |= whs
+                for wh in whs:
+                    a['wh'].setdefault(wh, set()).add('solde')
+                c = couleurs.get(v.id)
+                if c:
+                    a['couleur'].setdefault(c, set()).add('solde')
+
+        for tid, pid, so_id, wh in reassort_bp_lignes:
+            a = acc(tid)
+            a['reassort'].add(so_id)
+            if wh:
+                a['wh'].setdefault(wh, set()).add('reassort')
+            c = couleurs.get(pid)
+            if c:
+                a['couleur'].setdefault(c, set()).add('reassort')
         return out
 
     def _actions_detail(self, tmpl_id):
@@ -9963,8 +11695,7 @@ class MaVieDashboardController(http.Controller):
             if not warehouses:
                 return {'error': "Aucun magasin actif."}
             wh_ids = warehouses.ids
-            ref_date = self._reassort_reference_date(wh_ids)
-            date_debut = ref_date - timedelta(days=p['fenetre'])
+            date_debut, ref_date = self._fenetre_vente_bornes(kw, wh_ids, p['fenetre'])
 
             # 1. Ce que le dépôt a en stock, variante par variante.
             request.env.cr.execute("""
@@ -10226,8 +11957,7 @@ class MaVieDashboardController(http.Controller):
             p = self._reassort_params(kw)
             warehouses, wh_labels = self._reassort_warehouses(kw)
             mfl = self._societe_depot()
-            ref_date = self._reassort_reference_date(warehouses.ids)
-            debut = ref_date - timedelta(days=p['fenetre'] - 1)
+            debut, ref_date = self._fenetre_vente_bornes(kw, warehouses.ids, p['fenetre'] - 1)
             params = {
                 'vids': variantes.ids,
                 'wh': warehouses.ids or [-1],
@@ -10235,18 +11965,33 @@ class MaVieDashboardController(http.Controller):
                 'fin': datetime.combine(ref_date, datetime.max.time()),
                 'mfl': mfl.id if mfl else -1,
             }
+            # BUG CORRIGÉ (2026-10-26, découvert en creusant pourquoi le
+            # réassort groupé disait « 0/N traitées » alors que la page
+            # Propositions > Réassort trouve bien des besoins réels) :
+            # stock/vendu/reçu étaient sommés sur TOUTES LES VARIANTES
+            # (tailles/couleurs) de la référence AVANT de calculer le
+            # besoin — une taille en rupture totale (ex. stock 0, vendu 7)
+            # se retrouvait noyée dans le total de la référence (ex. stock
+            # 134 toutes tailles confondues), qui ne déclenche alors plus
+            # AUCUN besoin. Vérifié en base sur MRC-3314 : la page
+            # Propositions trouve besoin=3 sur la taille 37 au Carré Eden
+            # (stock 0, vendu 7), alors que ce calcul agrégé disait
+            # besoin=0 pour TOUTE la référence à ce magasin (stock total
+            # 134, vendu total 41). On calcule maintenant le besoin PAR
+            # VARIANTE (GROUP BY magasin, produit), puis on somme les
+            # besoins déjà calculés — pas l'inverse.
             request.env.cr.execute("""
                 WITH stock AS (
-                    SELECT w.id AS wh_id, SUM(sq.quantity) AS q
+                    SELECT w.id AS wh_id, sq.product_id, SUM(sq.quantity) AS q
                       FROM stock_quant sq
                       JOIN stock_location sl ON sl.id = sq.location_id
                       JOIN stock_warehouse w ON w.id = ANY(%(wh)s)
                       JOIN stock_location wl ON wl.id = w.lot_stock_id
                      WHERE sq.product_id = ANY(%(vids)s)
                        AND sl.parent_path LIKE wl.parent_path || '%%'
-                     GROUP BY 1
+                     GROUP BY 1, 2
                 ), vendu AS (
-                    SELECT spt.warehouse_id AS wh_id, SUM(pol.qty) AS q
+                    SELECT spt.warehouse_id AS wh_id, pol.product_id, SUM(pol.qty) AS q
                       FROM pos_order_line pol
                       JOIN pos_order po ON po.id = pol.order_id
                       JOIN pos_session ps ON ps.id = po.session_id
@@ -10255,24 +12000,28 @@ class MaVieDashboardController(http.Controller):
                      WHERE pol.product_id = ANY(%(vids)s)
                        AND po.state IN ('paid', 'done', 'invoiced')
                        AND po.date_order BETWEEN %(debut)s AND %(fin)s
-                     GROUP BY 1
+                     GROUP BY 1, 2
                 ), recu AS (
-                    SELECT spt.warehouse_id AS wh_id, SUM(pol.qty_received) AS q
+                    SELECT spt.warehouse_id AS wh_id, pol.product_id, SUM(pol.qty_received) AS q
                       FROM purchase_order_line pol
                       JOIN purchase_order po ON po.id = pol.order_id
                       JOIN stock_picking_type spt ON spt.id = po.picking_type_id
                      WHERE pol.product_id = ANY(%(vids)s)
                        AND po.state IN ('purchase', 'done')
-                     GROUP BY 1
+                     GROUP BY 1, 2
+                ), paires AS (
+                    SELECT wh_id, product_id FROM stock
+                    UNION SELECT wh_id, product_id FROM vendu
+                    UNION SELECT wh_id, product_id FROM recu
                 )
-                SELECT w.id, COALESCE(s.q, 0), COALESCE(v.q, 0), COALESCE(r.q, 0)
-                  FROM stock_warehouse w
-                  LEFT JOIN stock s ON s.wh_id = w.id
-                  LEFT JOIN vendu v ON v.wh_id = w.id
-                  LEFT JOIN recu r ON r.wh_id = w.id
-                 WHERE w.id = ANY(%(wh)s)
+                SELECT p.wh_id, p.product_id, COALESCE(s.q, 0), COALESCE(v.q, 0), COALESCE(r.q, 0)
+                  FROM paires p
+                  LEFT JOIN stock s ON s.wh_id = p.wh_id AND s.product_id = p.product_id
+                  LEFT JOIN vendu v ON v.wh_id = p.wh_id AND v.product_id = p.product_id
+                  LEFT JOIN recu r ON r.wh_id = p.wh_id AND r.product_id = p.product_id
+                 WHERE p.wh_id = ANY(%(wh)s)
             """, params)
-            lignes_sql = request.env.cr.fetchall()
+            lignes_variantes_sql = request.env.cr.fetchall()
 
             depot = 0
             if mfl:
@@ -10285,29 +12034,42 @@ class MaVieDashboardController(http.Controller):
                 """, params)
                 depot = int(round(request.env.cr.fetchone()[0] or 0))
 
+            # Même base/jours que ci-dessous (sorti de la boucle, identique
+            # pour toutes les variantes d'un même appel).
+            base = kw.get('base')
+            if base == 'plafond':
+                jours = plafond_jours
+            elif base == 'cible':
+                jours = p['cible']
+            else:
+                jours = p['delai']
+
+            # BUG CORRIGÉ (voir commentaire au-dessus de la requête SQL) :
+            # on calcule maintenant le besoin PAR VARIANTE, puis on somme —
+            # une taille en rupture ne doit plus être masquée par le stock
+            # confortable d'une autre taille de la même référence.
+            par_wh = {wh_id: {'stock': 0, 'vendu': 0, 'recu': 0, 'besoin': 0}
+                      for wh_id in (warehouses.ids or [])}
+            for wh_id, _product_id, stock_v, vendu_v, recu_v in lignes_variantes_sql:
+                stock_v = int(round(stock_v or 0))
+                vendu_v = int(round(vendu_v or 0))
+                recu_v = int(round(recu_v or 0))
+                vitesse_v = vendu_v / float(p['fenetre']) if vendu_v else 0.0
+                besoin_v = max(0, int(math.ceil(vitesse_v * jours - max(stock_v, 0) - 1e-9)))
+                agg = par_wh.setdefault(wh_id, {'stock': 0, 'vendu': 0, 'recu': 0, 'besoin': 0})
+                agg['stock'] += stock_v
+                agg['vendu'] += vendu_v
+                agg['recu'] += recu_v
+                agg['besoin'] += besoin_v
+
             shop_par_wh = {m.warehouse_id.id: m for m in self._get_active_shop_mappings() if m.warehouse_id}
             magasins = []
-            for wh_id, stock, vendu, recu in lignes_sql:
+            for wh_id, agg in par_wh.items():
                 m = shop_par_wh.get(wh_id)
-                stock = int(round(stock or 0))
-                vendu = int(round(vendu or 0))
-                recu = int(round(recu or 0))
-                vitesse = vendu / float(p['fenetre']) if vendu else 0.0
-                # Besoin = de quoi tenir le nombre de jours visé au rythme
-                # actuel. Appelée depuis le bloc Réassort (base='cible'), la
-                # fenêtre applique la même couverture que la ligne cliquée ;
-                # depuis la page Action, elle garde le délai de réappro.
-                # Même base et même arrondi que la ligne cliquée, sinon la
-                # fenêtre annonce 2 là où le bloc dit 3, ou 0 là où le bloc
-                # dit 7 : le bloc « À placer » vise le PLAFOND, pas la cible.
-                base = kw.get('base')
-                if base == 'plafond':
-                    jours = plafond_jours
-                elif base == 'cible':
-                    jours = p['cible']
-                else:
-                    jours = p['delai']
-                besoin = max(0, int(math.ceil(vitesse * jours - max(stock, 0) - 1e-9)))
+                stock = agg['stock']
+                vendu = agg['vendu']
+                recu = agg['recu']
+                besoin = agg['besoin']
                 magasins.append({
                     'wh_id': wh_id,
                     'magasin': wh_labels.get(wh_id) or (m.warehouse_id.name if m else '—'),
@@ -10360,6 +12122,11 @@ class MaVieDashboardController(http.Controller):
                 tailles.sort(key=_cle_taille)
 
             fournisseur = self._reassort_fournisseur(tmpl)
+            # DEMANDE UTILISATRICE (2026-10-23) : « je dois avoir toutes les
+            # informations qui vont aider » — prix de vente et photo
+            # manquaient, impossible de chiffrer l'intérêt du réassort sans
+            # rouvrir la fiche produit à côté.
+            src_image_ra = self._image_availability({tmpl.id}).get(tmpl.id)
             return {
                 'taille': taille,
                 'tailles': tailles,
@@ -10370,6 +12137,9 @@ class MaVieDashboardController(http.Controller):
                 'reference': tmpl.base_pivot_reference or tmpl.default_code or tmpl.name,
                 'nom': tmpl.name,
                 'couleur': couleur,
+                'prix_vente_ttc': round(tmpl.list_price or 0.0, 2),
+                'image_url': self._image_url(tmpl.id, src_image_ra),
+                'has_image': bool(src_image_ra),
                 'depot': depot,
                 'fenetre': p['fenetre'],
                 'delai': p['delai'],
@@ -10534,7 +12304,7 @@ class MaVieDashboardController(http.Controller):
         return collection, arrivage
 
     def _reassort_batch_base_pivot(self, tmpl, couleur, quantites_par_shop, suffixe,
-                                   taille=None):
+                                   taille=None, group_ref=None, group_label=None):
         """Crée un batch Base Pivot pour ce réassort.
 
         DEMANDE UTILISATRICE (2026-09-24) : « le réassort doit se faire dans
@@ -10611,13 +12381,19 @@ class MaVieDashboardController(http.Controller):
         # invalides » et ne peut pas être validé à la main.
         collection, arrivage = self._reassort_collection_arrivage(tmpl)
 
+        # DEMANDE UTILISATRICE (2026-10-26) : « fais pareil pour réassort »
+        # (même regroupement « une seule ligne » que pour Solder) — repère
+        # de lot embarqué dans le nom du batch, relu par
+        # _reassort_history_rows_groupees pour fusionner tous les batches
+        # du même lot en une seule ligne cliquable dans l'Historique.
+        suffixe_groupe = ' ‹G:%s|%s›' % (group_ref, group_label or '') if group_ref else ''
         vals_batch = {
             # Le type en TÊTE : la colonne « Nom du batch » est étroite dans
             # Base Pivot et coupait la fin du nom, on ne distinguait plus
             # l'achat fournisseur de la vente inter-sociétés (2026-09-24).
-            'name': '%s — Réassort %s%s' % (
+            'name': '%s — Réassort %s%s%s' % (
                 'ACHAT fournisseur' if suffixe == 'achat' else 'VENTE inter-sociétés',
-                ref_txt, (' ' + couleur) if couleur else ''),
+                ref_txt, (' ' + couleur) if couleur else '', suffixe_groupe),
             'date': fields.Date.context_today(request.env.user),
             'reference_ids': [(0, 0, {
                 'reference': ref_txt,
@@ -10814,7 +12590,9 @@ class MaVieDashboardController(http.Controller):
 
             batch = self._reassort_batch_base_pivot(
                 tmpl, couleur, quantites, 'achat' if mode == 'achat' else 'vente',
-                (kw.get('taille') or '').strip())
+                (kw.get('taille') or '').strip(),
+                group_ref=(kw.get('group_ref') or '').strip() or None,
+                group_label=(kw.get('group_label') or '').strip() or None)
 
             if mode == 'achat':
                 retour_bp = batch.action_generate_purchase_orders()
@@ -10838,7 +12616,7 @@ class MaVieDashboardController(http.Controller):
                                      "l'attribut « COULEURS ». Cette référence utilise « %s » : "
                                      "renommez l'attribut dans Odoo, ou lancez la vente depuis "
                                      "l'écran Base Pivot." % couleurs_attr[0]}
-                retour_bp = batch.action_generate_sale_orders()
+                retour_bp = self._reassort_envoyer_avec_validation_magasin(batch)
                 docs = [{'document': so.name, 'id': so.id, 'modele': 'sale.order',
                          'societe': so.company_id.name, 'partenaire': so.partner_id.name,
                          'etat': so.state,
@@ -10869,6 +12647,405 @@ class MaVieDashboardController(http.Controller):
             _logger.error(f"Erreur api_reassort_generer: {str(e)}", exc_info=True)
             request.env.cr.rollback()
             return {'error': str(e)}
+
+    @http.route('/mavie/api/reassort-generer-lot', type='json', auth='user', methods=['POST'], csrf=False)
+    def api_reassort_generer_lot(self, **kw):
+        """Réassortit PLUSIEURS références d'un coup — DEMANDE UTILISATRICE
+        (2026-10-24) : depuis le regroupement en chaîne (Collection/
+        Catégorie/Couleur choisie, pas forcément une Référence précise),
+        elle veut agir sur TOUT le groupe, pas une référence à la fois.
+        Même principe que `/mavie/api/soldes-appliquer-lot`, mais chaque
+        référence garde son propre batch Base Pivot (le modèle ne permet
+        pas de fusionner plusieurs références dans un seul batch) — donc
+        un résultat par ligne, comme pour les soldes en lot.
+
+        `article_ids` = [12, 45, ...] (100 au maximum par appel — à
+        découper côté client au-delà, même limite que les soldes en lot).
+        Paramètres partagés pour TOUT le lot : `mode` ('achat'/'vente'),
+        plus les réglages habituels du popup Réassort (`fenetre`, `cible`,
+        `delai`, `plafond`, `shop_field`/`shop_fields`, dates…).
+
+        Pas de révision manuelle ligne par ligne en mode lot (sinon ce
+        serait une référence à la fois, pas un lot) : la quantité retenue
+        par référence est automatiquement le BESOIN (mode achat — ce qui
+        manque, indépendant du dépôt) ou ce que le DÉPÔT PEUT RÉELLEMENT
+        ENVOYER (mode vente — `propose`) — exactement la même règle de
+        repli que le popup Réassort applique déjà par défaut pour une
+        seule référence (voir `_raGenerer` côté client).
+        """
+        try:
+            try:
+                article_ids = [int(i) for i in (kw.get('article_ids') or [])]
+            except (TypeError, ValueError):
+                return {'error': 'Groupe de références invalide.'}
+            if not article_ids:
+                return {'error': 'Aucune référence sélectionnée.'}
+            if len(article_ids) > 100:
+                return {'error': "Trop de références d'un coup (100 au maximum)."}
+            mode = kw.get('mode')
+            if mode not in ('achat', 'vente'):
+                return {'error': 'Mode inconnu.'}
+            champ = 'besoin' if mode == 'achat' else 'propose'
+
+            # BUG CORRIGÉ (2026-10-26, repéré par l'utilisatrice sur
+            # Transférer, même défaut ici) : la couleur ayant servi à FORMER
+            # le groupe (niveau Couleur du regroupement en chaîne) doit
+            # aussi FILTRER les variantes utilisées pour calculer le besoin
+            # de chaque référence — sinon le stock/les ventes de toutes les
+            # couleurs se mélangent dans le calcul.
+            couleur_groupe = (kw.get('couleur') or '').strip()
+            # DEMANDE UTILISATRICE (2026-10-26) : « fais pareil pour
+            # réassort » — même repère de lot que Solder, pour que
+            # l'Historique fusionne toutes les références en une seule
+            # ligne cliquable (voir _reassort_history_rows_groupees).
+            group_ref = (kw.get('group_ref') or '').strip() or None
+            group_label = (kw.get('group_label') or '').strip() or None
+
+            resultats = []
+            faits = 0
+            for aid in article_ids:
+                tmpl = request.env['product.template'].sudo().browse(aid).exists()
+                nom = (tmpl.base_pivot_reference or tmpl.default_code or tmpl.name) if tmpl else str(aid)
+                if not tmpl:
+                    resultats.append({'article_id': aid, 'reference': str(aid), 'ok': False,
+                                      'message': 'Référence introuvable.'})
+                    continue
+                try:
+                    detail = self._compute_reassort_article(
+                        dict(kw, article_id=aid, couleur=couleur_groupe, taille=''))
+                except Exception as e:  # noqa: BLE001
+                    resultats.append({'article_id': aid, 'reference': nom, 'ok': False, 'message': str(e)})
+                    continue
+                if detail.get('error'):
+                    resultats.append({'article_id': aid, 'reference': nom, 'ok': False,
+                                      'message': detail['error']})
+                    continue
+                lignes = [{'wh_id': m['wh_id'], 'qty': m[champ]}
+                          for m in (detail.get('magasins') or []) if (m.get(champ) or 0) > 0]
+                if not lignes:
+                    resultats.append({'article_id': aid, 'reference': nom, 'ok': False,
+                                      'message': "Rien à commander." if mode == 'achat'
+                                                 else "Le dépôt n'a rien à envoyer."})
+                    continue
+                res = self.api_reassort_generer(article_id=aid, mode=mode, couleur=couleur_groupe, taille='',
+                                                lignes=lignes, group_ref=group_ref, group_label=group_label)
+                if res.get('error'):
+                    resultats.append({'article_id': aid, 'reference': nom, 'ok': False, 'message': res['error']})
+                    continue
+                faits += 1
+                resultats.append({'article_id': aid, 'reference': nom, 'ok': True,
+                                  'batch': res.get('batch'), 'documents': res.get('documents') or []})
+            return {'ok': True, 'faits': faits, 'total': len(article_ids), 'resultats': resultats}
+        except Exception as e:
+            _logger.error("Erreur api_reassort_generer_lot: %s", e, exc_info=True)
+            return {'error': str(e)}
+
+    def _notify_reassort_reception(self, mapping, picking, order_lines):
+        """Notifie le(s) responsable(s) du magasin cible qu'une réception de
+        réassort les attend — même mécanisme que _notify_transfer_responsible
+        (boîte de réception Odoo UNIQUEMENT, jamais d'email), avec un lien
+        direct vers le bon de réception à valider.
+
+        `order_lines` : liste de dicts {product_id, product_name, qty, ...}
+        tels que construits dans _reassort_envoyer_avec_validation_magasin —
+        sert uniquement à lister les pièces dans le corps du message.
+        """
+        if not picking:
+            return
+        managers = mapping._get_store_managers()
+        if not managers:
+            _logger.warning(
+                "Réassort : aucun responsable trouvé pour %s (poste « Manager » avec "
+                "ce magasin dans ses POS autorisés) — notification non envoyée (picking %s).",
+                mapping.shop_label or mapping.shop_field, picking.name)
+            return
+
+        label = mapping.warehouse_id.name or mapping.shop_label or mapping.shop_field
+        items_txt = ''.join(
+            '<li>%s — Qté : %s</li>' % (escape(ld['product_name']), int(ld['qty']))
+            for ld in order_lines
+        )
+        lien_direct = self._absolute_url(
+            '/web#model=stock.picking&id=%s&view_type=form' % picking.id)
+
+        mail_thread = request.env['mail.thread'].sudo().with_context(
+            mavie_notify_inbox_only=True, mail_notify_author=False)
+        body = Markup(
+            "<p><strong>Réassort</strong> : marchandise envoyée depuis le dépôt vers "
+            "<strong>%s</strong>.</p>"
+            '<p><a href="%s" target="_blank">→ Ouvrir et valider la réception (%s)</a></p>'
+            "<p>Marchandise en route : à contrôler à la réception, puis valider dans "
+            "<strong>Inventaire → Réceptions</strong>.</p>"
+            "<ul>%s</ul>"
+        ) % (escape(label), lien_direct, escape(picking.name), items_txt)
+
+        mail_thread.message_notify(
+            partner_ids=managers.mapped('partner_id').ids,
+            subject="Réassort à réceptionner — %s (%s)" % (label, picking.name),
+            body=body,
+            model='stock.picking',
+            res_id=picking.id,
+        )
+        try:
+            picking.with_context(mail_notify_author=False).message_post(
+                body=body, subject="Réassort à réceptionner", subtype_xmlid='mail.mt_note')
+        except Exception as e:  # une note manquante ne doit jamais bloquer
+            _logger.warning("Note sur la réception de réassort impossible : %s", e)
+
+    def _reassort_envoyer_avec_validation_magasin(self, batch):
+        """Génère les ventes inter-sociétés du réassort, EN S'ARRÊTANT à la
+        livraison du dépôt — la réception au magasin reste à valider
+        manuellement dans Odoo, comme pour un transfert normal.
+
+        DEMANDE UTILISATRICE (2026-10-17, relayée par sa responsable) :
+        « normalement il doit être envoyé au magasin, il valide, puis la
+        validation finale est dans Base Pivot ». Ce n'est PAS ce que fait
+        `mv.article.batch.action_generate_sale_orders()` : cette méthode
+        valide AUSSI automatiquement la réception au magasin (ses étapes
+        3 et 4), sans aucune intervention humaine — vérifié en lisant son
+        code. L'autre méthode de Base Pivot qui s'arrête bien après la
+        seule livraison du dépôt (`mv.dispatch.session.action_generate_
+        sale_orders`) est, elle, câblée sur d'anciens noms de magasins
+        (Marina 1, Salam 1, CityMall…) qui n'existent pas sur cette base
+        (Elite ni MaVie) — inutilisable ici.
+
+        Cette méthode reprend donc fidèlement les étapes 1 et 2 de
+        `action_generate_sale_orders()` (même code, mêmes garde-fous,
+        mêmes méthodes privées du batch — _run_preflight,
+        _real_achat_vendu_cumules, _resolve_color_variants,
+        _explode_by_serie) mais s'arrête avant ses étapes 3/4 : le bon
+        d'achat miroir (créé par le module sale_purchase_inter_company_
+        rules dès la confirmation du bon de vente) et sa réception restent
+        intacts, SANS qu'aucune réception ne soit validée ici — c'est au
+        responsable du magasin de le faire lui-même dans Odoo.
+        """
+        batch.ensure_one()
+        if batch.intercompany_sales_generated:
+            raise UserError(
+                "Les ventes inter-sociétés ont déjà été générées pour ce batch.\n"
+                "Régénération impossible afin d'éviter les doublons.\n\n"
+                "Batch : %s" % batch.name)
+
+        batch._run_preflight("vente")
+
+        modforlife = batch._get_modforlife_company()
+        modforlife_warehouse = request.env['stock.warehouse'].sudo().search(
+            [('company_id', '=', modforlife.id)], limit=1)
+        color_attr = request.env['product.attribute'].sudo().search(
+            [('name', '=', 'COULEURS')], limit=1)
+        pointure_attr = request.env['product.attribute'].sudo().search(
+            [('name', '=', 'POINTURES')], limit=1)
+
+        mappings = request.env['mv.batch.shop.mapping'].sudo().search([('active', '=', True)])
+        shop_mapping = {m.shop_id.id: m for m in mappings}
+        if not shop_mapping:
+            raise UserError(
+                "Aucun mapping magasin configuré.\n"
+                "Allez dans Base Pivot → Configuration → Mapping Magasins.")
+
+        eligible = batch.reference_ids.filtered(lambda r: r.product_tmpl_id and r.color_line_ids)
+        if not eligible:
+            return {'type': 'ir.actions.client', 'tag': 'display_notification', 'params': {
+                'message': "Aucune référence avec produit lié et dispatch."}}
+
+        all_variant_ids = set()
+        for rec in eligible:
+            if rec.product_tmpl_id:
+                all_variant_ids.update(rec.product_tmpl_id.product_variant_ids.ids)
+        real_bilan = batch._real_achat_vendu_cumules(list(all_variant_ids))
+        reserved_qty = {}
+        blocked_lines = []
+        sale_plan = {}
+
+        for rec in eligible:
+            tmpl = rec.product_tmpl_id
+            price_unit = rec.purchase_cost_dh_ht or 0.0
+            for color_line in rec.color_line_ids:
+                color_name = (color_line.color or '').strip().upper()
+                if not color_name:
+                    continue
+                color_variants = batch._resolve_color_variants(tmpl, color_line.color, color_attr)
+                if not color_variants:
+                    continue
+                for dispatch in color_line.dispatch_ids:
+                    shop_id = dispatch.shop_id.id
+                    qty = dispatch.qty or 0.0
+                    if qty <= 0:
+                        continue
+                    mapping = shop_mapping.get(shop_id)
+                    if not mapping:
+                        continue
+                    partner = mapping.partner_id or mapping.company_id.partner_id
+                    if not partner:
+                        continue
+                    key = (mapping.company_id.id, partner.id, shop_id)
+                    plan = sale_plan.setdefault(key, {
+                        'mapping': mapping, 'partner': partner, 'lines': [], 'base_recs': set()})
+                    plan['base_recs'].add(rec)
+                    for variant, qty_pieces in batch._explode_by_serie(
+                            rec, color_variants, pointure_attr, qty,
+                            shop_cell=True, dispatch_line=dispatch, color_line=color_line):
+                        if qty_pieces <= 0:
+                            continue
+                        achete, vendu_doc = real_bilan.get(variant.id, (0.0, 0.0))
+                        deja_reserve = reserved_qty.get(variant.id, 0.0)
+                        disponible = achete - vendu_doc - deja_reserve
+                        if qty_pieces > disponible + 1e-6:
+                            blocked_lines.append({
+                                'reference': rec.reference or tmpl.name,
+                                'couleur': color_line.color,
+                                'variant': variant.display_name,
+                                'magasin': mapping.shop_label,
+                                'qty_demandee': qty_pieces,
+                                'disponible': max(disponible, 0.0),
+                            })
+                            continue
+                        reserved_qty[variant.id] = deja_reserve + qty_pieces
+                        plan['lines'].append({
+                            'product_id': variant.id, 'product_name': variant.display_name,
+                            'qty': qty_pieces, 'price_unit': price_unit, 'uom_id': variant.uom_id.id,
+                        })
+
+        if not sale_plan:
+            return {'type': 'ir.actions.client', 'tag': 'display_notification', 'params': {
+                'message': "Aucun dispatch vers des magasins mappés."}}
+
+        created_sos = []
+        for (company_id, partner_id, shop_id), plan_data in sale_plan.items():
+            mapping = plan_data['mapping']
+            order_lines = plan_data['lines']
+            partner = plan_data['partner']
+            base_recs = plan_data['base_recs']
+            if not order_lines:
+                continue
+
+            shipping_partner = mapping.company_id.partner_id or partner
+            so_vals = {
+                'partner_id': partner.id,
+                'partner_shipping_id': shipping_partner.id,
+                'company_id': modforlife.id,
+                'origin': '%s — %s' % (batch.name, mapping.shop_label),
+                'note': "Vente inter-sociétés %s → %s\nMagasin : %s | Batch : %s"
+                        " — réception à valider au magasin." % (
+                            modforlife.name, mapping.company_id.name,
+                            mapping.shop_label, batch.name),
+                'order_line': [(0, 0, {
+                    'product_id': ld['product_id'],
+                    'name': ld['product_name'],
+                    'product_uom_qty': ld['qty'],
+                    'price_unit': ld['price_unit'],
+                    'product_uom': ld['uom_id'],
+                }) for ld in order_lines],
+            }
+            if modforlife_warehouse:
+                so_vals['warehouse_id'] = modforlife_warehouse.id
+
+            so = request.env['sale.order'].sudo().with_company(modforlife).create(so_vals)
+
+            # Étape 1 : confirmation — génère la livraison sortante du
+            # dépôt et déclenche la création (éventuellement confirmée
+            # selon la configuration du module intercompany) du bon
+            # d'achat miroir dans la société cible.
+            so.action_confirm()
+
+            # Étape 2 : validation de la SEULE livraison sortante du dépôt.
+            # La réception au magasin n'est PAS touchée ici — c'est la
+            # différence avec action_generate_sale_orders() du batch.
+            for picking in so.picking_ids.filtered(lambda p: p.state not in ('done', 'cancel')):
+                for move in picking.move_ids.filtered(lambda m: m.state not in ('done', 'cancel')):
+                    move.quantity = move.product_uom_qty
+                try:
+                    picking.with_context(skip_backorder=True).button_validate()
+                except Exception as e:
+                    _logger.warning("Impossible de valider la livraison %s : %s", picking.name, e)
+
+            created_sos.append(so)
+            for rec in base_recs:
+                rec.write({'sale_order_ids': [(4, so.id)]})
+                if rec.article_state == 'reassort':
+                    rec.with_context(skip_status_check=True).write({'reassort_status': 'sale_linked'})
+
+            intercompany_po = request.env['purchase.order'].sudo().search(
+                [('auto_sale_order_id', '=', so.id)], limit=1)
+            incoming_picking = intercompany_po.picking_ids.filtered(
+                lambda p: p.picking_type_id.code == 'incoming' and p.state not in ('done', 'cancel')
+            )[:1] if intercompany_po else request.env['stock.picking']
+
+            # BUG CORRIGÉ (2026-10-21, repéré par l'utilisatrice : la
+            # notification pointait vers un bon « Erreur d'accès » pour le
+            # responsable) : le module intercompany crée le PO miroir sur
+            # l'entrepôt GÉNÉRIQUE créé automatiquement par Odoo pour la
+            # société (ex. entrepôt « SQUARE TARGA »), pas sur le vrai
+            # entrepôt magasin configuré dans Base Pivot (ex. « Elite
+            # Carrefour Targa ») — ce sont deux entrepôts différents de la
+            # même société, et la règle multi-entrepôt (« Restrict Warehouse
+            # for Users ») ne donne au responsable accès qu'au second.
+            picking_wh = incoming_picking.picking_type_id.warehouse_id if incoming_picking else False
+            if picking_wh and mapping.warehouse_id and picking_wh != mapping.warehouse_id:
+                # BUG CORRIGÉ (2026-10-21, repéré par l'utilisatrice : « je
+                # n'ai pas trouvé cette variante ajoutée dans le magasin » —
+                # le bon se validait « fait » mais la marchandise restait
+                # dans l'entrepôt générique, jamais regardé nulle part
+                # ailleurs dans le dashboard). Changer le TYPE d'opération du
+                # picking est refusé par Odoo passé ce stade (« Changing the
+                # operation type of this record is forbidden at this
+                # point »), mais changer seulement sa DESTINATION
+                # (location_dest_id) ne l'est pas — vérifié en test réel :
+                # la pièce atterrit alors bien dans le stock du vrai
+                # entrepôt magasin. On redirige donc le picking et ses
+                # mouvements vers le véritable emplacement, avant que le
+                # magasin ne valide la réception.
+                vrai_loc = mapping.warehouse_id.lot_stock_id
+                if incoming_picking and vrai_loc and incoming_picking.location_dest_id != vrai_loc:
+                    try:
+                        incoming_picking.write({'location_dest_id': vrai_loc.id})
+                        incoming_picking.move_ids.write({'location_dest_id': vrai_loc.id})
+                        incoming_picking.move_line_ids.write({'location_dest_id': vrai_loc.id})
+                    except Exception as e:  # noqa: BLE001
+                        _logger.warning("Impossible de rediriger la réception %s vers %s : %s",
+                                         incoming_picking.name, vrai_loc.display_name, e)
+                # Filet de sécurité : même si la redirection échoue pour une
+                # raison imprévue, le responsable garde accès à l'entrepôt
+                # générique de sa propre société pour pouvoir quand même
+                # valider la réception.
+                managers = mapping._get_store_managers()
+                a_ajouter = managers - picking_wh.user_ids
+                if a_ajouter:
+                    picking_wh.write({'user_ids': [(4, u.id) for u in a_ajouter]})
+
+            # DEMANDE UTILISATRICE (2026-10-21) : « j'ai fait un réassort...
+            # mais j'ai rien trouvé dans notification pour valider » — la
+            # réception reste bien en attente (voir ci-dessus), mais sans
+            # notification le responsable du magasin n'a aucun moyen de
+            # savoir qu'il y a quelque chose à valider. Même mécanisme que
+            # les transferts normaux (_notify_transfer_responsible),
+            # boîte Odoo uniquement, jamais d'email.
+            self._notify_reassort_reception(mapping, incoming_picking, order_lines)
+
+        if blocked_lines:
+            items = ''.join(
+                '<li>%s — couleur %s — magasin %s : demandé %g, disponible réel %g (bloqué)</li>' % (
+                    b['variant'], b['couleur'] or '—', b['magasin'], b['qty_demandee'], b['disponible'])
+                for b in blocked_lines)
+            batch.message_post(body=(
+                "<p><b>⚠️ Garde-fou achat/vente : %d ligne(s) de dispatch bloquée(s)</b> — "
+                "la quantité demandée dépassait la quantité réellement achetée par %s pour ce "
+                "produit/couleur. Aucune vente inter-sociétés n'a été créée pour ces lignes.</p>"
+                "<ul>%s</ul>") % (len(blocked_lines), modforlife.name, items))
+
+        if not created_sos:
+            message = "Vérifiez les mappings magasins et les quantités dispatch."
+            if blocked_lines:
+                message = ("%d ligne(s) bloquée(s) par le garde-fou achat/vente "
+                           "(quantité dispatchée > quantité réellement achetée).") % len(blocked_lines)
+            return {'type': 'ir.actions.client', 'tag': 'display_notification', 'params': {'message': message}}
+
+        batch.write({
+            'sale_order_ids': [(4, so.id) for so in created_sos],
+            'intercompany_sales_generated': True,
+        })
+        return {'type': 'ir.actions.act_window', 'res_model': 'sale.order',
+                'domain': [('id', 'in', [so.id for so in created_sos])]}
 
     def _reassort_fournisseur(self, tmpl):
         """Fournisseur de la référence : celui de Base Pivot s'il existe,
@@ -10908,8 +13085,7 @@ class MaVieDashboardController(http.Controller):
 
         wh_ids = warehouses.ids
         wh_societes = {w.id: w.company_id.name or '' for w in warehouses}
-        ref_date = self._reassort_reference_date(wh_ids)
-        date_debut = ref_date - timedelta(days=p['fenetre'] - 1)
+        date_debut, ref_date = self._fenetre_vente_bornes(kw, wh_ids, p['fenetre'] - 1)
 
         product_tmpl_ids = None
         if self._filtre_produit_actif(kw):
@@ -11815,8 +13991,7 @@ class MaVieDashboardController(http.Controller):
             wh_ids = warehouses.ids
             if len(wh_ids) < 2:
                 return {'error': "Il faut au moins deux magasins pour transférer."}
-            ref_date = self._reassort_reference_date(wh_ids)
-            debut = ref_date - timedelta(days=p['fenetre'])
+            debut, ref_date = self._fenetre_vente_bornes(kw, wh_ids, p['fenetre'])
 
             filtres = self._mfl_sans_test_sql('pt')
             params = {'wh': wh_ids, 'd1': str(debut) + ' 00:00:00',
@@ -12893,6 +15068,16 @@ class MaVieDashboardController(http.Controller):
                 pieces_vendues += q
                 recette += m
                 fin = fields.Datetime.to_string(e['fin_dt'])[:10] if e['fin_dt'] else ''
+                # DEMANDE UTILISATRICE (2026-10-26) : repère de lot posé par
+                # _solde_creer_promotion (voir suffixe_groupe) — on le
+                # détache du nom affiché (sinon l'utilisatrice verrait le
+                # marqueur technique « ‹G:...› » dans la liste) et on
+                # l'expose à part pour que l'Historique regroupe les lots
+                # (_solde_posees_rows) et que le popup de détail filtre dessus.
+                m_groupe = re.search(r'‹G:([^|›]+)\|([^›]*)›', e['liste'] or '')
+                group_ref = m_groupe.group(1) if m_groupe else None
+                group_label = m_groupe.group(2) if m_groupe else None
+                liste_affichee = re.sub(r'\s*‹G:[^›]*›', '', e['liste'] or '')
                 rows.append({
                     'id': e['source_id'],
                     'pose_le': fields.Datetime.to_string(e['pose_dt'])[:16]
@@ -12911,7 +15096,9 @@ class MaVieDashboardController(http.Controller):
                     'magasins': magasins,
                     'partagee': len(magasins) > 1,
                     'societe': ', '.join(e['societes']),
-                    'liste': e['liste'],
+                    'liste': liste_affichee,
+                    'group_ref': group_ref,
+                    'group_label': group_label,
                     'operation': e.get('operation') or '',
                     'prix_catalogue': e['prix_catalogue'],
                     'prix_solde': e['prix_solde'],
@@ -13163,12 +15350,28 @@ class MaVieDashboardController(http.Controller):
             date_start, date_end = self._solde_dates_operation(
                 (kw.get('date_start') or '').strip(),
                 (kw.get('date_end') or '').strip())
+            # DEMANDE UTILISATRICE (2026-10-26) : « je dois avoir une seule
+            # ligne avec tout les articles soldés » dans l'Historique —
+            # `group_ref` (généré côté client, partagé par tout le lot)
+            # marque chaque promotion créée comme appartenant à CE lot,
+            # pour que l'Historique les regroupe en une seule ligne cliquable
+            # (voir _solde_posees_rows et _solde_creer_promotion).
+            group_ref = (kw.get('group_ref') or '').strip() or None
+            group_label = (kw.get('group_label') or '').strip() or None
 
             resultats = []
             faits = magasins_total = 0
             op = self._solde_operation()
-            op_categories = op.get('categories') or []
-            op_magasins = set(op.get('magasins') or [])
+            # BUG CORRIGÉ (2026-10-26, repéré par l'utilisatrice : un solde
+            # groupé était bloqué par « Hors des catégories de l'opération »
+            # pour UNE opération « Black Friday » dont la date de fin était
+            # pourtant passée depuis 11 jours) : une opération TERMINÉE ne
+            # doit plus restreindre quoi que ce soit — même logique déjà
+            # appliquée ailleurs (voir _solde_dates_operation,
+            # _solde_creer_promotion), qui manquait ici.
+            op_active = bool(op.get('active')) and not op.get('terminee')
+            op_categories = (op.get('categories') or []) if op_active else []
+            op_magasins = set(op.get('magasins') or []) if op_active else set()
             for ligne in lignes:
                 try:
                     aid = int(ligne.get('article_id') or 0)
@@ -13222,6 +15425,7 @@ class MaVieDashboardController(http.Controller):
                     # _solde_creer_promotion).
                     product_tmpl_id=aid, prix_ttc=prix, mode='promotion',
                     date_start=date_start, date_end=date_end,
+                    group_ref=group_ref, group_label=group_label,
                     magasins=[{'shop_field': m['shop_field'],
                                'nom_liste': '' if m.get('liste') else m.get('nom_propose')}
                               for m in cibles])
@@ -13720,8 +15924,7 @@ class MaVieDashboardController(http.Controller):
             if not warehouses:
                 return {'error': "Aucun magasin actif."}
             wh_ids = warehouses.ids
-            ref_date = self._reassort_reference_date(wh_ids)
-            debut = ref_date - timedelta(days=p['fenetre'])
+            debut, ref_date = self._fenetre_vente_bornes(kw, wh_ids, p['fenetre'])
 
             filtres = self._mfl_sans_test_sql('pt')
             params = {'wh': wh_ids, 'd1': str(debut) + ' 00:00:00',
@@ -14130,6 +16333,31 @@ class MaVieDashboardController(http.Controller):
                  'vids': variantes.ids if variantes else []})
             stock_by_wh = {r[0]: max(0, int(round(r[1] or 0))) for r in request.env.cr.fetchall()}
 
+            # DEMANDE UTILISATRICE (2026-10-23) : « je dois avoir toutes les
+            # informations qui vont aider » — la vitesse de vente par
+            # magasin manquait, alors que c'est la raison même de solder
+            # (« ça ne tourne pas »). Fenêtre de 90 jours, même convention
+            # que les autres calculs de vitesse du dashboard.
+            SOLDE_VITESSE_FENETRE_JOURS = 90
+            seuil_vitesse = datetime.now() - timedelta(days=SOLDE_VITESSE_FENETRE_JOURS)
+            request.env.cr.execute("""
+                SELECT spt.warehouse_id, SUM(pol.qty)
+                  FROM pos_order_line pol
+                  JOIN pos_order po ON po.id = pol.order_id
+                  JOIN pos_session ps ON ps.id = po.session_id
+                  JOIN pos_config pc ON pc.id = ps.config_id
+                  JOIN stock_picking_type spt ON spt.id = pc.picking_type_id
+                  JOIN product_product pp ON pp.id = pol.product_id
+                 WHERE pp.product_tmpl_id = %(tmpl)s{V}
+                   AND po.state IN ('paid', 'done', 'invoiced')
+                   AND po.date_order >= %(seuil)s
+                   AND spt.warehouse_id = ANY(%(wh)s)
+                 GROUP BY 1
+            """.replace('{V}', ' AND pp.id = ANY(%(vids)s)' if variantes else ''),
+                {'wh': mappings.mapped('warehouse_id').ids or [-1], 'tmpl': tmpl.id,
+                 'vids': variantes.ids if variantes else [], 'seuil': seuil_vitesse})
+            vendu_by_wh = {r[0]: int(round(r[1] or 0)) for r in request.env.cr.fetchall()}
+
             magasins = []
             ratio_ref = None
             for m in mappings:
@@ -14156,18 +16384,29 @@ class MaVieDashboardController(http.Controller):
                         'date_start': fields.Datetime.to_string(rule.date_start)[:10] if rule.date_start else '',
                         'date_end': fields.Datetime.to_string(rule.date_end)[:10] if rule.date_end else '',
                     }
+                stock_ici = stock_by_wh.get(m.warehouse_id.id, 0)
+                vendu_90j = vendu_by_wh.get(m.warehouse_id.id, 0)
+                vitesse_semaine = round(vendu_90j * 7.0 / SOLDE_VITESSE_FENETRE_JOURS, 1)
                 magasins.append({
                     'shop_field': m.shop_field,
                     'warehouse_id': m.warehouse_id.id,
                     'magasin': m.warehouse_id.name,
                     'libelle': m.shop_label or m.warehouse_id.name,
                     'societe': m.company_id.name,
-                    'stock': stock_by_wh.get(m.warehouse_id.id, 0),
+                    'stock': stock_ici,
                     'caisses': configs.mapped('name'),
                     'liste': {'id': lst.id, 'name': lst.name, 'nb_articles': len(lst.item_ids),
                               'autres_caisses': self._solde_other_configs(lst, configs).mapped('name')} if lst else None,
                     'nom_propose': 'Solde %s' % (m.shop_label or m.warehouse_id.name),
                     'regle': regle,
+                    'vendu_90j': vendu_90j,
+                    'vitesse_semaine': vitesse_semaine,
+                    # Au rythme actuel, combien de jours ce stock va encore
+                    # tenir — None si rien ne s'est vendu (pas de rythme à
+                    # projeter, c'est justement le signal le plus fort pour
+                    # solder).
+                    'couverture_jours': (int(round(stock_ici / (vendu_90j / float(SOLDE_VITESSE_FENETRE_JOURS))))
+                                          if vendu_90j > 0 else None),
                 })
             magasins.sort(key=lambda x: (x['societe'], x['magasin']))
             ratio_ref = ratio_ref or 1.0
@@ -14314,7 +16553,8 @@ class MaVieDashboardController(http.Controller):
             return None
         return round(max(0.0, (1 - prix_ttc / catalogue_ttc)) * 100)
 
-    def _solde_creer_promotion(self, tmpl, variantes, prix_ttc, plan, date_start, date_end, couleur):
+    def _solde_creer_promotion(self, tmpl, variantes, prix_ttc, plan, date_start, date_end, couleur,
+                                group_ref=None, group_label=None):
         """Une promotion par société concernée, limitée aux caisses des
         magasins cochés. Retourne la liste des résultats par magasin."""
         Program = request.env['loyalty.program'].sudo()
@@ -14347,6 +16587,15 @@ class MaVieDashboardController(http.Controller):
         op_nom = (operation.get('nom') or '').strip() if (
             operation.get('active') and not operation.get('terminee')) else ''
         suffixe_operation = ' [%s]' % op_nom if op_nom else ''
+        # DEMANDE UTILISATRICE (2026-10-26) : « je dois avoir une seule
+        # ligne avec tout les articles soldés » — quand ce solde fait partie
+        # d'une action groupée (Collection/Catégorie/Couleur, voir
+        # api_soldes_appliquer_lot), on marque le nom du programme avec le
+        # repère du lot ; l'Historique (_solde_posees_rows) le relit pour
+        # regrouper toutes les promotions du même lot en une seule ligne
+        # cliquable, avec un popup de détail. Délimiteur ‹…› choisi pour ne
+        # jamais être confondu avec le suffixe d'opération entre crochets.
+        suffixe_groupe = ' ‹G:%s|%s›' % (group_ref, group_label or '') if group_ref else ''
         for company, data in par_societe.items():
             ratio = data['ratio']
             catalogue_ht = min(variantes.mapped('lst_price')) if variantes else tmpl.list_price
@@ -14370,8 +16619,9 @@ class MaVieDashboardController(http.Controller):
                 # une référence réappliquée hors opération retrouve un nom
                 # sans crochets, une réappliquée pendant une opération prend
                 # (ou change) son étiquette.
-                nom_sans_operation = re.sub(r'\s*\[[^\]]*\]\s*$', '', programme.name or '').rstrip()
-                vals_programme['name'] = nom_sans_operation + suffixe_operation
+                nom_sans_operation = re.sub(r'\s*‹G:[^›]*›\s*$', '', programme.name or '')
+                nom_sans_operation = re.sub(r'\s*\[[^\]]*\]\s*$', '', nom_sans_operation).rstrip()
+                vals_programme['name'] = nom_sans_operation + suffixe_operation + suffixe_groupe
                 programme.write(vals_programme)
                 if programme.rule_ids:
                     programme.rule_ids[0].write({'product_ids': [(6, 0, variantes.ids)]})
@@ -14391,8 +16641,8 @@ class MaVieDashboardController(http.Controller):
                     reward._compute_description()
             else:
                 vals_programme.update({
-                    'name': '%s %s%s' % (prefixe_nom, (date_start or fields.Date.today().isoformat()),
-                                         suffixe_operation),
+                    'name': '%s %s%s%s' % (prefixe_nom, (date_start or fields.Date.today().isoformat()),
+                                           suffixe_operation, suffixe_groupe),
                     'program_type': 'promotion',
                     'applies_on': 'current',
                     'trigger': 'auto',
@@ -15021,7 +17271,9 @@ class MaVieDashboardController(http.Controller):
             if mode == 'promotion':
                 cibles = cibles_prog
                 resultats, erreur = self._solde_creer_promotion(
-                    tmpl, cibles, prix_ttc, plan, date_start, date_end, couleur)
+                    tmpl, cibles, prix_ttc, plan, date_start, date_end, couleur,
+                    group_ref=(kw.get('group_ref') or '').strip() or None,
+                    group_label=(kw.get('group_label') or '').strip() or None)
                 if erreur:
                     return {'error': erreur}
                 _logger.info("Promotion solde par %s : %s -> %s TTC (%s)",
@@ -15115,71 +17367,40 @@ class MaVieDashboardController(http.Controller):
         onglet ne listait que les VENTES en caisse à prix réduit : une solde
         qui vient d'être lancée, sans vente encore, n'y figurait pas.
 
-        On lit donc les règles des listes de soldes (listes de prix dont le
-        nom contient « solde », actives ou non) portant sur cet article ou
-        sur une de ses variantes — celles créées depuis le dashboard comme
-        celles saisies à la main dans Odoo. Prix affichés TTC, comme le reste
-        du dashboard (les règles sont stockées HT).
+        BUG CORRIGÉ (2026-10-26, repéré par l'utilisatrice : « ya pas dans
+        l'historique de fiche de produit ») : cette fonction ne lisait que
+        les listes de prix (product.pricelist.item), un mécanisme abandonné
+        — les soldes posées depuis le dashboard créent des promotions
+        « Remise & Fidélité » (loyalty.program, voir _solde_creer_promotion),
+        donc plus rien n'apparaissait jamais ici. Le journal du tableau de
+        bord (api_soldes_journal) a déjà la bonne logique, fusionnant les
+        deux mécanismes : on le réutilise et on filtre sur CETTE référence
+        plutôt que de dupliquer la requête.
         """
-        # Depuis que le bouton réutilise la liste déjà rattachée à la caisse
-        # (ex. « REMISE 20% »), une solde peut vivre dans une liste qui ne
-        # s'appelle pas « solde » : on prend aussi toute liste rattachée à
-        # une caisse, hors liste normale par défaut. Seules les règles posées
-        # sur CET article comptent (la remise globale de 20 % n'en est pas).
-        Item = request.env['product.pricelist.item'].sudo().with_context(active_test=False)
-        cfg_lists = request.env['pos.config'].sudo().with_context(active_test=False).search([])
-        cfg_lists = (cfg_lists.mapped('available_pricelist_ids') | cfg_lists.mapped('pricelist_id'))
-        cfg_lists = cfg_lists.filtered(lambda p: not self._solde_is_default_list(p))
-        items = Item.search([
-            '|', ('pricelist_id.name', 'ilike', 'solde'), ('pricelist_id', 'in', cfg_lists.ids),
-            '|',
-            '&', ('applied_on', '=', '1_product'), ('product_tmpl_id', '=', product_tmpl.id),
-            '&', ('applied_on', '=', '0_product_variant'), ('product_id', 'in', variants.ids),
-        ], order='create_date desc, id desc')
-        if not items:
-            return []
-        configs = request.env['pos.config'].sudo().with_context(active_test=False).search([
-            '|', ('available_pricelist_ids', 'in', items.mapped('pricelist_id').ids),
-            ('pricelist_id', 'in', items.mapped('pricelist_id').ids),
-        ])
-        now = fields.Datetime.now()
+        aujourdhui = str(fields.Date.context_today(request.env.user))
+        journal = self.api_soldes_journal()
+        lignes = [r for r in (journal.get('rows') or []) if r.get('article_id') == product_tmpl.id]
         out = []
-        for it in items:
-            pl = it.pricelist_id
-            ratio = self._solde_tax_ratio(product_tmpl, pl.company_id or request.env.company)
-            catalogue_ht = it.product_id.lst_price if it.applied_on == '0_product_variant' else product_tmpl.list_price
-            if it.compute_price == 'fixed':
-                prix_ht = it.fixed_price
-            elif it.compute_price == 'percentage':
-                prix_ht = catalogue_ht * (1 - (it.percent_price or 0.0) / 100.0)
-            else:
-                prix_ht = None
-            if not pl.active:
-                statut = 'inactive'
-            elif it.date_end and it.date_end < now:
+        for r in sorted(lignes, key=lambda r: r.get('pose_le') or '', reverse=True):
+            if r.get('expiree'):
                 statut = 'terminee'
-            elif it.date_start and it.date_start > now:
+            elif r.get('debut') and r['debut'] > aujourdhui:
                 statut = 'a_venir'
             else:
                 statut = 'en_cours'
-            caisses = configs.filtered(lambda c: pl in c.available_pricelist_ids or c.pricelist_id == pl)
-            catalogue_ttc = round(catalogue_ht * ratio, 2)
-            prix_ttc = round(prix_ht * ratio, 2) if prix_ht is not None else None
             out.append({
-                'date': fields.Datetime.to_string(it.create_date)[:16] if it.create_date else '—',
-                'modifiee': (fields.Datetime.to_string(it.write_date)[:16]
-                             if it.write_date and it.create_date and (it.write_date - it.create_date).total_seconds() > 60 else ''),
-                'par': it.create_uid.login or it.create_uid.name or '—',
-                'liste': pl.name,
-                'societe': pl.company_id.name or '',
-                'magasins': caisses.mapped('name'),
-                'variante': it.product_id.display_name if it.applied_on == '0_product_variant' else '',
-                'prix_catalogue': catalogue_ttc,
-                'prix_solde': prix_ttc,
-                'remise_pct': (round((1 - prix_ttc / catalogue_ttc) * 100, 1)
-                               if prix_ttc is not None and catalogue_ttc else None),
-                'debut': fields.Datetime.to_string(it.date_start)[:10] if it.date_start else '',
-                'fin': fields.Datetime.to_string(it.date_end)[:10] if it.date_end else '',
+                'date': r.get('pose_le') or '—',
+                'modifiee': '',
+                'par': r.get('par') or '—',
+                'liste': r.get('liste') or '',
+                'societe': r.get('societe') or '',
+                'magasins': r.get('magasins') or [],
+                'variante': r.get('variante') or '',
+                'prix_catalogue': r.get('prix_catalogue'),
+                'prix_solde': r.get('prix_solde'),
+                'remise_pct': r.get('remise'),
+                'debut': r.get('debut') or '',
+                'fin': r.get('fin') or '',
                 'statut': statut,
             })
         return out

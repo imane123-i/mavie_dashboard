@@ -70,6 +70,61 @@
                     margin-left: auto;
                 }
 
+                .btn-vue-unifiee {
+                    font-family: inherit;
+                    font-size: 0.82rem;
+                    font-weight: 700;
+                    color: #fff;
+                    background: rgba(255,255,255,0.14);
+                    border: 1px solid rgba(255,255,255,0.35);
+                    border-radius: 20px;
+                    padding: 7px 14px;
+                    cursor: pointer;
+                    white-space: nowrap;
+                    transition: background 0.15s ease;
+                }
+                .btn-vue-unifiee:hover { background: rgba(255,255,255,0.24); }
+                .btn-vue-unifiee.on {
+                    background: #fff;
+                    color: var(--brand-dark);
+                    border-color: #fff;
+                }
+
+                .vue-unifiee-section-title {
+                    font-size: 1.05rem;
+                    font-weight: 800;
+                    color: var(--text);
+                    margin: 36px 0 14px;
+                    padding-top: 20px;
+                    border-top: 2px solid var(--border);
+                }
+
+                #vu-nav {
+                    position: sticky;
+                    top: 74px;
+                    z-index: 90;
+                    display: flex;
+                    gap: 8px;
+                    flex-wrap: wrap;
+                    margin-bottom: 18px;
+                    padding: 8px 10px;
+                    background: #fff;
+                    border: 1px solid var(--border);
+                    border-radius: 10px;
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+                }
+                #vu-nav a {
+                    font-size: 0.82rem;
+                    font-weight: 700;
+                    color: var(--brand-dark);
+                    background: #F5F3FF;
+                    border-radius: 16px;
+                    padding: 6px 12px;
+                    text-decoration: none;
+                    cursor: pointer;
+                }
+                #vu-nav a:hover { background: #E9E4FB; }
+
                 .container {
                     max-width: 1440px;
                     margin: 0 auto;
@@ -142,7 +197,15 @@
                 .filter-multi-panel {
                     display: none;
                     position: absolute;
-                    z-index: 60;
+                    /* BUG CORRIGÉ (2026-10-24, repéré par l'utilisatrice :
+                       « y a un décalage ici quand je veux sélectionner
+                       catégories ») : la barre de navigation rapide #vu-nav
+                       (vue unifiée, position:sticky) a un z-index de 90 —
+                       plus haut que celui-ci (60), donc elle passait PAR-
+                       DESSUS ce menu déroulant ouvert au lieu de rester
+                       dessous. Un menu ouvert doit toujours primer sur une
+                       barre collante. */
+                    z-index: 120;
                     top: calc(100% + 4px);
                     left: 0;
                     min-width: 240px;
@@ -503,14 +566,14 @@
                 .abc-b { background: linear-gradient(135deg,#D97706,#F59E0B); }
                 .abc-c { background: linear-gradient(135deg,#DC2626,#EF4444); }
 
-                #sales-daily-chart {
+                #sales-daily-chart, #achats-daily-chart {
                     display: flex;
                     align-items: flex-end;
-                    gap: 6px;
-                    height: 250px;
+                    gap: 10px;
+                    height: 270px;
                     padding: 12px 0 0;
                     overflow-x: auto;
-                    padding-bottom: 40px;
+                    padding-bottom: 60px;
                 }
 
                 .chart-bar-wrapper {
@@ -518,18 +581,31 @@
                     flex-direction: column;
                     align-items: center;
                     flex-shrink: 0;
-                    min-width: 70px;
+                    min-width: 86px;
                 }
 
                 .chart-bar-inner {
                     display: flex;
-                    align-items: flex-end;
-                    justify-content: center;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: flex-end;
                     height: 180px;
                 }
 
+                /* Montant au-dessus de la barre : la valeur se lisait
+                   uniquement au survol (infobulle), invisible d'un coup
+                   d'œil sur un graphique censé comparer plusieurs arrivages
+                   (demande utilisatrice 2026-10-22, « pas bien visible »). */
+                .chart-bar-value {
+                    font-size: 0.72rem;
+                    font-weight: 700;
+                    color: var(--text);
+                    margin-bottom: 4px;
+                    white-space: nowrap;
+                }
+
                 .chart-bar {
-                    width: 28px;
+                    width: 34px;
                     background: linear-gradient(180deg, var(--brand-light) 0%, var(--brand) 100%);
                     border-radius: 4px 4px 0 0;
                     cursor: pointer;
@@ -542,14 +618,15 @@
                 }
 
                 .chart-bar-label {
-                    font-size: 0.6rem;
-                    color: var(--text-muted);
-                    margin-top: 6px;
+                    font-size: 0.72rem;
+                    font-weight: 600;
+                    color: var(--text);
+                    margin-top: 8px;
                     text-align: center;
-                    transform: rotate(-40deg);
+                    transform: rotate(-32deg);
                     transform-origin: top center;
                     white-space: nowrap;
-                    max-width: 80px;
+                    max-width: 130px;
                     overflow: hidden;
                     text-overflow: ellipsis;
                 }
@@ -575,7 +652,7 @@
                 }
 
                 .chart-bar-stack {
-                    width: 28px;
+                    width: 34px;
                     display: flex;
                     flex-direction: column-reverse;
                     border-radius: 4px 4px 0 0;
@@ -720,6 +797,13 @@
                     margin-left: auto;
                 }
                 .btn-transfer-open:hover { background: #E9D5FF; }
+                /* DEMANDE UTILISATRICE (2026-10-22) : un bouton désactivé
+                   gardait exactement la même apparence cliquable (fond
+                   violet plein, curseur pointeur) — rien ne disait qu'il
+                   fallait d'abord sélectionner une référence, d'où
+                   l'impression que le bouton « ne marche pas ». */
+                .btn-transfer-open:disabled { background: #F1F5F9; border-color: #E2E8F0; color: #94A3B8; cursor: not-allowed; }
+                .btn-transfer-open:disabled:hover { background: #F1F5F9; }
 
                 .btn-transfer-row-icon {
                     background: transparent;
@@ -1232,7 +1316,9 @@
                 #ecarts-overlay,
                 #stock-recon-overlay,
                 #ecart-detail-overlay,
-                #couleur-detail-overlay {
+                #couleur-detail-overlay,
+                #solde-groupe-detail-overlay,
+                #reassort-groupe-detail-overlay {
                     position: fixed;
                     inset: 0;
                     background: rgba(15,23,42,0.4);
@@ -1242,6 +1328,19 @@
                     justify-content: center;
                     padding: 16px;
                 }
+
+                /* Barre « Changer de produit » (recherche simple) en haut
+                   des popups Transférer / Solder / Réassort. */
+                .nav-widget { margin-bottom: 14px; }
+                .nav-item { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 8px; padding: 6px 10px; font-size: 0.82rem; cursor: pointer; }
+                .nav-item:hover { border-color: var(--brand); background: rgba(124,58,237,0.06); }
+                .nav-item.active { border-color: var(--brand); background: rgba(124,58,237,0.1); color: var(--brand); font-weight: 700; }
+
+                /* KPI rapides (Qté achetée/vendue, CA) dans le popup
+                   Transférer — mêmes chiffres que la fiche produit. */
+                .tr-kpi { flex: 1; min-width: 130px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface2); padding: 8px 12px; }
+                .tr-kpi-label { display: block; font-size: 0.7rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 2px; }
+                .tr-kpi-value { display: block; font-size: 1.05rem; font-weight: 700; color: var(--text); }
 
                 /* Le détail d'un écart s'ouvre PAR-DESSUS la liste des
                    écarts : z-index supérieur, sinon il passe dessous et
@@ -1257,7 +1356,9 @@
                 #ecarts-overlay.active,
                 #stock-recon-overlay.active,
                 #ecart-detail-overlay.active,
-                #couleur-detail-overlay.active {
+                #couleur-detail-overlay.active,
+                #solde-groupe-detail-overlay.active,
+                #reassort-groupe-detail-overlay.active {
                     display: flex;
                     animation: fadeInOverlay 0.22s ease;
                 }
@@ -2422,14 +2523,22 @@
                 <span style="font-size:1.8rem">📊</span>
                 <h1>Dashboard</h1>
                 <span class="subtitle">Base Pivot — Données réelles</span>
+                <!-- DEMANDE UTILISATRICE (2026-10-23) : bouton de bascule pour la
+                     vue unifiée du Tableau de bord (Stock & ruptures + Propositions
+                     + Dépôt sur un seul écran) — visible seulement sur cette page,
+                     réversible en un clic, rien à perdre. -->
+                <button type="button" id="btn-vue-unifiee" class="btn-vue-unifiee" style="display:none;"
+                        title="Tout voir sur un seul écran (Stock &amp; ruptures, Propositions, Dépôt) — un clic pour revenir à l'affichage classique à tout moment.">
+                    🧩 Vue unifiée
+                </button>
             </header>
 
             <div class="container">
 
                 <div class="filters-bar">
-                    <div class="filter-group" style="min-width:260px;">
+                    <div class="filter-group" style="min-width:340px;">
                         <label>📅 Période</label>
-                        <div style="display:flex; gap:6px;">
+                        <div style="display:flex; gap:6px; flex-wrap:wrap;">
                             <select id="filter-period-type" style="flex:0 0 auto;">
                                 <option value="all">Toutes les dates</option>
                                 <option value="month">Mois</option>
@@ -2437,10 +2546,10 @@
                                 <option value="year">Année</option>
                                 <option value="custom">Personnalisé</option>
                             </select>
-                            <select id="filter-period-month" style="flex:1; min-width:0;"></select>
-                            <select id="filter-period-month-year" style="flex:1; min-width:0;"></select>
-                            <input type="week" id="filter-period-week" style="display:none; flex:1; min-width:0;"/>
-                            <select id="filter-period-year" style="display:none; flex:1; min-width:0;"></select>
+                            <select id="filter-period-month" style="flex:1 1 118px; min-width:100px;"></select>
+                            <select id="filter-period-month-year" style="flex:1 1 90px; min-width:80px;"></select>
+                            <input type="week" id="filter-period-week" style="display:none; flex:1; min-width:120px;"/>
+                            <select id="filter-period-year" style="display:none; flex:1; min-width:90px;"></select>
                         </div>
                         <!-- Le calcul part une fois la saisie terminée : ce mot
                              dit qu'il arrive. -->
@@ -2521,6 +2630,16 @@
                             </div>
                         </div>
                     </div>
+                </div>
+
+                <!-- DEMANDE UTILISATRICE (2026-10-23) : « je veux que tout soit
+                     lié sans que je sorte d'une partie » — petite barre de liens
+                     rapides vers les 3 sections de la vue unifiée, pour s'y
+                     déplacer sans avoir à faire défiler toute la page. -->
+                <div id="vu-nav" style="display:none;">
+                    <a href="javascript:void(0)" id="vu-nav-kpi" data-vu-cible="main-kpi-grid">📊 KPI</a>
+                    <a href="javascript:void(0)" id="vu-nav-stock" data-vu-cible="vu-title-stock">📦 Stock &amp; Ruptures</a>
+                    <a href="javascript:void(0)" data-vu-cible="vu-title-propositions">🏷️ Propositions</a>
                 </div>
 
                 <div class="kpi-grid" id="main-kpi-grid">
@@ -2680,140 +2799,19 @@
                         <div id="mfl-dispatch-tree" class="mfl-tree"></div>
                     </div>
 
-                    <!-- ── Réassort : que doit envoyer le dépôt, et à quel magasin ──
-                         REFONTE (2026-09-19, « je n'aime pas l'ordre et le
-                         design, je veux quelque chose de professionnel ») :
-                         l'ordre suit celui d'un écran de préparation — ce
-                         qu'il faut faire d'abord, les réglages repliés en
-                         dernier. Source des envois = le dépôt
-                         uniquement. Chargé par /mavie/api/reassort. -->
-                    <div class="section-card full-width rx" id="mfl-reassort-section">
-
-                        <div class="rx-head">
-                            <div>
-                                <div class="rx-title">Réassort dépôt → magasins</div>
-                            </div>
-                            <div class="rx-head-actions">
-                                <button type="button" id="btn-ra-settings" class="rx-btn" aria-expanded="false">Réglages</button>
-                                <button type="button" id="btn-ra-export" class="rx-btn rx-btn-primary">Exporter</button>
-                            </div>
-                        </div>
-
-                        <div class="rx-settings" id="ra-settings" style="display:none;">
-                            <label class="rx-field">
-                                <span class="rx-field-label">Fenêtre de vente</span>
-                                <span class="rx-input"><input type="number" id="ra-fenetre" value="90" min="7" max="365"/><em>jours</em></span>
-                                <span class="rx-help">Période utilisée pour mesurer ce que chaque magasin vend.</span>
-                            </label>
-                            <label class="rx-field">
-                                <span class="rx-field-label">Seuil d'alerte</span>
-                                <span class="rx-input"><input type="number" id="ra-seuil" value="10" min="1" max="90"/><em>% du reçu</em></span>
-                                <span class="rx-help">Alerte quand il reste moins que ce pourcentage de ce que le magasin a reçu.</span>
-                            </label>
-                            <label class="rx-field">
-                                <span class="rx-field-label">Délai de réappro</span>
-                                <span class="rx-input"><input type="number" id="ra-delai" value="21" min="1" max="180"/><em>jours</em></span>
-                                <span class="rx-help">Alerte « vend vite » : le stock ne tiendra pas ce délai au rythme actuel.</span>
-                            </label>
-                            <label class="rx-field">
-                                <span class="rx-field-label">Couverture cible</span>
-                                <span class="rx-input"><input type="number" id="ra-cible" value="30" min="1" max="365"/><em>jours</em></span>
-                                <span class="rx-help">Quantité à envoyer = de quoi tenir ce nombre de jours, moins le stock.</span>
-                            </label>
-                            <label class="rx-field">
-                                <span class="rx-field-label">Plafond d’envoi</span>
-                                <span class="rx-input"><input type="number" id="ra-plafond" value="90" min="7" max="365"/><em>jours</em></span>
-                                <span class="rx-help">Bloc ④ : on n’envoie jamais à un magasin plus que ce nombre de jours de vente.</span>
-                            </label>
-                            <div class="rx-settings-foot" style="justify-content:flex-end;">
-                                <button type="button" id="btn-ra-recalc" class="rx-btn rx-btn-primary">Appliquer</button>
-                            </div>
-                        </div>
-
-                        <!-- REFONTE 2 (2026-09-21, choix de l'utilisatrice : « 3 blocs
-                             simples empilés ») : plus d'onglets ni de boutons de vue.
-                             Synthèse, deux filtres, puis trois blocs l'un sous
-                             l'autre, chacun avec son titre et son tableau. -->
-                        <div class="rx-summary rx-summary-3">
-                            <div class="rx-stat rx-stat-main">
-                                <div class="rx-stat-label">À envoyer</div>
-                                <div class="rx-stat-value" id="ra-kpi-pieces">—</div>
-                                <div class="rx-stat-sub">pièces</div>
-                            </div>
-                            <div class="rx-stat">
-                                <div class="rx-stat-label">Manquant au dépôt</div>
-                                <div class="rx-stat-value" id="ra-kpi-vide">—</div>
-                                <div class="rx-stat-sub">articles à acheter</div>
-                            </div>
-                            <!-- DEMANDE UTILISATRICE (2026-09-28) : le calcul
-                                 par ruptures ne mobilisait que 4,7 % du stock du
-                                 dépôt. Cette carte compte ce que le mode
-                                 « sortir le stock » propose de placer. -->
-                            <div class="rx-stat">
-                                <div class="rx-stat-label">À placer</div>
-                                <div class="rx-stat-value" id="ra-kpi-placer">—</div>
-                                <div class="rx-stat-sub">pièces qui dorment au dépôt</div>
-                            </div>
-                        </div>
-
-                        <div class="rx-toolbar">
-                            <div class="rx-toolbar-right" style="margin-left:0;">
-                                <select id="ra-f-magasin" class="rx-select"><option value="">Tous les magasins</option></select>
-                                <input type="search" id="ra-f-search" class="rx-select rx-search" placeholder="Rechercher une référence, une couleur, un magasin…" autocomplete="off"/>
-                            </div>
-                        </div>
-
-                        <!-- ① À envoyer maintenant -->
-                        <!-- Replié par défaut comme les autres (2026-09-28) :
-                             on ouvre le bloc en cliquant sa carte ou son en-tête. -->
-                        <div class="rb" id="ra-bloc-envoyer" data-open="0">
-                            <div class="rb-head">
-                                <span class="rb-num rb-num-green">1</span>
-                                <div class="rb-titles">
-                                    <div class="rb-title">À envoyer maintenant</div>
-                                    <div class="rb-sub">Ce que le dépôt peut envoyer tout de suite, magasin par magasin.</div>
-                                </div>
-                                <div class="rb-count" id="ra-cnt-envoyer">—</div>
-                                <span class="rb-caret">▾</span>
-                            </div>
-                            <div class="rb-body" id="ra-body-envoyer"></div>
-                        </div>
-
-                        <!-- ② Manquant au dépôt -->
-                        <!-- Replié par défaut : ce bloc porte plusieurs milliers
-                             de lignes et écrasait le bloc ①, le seul sur lequel on
-                             agit tout de suite. -->
-                        <div class="rb" id="ra-bloc-vide" data-open="0">
-                            <div class="rb-head">
-                                <span class="rb-num rb-num-red">2</span>
-                                <div class="rb-titles">
-                                    <div class="rb-title">Manquant au dépôt <span class="rb-title-hint">— à acheter</span></div>
-                                    <div class="rb-sub">Le magasin en a besoin et le dépôt ne peut pas le servir : soit il n'a plus l'article, soit ses dernières pièces sont déjà parties à un magasin qui vend plus vite. Ces dernières sont listées en premier.</div>
-                                </div>
-                                <div class="rb-count" id="ra-cnt-vide">—</div>
-                                <span class="rb-caret">▾</span>
-                            </div>
-                            <div class="rb-body" id="ra-body-vide"></div>
-                        </div>
-
-                        <!-- ④ À placer : on part du stock du dépôt, pas des
-                             ruptures. Voir api_reassort_a_placer. -->
-                        <div class="rb" id="ra-bloc-placer" data-open="0">
-                            <div class="rb-head">
-                                <span class="rb-num rb-num-violet">4</span>
-                                <div class="rb-titles">
-                                    <div class="rb-title">À placer <span class="rb-title-hint">— le stock qui dort au dépôt</span></div>
-                                    <div class="rb-sub">Le surplus du dépôt, proposé aux magasins qui vendent bien cette référence et qui sont déjà couverts. Les magasins en rupture ne sont pas ici : ils sont dans « À envoyer maintenant ».</div>
-                                </div>
-                                <div class="rb-count" id="ra-cnt-placer">—</div>
-                                <span class="rb-caret">▾</span>
-                            </div>
-                            <div class="rb-body" id="ra-body-placer"></div>
-                        </div>
-
-                        <div class="rx-foot" id="ra-foot" style="margin-bottom:22px;"></div>
-                    </div>
+                    <!-- DEMANDE UTILISATRICE (2026-10-23) : le bloc Réassort
+                         dépôt → magasins (#mfl-reassort-section) a été déplacé
+                         dans la page Propositions, comme 3e onglet à côté de
+                         Soldes et Transferts (voir onglet-reassort). Il n'y a
+                         plus de double affichage : loadReassort() reste
+                         appelé depuis la vue Dépôt (_renderModForLifeDashboard)
+                         mais remplit maintenant des éléments situés là-bas. -->
                 </div>
+
+                <!-- DEMANDE UTILISATRICE (2026-10-23) : titre de section, visible
+                     seulement dans la vue unifiée du Tableau de bord (sinon la page
+                     Stock &amp; ruptures autonome n'a pas besoin de ce rappel). -->
+                <div class="vue-unifiee-section-title" id="vu-title-stock" style="display:none;">📦 Stock &amp; Ruptures</div>
 
                 <!-- ══════════ KPI GRID FOR STOCK PAGE ══════════ -->
                 <div class="kpi-grid" id="stock-kpi-grid" style="display:none;">
@@ -2925,8 +2923,7 @@
                                 <tr>
                                     <th>#</th>
                                     <th title="Photo du produit. Vide = aucune photo n'est enregistrée dans Odoo pour cette référence.">Photo</th>
-                                    <th>Produit</th>
-                                    <th>Réf</th>
+                                    <th>Référence</th>
                                     <th title="Montant TTC des commandes fournisseur confirmées pour cette référence.">CA Achat (TTC)</th>
                                     <th title="Montant toutes taxes comprises encaissé en caisse pour cette référence.">CA Vendu (TTC)</th>
                                     <th title="Quantité RÉELLEMENT REÇUE par les magasins sur les commandes fournisseur confirmées (qty_received), nette des retours au fournisseur. Une commande confirmée mais jamais réceptionnée ne compte pas.">Qté achetée</th>
@@ -2950,8 +2947,7 @@
                                 <tr>
                                     <th>#</th>
                                     <th title="Photo du produit. Vide = aucune photo n'est enregistrée dans Odoo pour cette référence.">Photo</th>
-                                    <th>Produit</th>
-                                    <th>Réf</th>
+                                    <th>Référence</th>
                                     <th title="Montant TTC des commandes fournisseur confirmées pour cette référence.">CA Achat (TTC)</th>
                                     <th title="Montant toutes taxes comprises encaissé en caisse pour cette référence.">CA Vendu (TTC)</th>
                                     <th title="Quantité RÉELLEMENT REÇUE par les magasins sur les commandes fournisseur confirmées (qty_received), nette des retours au fournisseur. Une commande confirmée mais jamais réceptionnée ne compte pas.">Qté achetée</th>
@@ -3016,17 +3012,53 @@
                     <div id="abc-analysis-content"></div>
                 </div>
 
-                <div class="section-card full-width" id="section-sales-chart">
-                    <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-                        <span>📦 CA par Arrivage / Batch</span>
-                        <div class="chart-mode-toggle">
-                            <button type="button" id="chart-mode-arrivage" class="chart-mode-btn active">Par Arrivage</button>
-                            <button type="button" id="chart-mode-shop" class="chart-mode-btn">Par Magasin</button>
+                <!-- DEMANDE UTILISATRICE (2026-10-24) : « mets-les dans une
+                     seule ligne, un à côté de l'autre » — CA Vente et CA
+                     Achat par Arrivage côte à côte au lieu d'empilés ;
+                     repassent en pile automatiquement sur petit écran
+                     (flex-wrap). -->
+                <!-- DEMANDE UTILISATRICE (2026-10-24) : « change l'ordre, je
+                     dois avoir achat puis vente » — Achat affiché en
+                     premier (à gauche). -->
+                <div class="full-width" style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px;">
+                    <div class="section-card" id="section-achats-chart" style="flex:1 1 420px;min-width:0;">
+                        <!-- BUG CORRIGÉ (2026-10-24, repéré par l'utilisatrice :
+                             « enlève le trait qui est au-dessous de la phrase
+                             de CA achat ») : avec flex-wrap:wrap, l'icône ℹ️
+                             en plus faisait déborder la ligne de titre, et
+                             .title-line (flex:1) se retrouvait rejetée sur
+                             sa propre ligne — d'où ce trait qui traversait
+                             toute la largeur sous le titre. nowrap force
+                             tout à tenir sur une seule ligne, comme pour
+                             Vente. -->
+                        <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:nowrap;gap:8px;">
+                            <span style="white-space:nowrap;">📥 CA Achat par Arrivage / Batch
+                                <span title="Qté achetée / CA Achat ignorent le filtre Période, comme partout ailleurs dans ce dashboard : la marchandise est achetée en une fois puis vendue sur des mois." style="cursor:help;font-size:0.8rem;font-weight:400;color:#94A3B8;">ℹ️</span>
+                            </span>
+                            <div class="chart-mode-toggle" style="flex-shrink:0;">
+                                <button type="button" id="achats-chart-mode-arrivage" class="chart-mode-btn active">Par Arrivage</button>
+                                <button type="button" id="achats-chart-mode-shop" class="chart-mode-btn">Par Magasin</button>
+                            </div>
+                            <span class="title-line"></span>
                         </div>
-                        <span class="title-line"></span>
+                        <div id="achats-daily-chart"></div>
+                        <div id="achats-daily-legend" class="chart-legend" style="display:none;"></div>
+                        <div id="achats-daily-non-rattache" style="display:none; margin-top:10px; font-size:0.78rem; color:#B45309; background:#FFFBEB; border:1px solid #FEF3C7; border-radius:8px; padding:7px 12px;"></div>
                     </div>
-                    <div id="sales-daily-chart"></div>
-                    <div id="sales-daily-legend" class="chart-legend" style="display:none;"></div>
+
+                    <div class="section-card" id="section-sales-chart" style="flex:1 1 420px;min-width:0;">
+                        <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:nowrap;gap:8px;">
+                            <span style="white-space:nowrap;">📦 CA Vente par Arrivage / Batch</span>
+                            <div class="chart-mode-toggle" style="flex-shrink:0;">
+                                <button type="button" id="chart-mode-arrivage" class="chart-mode-btn active">Par Arrivage</button>
+                                <button type="button" id="chart-mode-shop" class="chart-mode-btn">Par Magasin</button>
+                            </div>
+                            <span class="title-line"></span>
+                        </div>
+                        <div id="sales-daily-chart"></div>
+                        <div id="sales-daily-legend" class="chart-legend" style="display:none;"></div>
+                        <div id="sales-daily-non-rattache" style="display:none; margin-top:10px; font-size:0.78rem; color:#B45309; background:#FFFBEB; border:1px solid #FEF3C7; border-radius:8px; padding:7px 12px;"></div>
+                    </div>
                 </div>
 
                 <!-- ══════════ PAGE ACTION (menu Dashboard → Action) ══════════
@@ -3043,14 +3075,33 @@
                 <div class="section-card full-width rx" id="suivi-page" style="display:none;">
                     <div class="rx-head">
                         <div>
-                            <div class="rx-title">Suivi des transferts</div>
+                            <div class="rx-title">Suivi</div>
                             <div class="rx-sub">Ce qui a été envoyé, ce qui a été reçu, bon par bon.</div>
                         </div>
-                        <div style="display:flex;gap:8px;">
+                        <div style="display:flex;gap:8px;" id="su-head-actions">
                             <button type="button" id="btn-suivi-export" class="btn-transfer-open">📊 Exporter Excel</button>
                             <button type="button" id="btn-suivi-refresh" class="btn-transfer-open">↻ Rafraîchir</button>
                         </div>
+                        <div style="display:none;gap:8px;" id="su-reassort-head-actions">
+                            <button type="button" id="btn-suivi-reassort-export" class="btn-transfer-open">📊 Exporter Excel</button>
+                            <button type="button" id="btn-suivi-reassort-refresh" class="btn-transfer-open">↻ Rafraîchir</button>
+                        </div>
                     </div>
+
+                    <!-- DEMANDE UTILISATRICE (2026-10-19) : « séparer deux pages, une
+                         de transferts et une de réassort, comme de solde et
+                         transferts » — même motif d'onglets que la page
+                         Propositions (pr-onglets), les deux circuits de
+                         documents étant trop différents (inter.internal.transfer
+                         vs sale.order) pour rester mélangés dans une seule liste. -->
+                    <div class="pr-onglets" role="tablist">
+                        <button type="button" class="pr-onglet pr-on" id="onglet-btn-su-transferts"
+                                data-onglet="su-transferts" role="tab">🔄 Transferts</button>
+                        <button type="button" class="pr-onglet" id="onglet-btn-su-reassort"
+                                data-onglet="su-reassort" role="tab">📦 Réassort</button>
+                    </div>
+
+                    <div id="onglet-su-transferts">
                     <div id="suivi-resume" class="rx-sub" style="margin:6px 0 10px;"></div>
 
                     <div class="su-toolbar">
@@ -3083,7 +3134,45 @@
                         </thead>
                         <tbody id="suivi-tbody"></tbody>
                     </table>
+                    </div>
+
+                    <div id="onglet-su-reassort" style="display:none;">
+                    <div id="suivi-reassort-resume" class="rx-sub" style="margin:6px 0 10px;"></div>
+
+                    <div class="su-toolbar">
+                        <div class="su-filtres" id="suivi-reassort-filtres">
+                            <button type="button" class="su-filtre-btn active" data-filtre="tous">Tous</button>
+                            <button type="button" class="su-filtre-btn" data-filtre="attente">En attente de réception</button>
+                            <button type="button" class="su-filtre-btn" data-filtre="anomalies">Anomalies</button>
+                            <button type="button" class="su-filtre-btn" data-filtre="recu">Reçus</button>
+                        </div>
+                        <div style="display:flex;gap:8px;">
+                            <select id="suivi-reassort-f-magasin" class="rx-select"><option value="">Tous les magasins</option></select>
+                            <input type="search" id="suivi-reassort-recherche" class="rx-select rx-search" placeholder="Rechercher un bon, un magasin…" autocomplete="off"/>
+                        </div>
+                    </div>
+
+                    <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+                        <thead>
+                            <tr style="background:#F8FAFC;text-align:left;">
+                                <th style="padding:8px;width:20px;"></th>
+                                <th style="padding:8px;">Bon</th>
+                                <th style="padding:8px;">Trajet</th>
+                                <th style="padding:8px;">État</th>
+                                <th style="padding:8px;text-align:center;">Pièces envoyées</th>
+                                <th style="padding:8px;text-align:center;">Pièces reçues</th>
+                                <th style="padding:8px;text-align:center;">Écart</th>
+                                <th style="padding:8px;">Créé le</th>
+                            </tr>
+                        </thead>
+                        <tbody id="suivi-reassort-tbody"></tbody>
+                    </table>
+                    </div>
                 </div>
+
+                <!-- DEMANDE UTILISATRICE (2026-10-23) : titre de section, visible
+                     seulement dans la vue unifiée du Tableau de bord. -->
+                <div class="vue-unifiee-section-title" id="vu-title-propositions" style="display:none;">🏷️ Propositions (Soldes &amp; Transferts)</div>
 
                 <!-- ══════════ PAGE PROPOSITIONS ══════════
                      Ce que le tableau de bord propose de faire : les soldes
@@ -3092,7 +3181,9 @@
                 <div class="section-card full-width rx" id="propositions-page" style="display:none;">
                     <div class="rx-head">
                         <div>
-                            <div class="rx-title">Propositions</div>
+                            <!-- Masqué en vue unifiée : le titre juste au-dessus
+                                 (#vu-title-propositions) fait déjà double emploi. -->
+                            <div class="rx-title" id="propositions-inner-title">Propositions</div>
                         </div>
                         <div class="rx-head-actions" id="sp-head-actions">
                             <button type="button" id="btn-sp-settings" class="rx-btn" aria-expanded="false">Réglages</button>
@@ -3108,6 +3199,10 @@
                                 data-onglet="soldes" role="tab">🏷️ Soldes</button>
                         <button type="button" class="pr-onglet" id="onglet-btn-transferts"
                                 data-onglet="transferts" role="tab">🚚 Transferts</button>
+                        <!-- DEMANDE UTILISATRICE (2026-10-23) : « ajouter ici la
+                             proposition de réassort à côté de ces deux onglets ». -->
+                        <button type="button" class="pr-onglet" id="onglet-btn-reassort"
+                                data-onglet="reassort" role="tab">📦 Réassort</button>
                     </div>
 
                     <div id="onglet-soldes">
@@ -3224,7 +3319,7 @@
                     <div class="sp-calibrage" id="sp-calibrage" style="display:none;"></div>
                     <div class="sp-portee" id="sp-portee" style="display:none;"></div>
 
-                    <div class="rb" id="sp-bloc" data-open="1">
+                    <div class="rb" id="sp-bloc" data-open="0">
                         <div class="rb-head">
                             <span class="rb-num rb-num-red">1</span>
                             <div class="rb-titles">
@@ -3389,6 +3484,132 @@
                     <div class="rx-foot" id="tr-foot" style="margin-bottom:22px;"></div>
                                     </div>
 
+                    <!-- DEMANDE UTILISATRICE (2026-10-23) : « ajouter ici la
+                         proposition de réassort à côté de ces deux onglets » —
+                         3e onglet Propositions, reprenant tel quel le bloc
+                         Réassort dépôt → magasins qui vivait avant dans la vue
+                         Dépôt (#mfl-reassort-section, chargé par
+                         /mavie/api/reassort + /mavie/api/reassort-a-placer,
+                         voir loadReassort()/_raChargerAPlacer() dans
+                         dashboard.js). -->
+                    <div id="onglet-reassort" style="display:none;">
+
+                    <div class="section-card full-width rx" id="mfl-reassort-section">
+
+                        <div class="rx-head">
+                            <div>
+                                <div class="rx-title">Réassort dépôt → magasins</div>
+                            </div>
+                            <div class="rx-head-actions">
+                                <button type="button" id="btn-ra-settings" class="rx-btn" aria-expanded="false">Réglages</button>
+                                <button type="button" id="btn-ra-export" class="rx-btn rx-btn-primary">Exporter</button>
+                            </div>
+                        </div>
+
+                        <div class="rx-settings" id="ra-settings" style="display:none;">
+                            <label class="rx-field">
+                                <span class="rx-field-label">Fenêtre de vente</span>
+                                <span class="rx-input"><input type="number" id="ra-fenetre" value="90" min="7" max="365"/><em>jours</em></span>
+                                <span class="rx-help">Période utilisée pour mesurer ce que chaque magasin vend.</span>
+                            </label>
+                            <label class="rx-field">
+                                <span class="rx-field-label">Seuil d'alerte</span>
+                                <span class="rx-input"><input type="number" id="ra-seuil" value="10" min="1" max="90"/><em>% du reçu</em></span>
+                                <span class="rx-help">Alerte quand il reste moins que ce pourcentage de ce que le magasin a reçu.</span>
+                            </label>
+                            <label class="rx-field">
+                                <span class="rx-field-label">Délai de réappro</span>
+                                <span class="rx-input"><input type="number" id="ra-delai" value="21" min="1" max="180"/><em>jours</em></span>
+                                <span class="rx-help">Alerte « vend vite » : le stock ne tiendra pas ce délai au rythme actuel.</span>
+                            </label>
+                            <label class="rx-field">
+                                <span class="rx-field-label">Couverture cible</span>
+                                <span class="rx-input"><input type="number" id="ra-cible" value="30" min="1" max="365"/><em>jours</em></span>
+                                <span class="rx-help">Quantité à envoyer = de quoi tenir ce nombre de jours, moins le stock.</span>
+                            </label>
+                            <label class="rx-field">
+                                <span class="rx-field-label">Plafond d’envoi</span>
+                                <span class="rx-input"><input type="number" id="ra-plafond" value="90" min="7" max="365"/><em>jours</em></span>
+                                <span class="rx-help">Bloc ④ : on n’envoie jamais à un magasin plus que ce nombre de jours de vente.</span>
+                            </label>
+                            <div class="rx-settings-foot" style="justify-content:flex-end;">
+                                <button type="button" id="btn-ra-recalc" class="rx-btn rx-btn-primary">Appliquer</button>
+                            </div>
+                        </div>
+
+                        <div class="rx-summary rx-summary-3">
+                            <div class="rx-stat rx-stat-main">
+                                <div class="rx-stat-label">À envoyer</div>
+                                <div class="rx-stat-value" id="ra-kpi-pieces">—</div>
+                                <div class="rx-stat-sub">pièces</div>
+                            </div>
+                            <div class="rx-stat">
+                                <div class="rx-stat-label">Manquant au dépôt</div>
+                                <div class="rx-stat-value" id="ra-kpi-vide">—</div>
+                                <div class="rx-stat-sub">articles à acheter</div>
+                            </div>
+                            <div class="rx-stat">
+                                <div class="rx-stat-label">À placer</div>
+                                <div class="rx-stat-value" id="ra-kpi-placer">—</div>
+                                <div class="rx-stat-sub">pièces qui dorment au dépôt</div>
+                            </div>
+                        </div>
+
+                        <div class="rx-toolbar">
+                            <div class="rx-toolbar-right" style="margin-left:0;">
+                                <select id="ra-f-magasin" class="rx-select"><option value="">Tous les magasins</option></select>
+                                <input type="search" id="ra-f-search" class="rx-select rx-search" placeholder="Rechercher une référence, une couleur, un magasin…" autocomplete="off"/>
+                            </div>
+                        </div>
+
+                        <!-- ① À envoyer maintenant -->
+                        <div class="rb" id="ra-bloc-envoyer" data-open="0">
+                            <div class="rb-head">
+                                <span class="rb-num rb-num-green">1</span>
+                                <div class="rb-titles">
+                                    <div class="rb-title">À envoyer maintenant</div>
+                                    <div class="rb-sub">Ce que le dépôt peut envoyer tout de suite, magasin par magasin.</div>
+                                </div>
+                                <div class="rb-count" id="ra-cnt-envoyer">—</div>
+                                <span class="rb-caret">▾</span>
+                            </div>
+                            <div class="rb-body" id="ra-body-envoyer"></div>
+                        </div>
+
+                        <!-- ② Manquant au dépôt -->
+                        <div class="rb" id="ra-bloc-vide" data-open="0">
+                            <div class="rb-head">
+                                <span class="rb-num rb-num-red">2</span>
+                                <div class="rb-titles">
+                                    <div class="rb-title">Manquant au dépôt <span class="rb-title-hint">— à acheter</span></div>
+                                    <div class="rb-sub">Le magasin en a besoin et le dépôt ne peut pas le servir : soit il n'a plus l'article, soit ses dernières pièces sont déjà parties à un magasin qui vend plus vite. Ces dernières sont listées en premier.</div>
+                                </div>
+                                <div class="rb-count" id="ra-cnt-vide">—</div>
+                                <span class="rb-caret">▾</span>
+                            </div>
+                            <div class="rb-body" id="ra-body-vide"></div>
+                        </div>
+
+                        <!-- ④ À placer : on part du stock du dépôt, pas des
+                             ruptures. Voir api_reassort_a_placer. -->
+                        <div class="rb" id="ra-bloc-placer" data-open="0">
+                            <div class="rb-head">
+                                <span class="rb-num rb-num-violet">4</span>
+                                <div class="rb-titles">
+                                    <div class="rb-title">À placer <span class="rb-title-hint">— le stock qui dort au dépôt</span></div>
+                                    <div class="rb-sub">Le surplus du dépôt, proposé aux magasins qui vendent bien cette référence et qui sont déjà couverts. Les magasins en rupture ne sont pas ici : ils sont dans « À envoyer maintenant ».</div>
+                                </div>
+                                <div class="rb-count" id="ra-cnt-placer">—</div>
+                                <span class="rb-caret">▾</span>
+                            </div>
+                            <div class="rb-body" id="ra-body-placer"></div>
+                        </div>
+
+                        <div class="rx-foot" id="ra-foot" style="margin-bottom:22px;"></div>
+                    </div>
+
+                    </div>
+
                 </div>
 
                 <div class="section-card full-width" id="action-page" style="display:none;">
@@ -3451,6 +3672,7 @@
                         </div>
                         <div class="ac-tools">
                             <button type="button" class="ac-btn ac-ordre" id="ac-ordre" title="Cliquer pour inverser"><span style="color:#16A34A;">▲</span> Top → Flop</button>
+                            <button type="button" class="ac-btn" id="btn-ac-export" title="Exporter les références affichées en CSV">⬇ Exporter CSV</button>
                             <label class="ac-limit" title="Société du classement">
                                 Société
                                 <select id="ac-societe" class="ac-select"><option value="">Toutes les sociétés cochées</option></select>
@@ -3495,6 +3717,7 @@
                         </div>
                         <div class="section-actions" style="display:flex; align-items:center; gap:10px; margin-left:auto;">
                             <button type="button" id="history-tab-transferts" class="chart-mode-btn active">🔄 Transferts</button>
+                            <button type="button" id="history-tab-reassort" class="chart-mode-btn">📦 Réassort</button>
                             <button type="button" id="history-tab-soldes" class="chart-mode-btn">🏷️ Soldes</button>
                             <button type="button" id="btn-refresh-history" class="btn-transfer-open" title="Rafraîchir la liste" style="padding:4px 10px;font-size:0.78rem;">↻ Rafraîchir</button>
                             <button id="btn-export-history" class="btn-transfer-open" title="Exporter l'historique affiché en CSV" style="padding:4px 10px;font-size:0.78rem;">📄 CSV</button>
@@ -3542,9 +3765,15 @@
                         <button id="btn-export-detail" class="btn-transfer-open" title="Exporter cette fiche produit en Excel (.xlsx), photo incrustée">📊 Exporter Excel</button>
                         <button id="btn-open-transfer" class="btn-transfer-open" title="Proposer un transfert inter-magasins">🔄 Transférer</button>
                         <button id="btn-open-solde" class="btn-transfer-open" title="Solder cette référence dans un ou plusieurs magasins (liste de soldes du magasin, créée si besoin)">🏷️ Solder</button>
+                        <!-- DEMANDE UTILISATRICE (2026-10-24) : « ajoute aussi
+                             bouton de réassort dans fiche de produit » —
+                             même principe que Transférer/Solder ci-dessus. -->
+                        <button id="btn-open-reassort" class="btn-transfer-open" title="Voir le réassort proposé dépôt → magasins pour cette référence">📦 Réassort</button>
                     </div>
 
                     <div id="detail-batch-info" style="display:none"></div>
+
+                    <div id="dt-chain" class="nav-widget"></div>
 
                     <!-- Filtres du detail (uniquement Magasin, Collection retirée) -->
                     <div class="detail-filters">
@@ -3604,7 +3833,7 @@
                                     <th title="Quantité de cette couleur RÉELLEMENT RÉCEPTIONNÉE sur les commandes fournisseur, nette des retours au fournisseur.">Total pièces</th>
                                     <th title="Prix de vente catalogue TTC de la couleur (fourchette si les tailles n&#39;ont pas toutes le même prix).">Prix de vente</th>
                                     <th>Qté vendue (stock magasin)</th>
-                                    <th title="Stock attendu d'après TOUS les mouvements de stock validés de cette couleur (réceptions, ventes, retours, inventaire, transferts). Doit être égal au stock réel — un ⚠️ signale une quantité écrite sans mouvement.">Stock attendu</th>
+                                    <th title="Reste sur le papier = Total pièces (dispatché) − Qté vendue pour cette couleur. Une valeur négative signale plus de ventes que de pièces dispatchées — à vérifier.">Reste (dispatché − vendu)</th>
                                 </tr>
                             </thead>
                             <tbody id="detail-variants-tbody"></tbody>
@@ -3692,6 +3921,17 @@
                         </div>
                     </div>
 
+                    <div id="sd-nav" class="nav-widget"></div>
+                    <div id="sd-chain" class="nav-widget"></div>
+                    <!-- DEMANDE UTILISATRICE (2026-10-24) : « solder tout ce
+                         qui est en blanc » / « toute la collection ». -->
+                    <div id="sd-chain-group-banner" style="display:none;"></div>
+                    <div id="sd-group-view" style="display:none;"></div>
+
+                    <!-- DEMANDE UTILISATRICE (2026-10-24) : enveloppe à
+                         masquer en mode groupe (sd-group-view prend le
+                         relais) — contenu normal (une référence) inchangé. -->
+                    <div id="sd-single-view">
                     <!-- Un seul pop-up pour tout (demande utilisatrice
                          2026-09-23) : le type choisi affiche ses champs, les
                          autres sont masqués (data-modes). -->
@@ -3785,6 +4025,8 @@
                                     <th style="width:32px;"></th>
                                     <th>Magasin</th>
                                     <th class="num">Stock</th>
+                                    <th class="num" title="Pièces vendues sur les 90 derniers jours, et au même rythme par semaine. C'est la raison même de solder : un stock qui ne tourne pas.">Vitesse de vente</th>
+                                    <th class="num" title="Au rythme actuel, combien de jours ce stock va encore tenir.">Couverture</th>
                                     <th>Liste de soldes du magasin</th>
                                     <th class="num">Solde actuelle</th>
                                 </tr>
@@ -3798,6 +4040,7 @@
                         <button type="button" id="btn-sd-apply" class="rx-btn rx-btn-primary" disabled="disabled">Appliquer la solde</button>
                     </div>
                     <div class="sd-result" id="sd-result" style="display:none;"></div>
+                    </div>
                 </div>
             </div>
 
@@ -3808,12 +4051,44 @@
                 <div class="detail-panel">
                     <button class="close-detail-btn" id="close-transfer-btn" title="Fermer">✕</button>
 
+                    <!-- DEMANDE UTILISATRICE (2026-10-23) : photo + prix de
+                         vente, pour juger l'enjeu d'un transfert sans
+                         rouvrir la fiche produit à côté. -->
                     <div class="detail-header">
+                        <img id="transfer-image" src="" alt="Image produit" style="display:none"/>
+                        <div id="transfer-image-missing" style="display:none; width:96px; height:96px; border-radius:10px; border:1px dashed #CBD5E1; background:#F8FAFC; color:#94A3B8; font-size:0.7rem; font-weight:600; text-align:center; line-height:1.2; align-items:center; justify-content:center; padding:6px;">Aucune photo</div>
                         <div class="detail-title-block">
                             <h2>🔄 Proposer un transfert</h2>
                             <div class="detail-meta">
                                 <span id="transfer-product-name" class="detail-badge">—</span>
+                                <span id="transfer-product-price" class="detail-badge" style="display:none;"></span>
                             </div>
+                        </div>
+                    </div>
+
+                    <div id="tr-nav" class="nav-widget"></div>
+                    <div id="tr-chain" class="nav-widget"></div>
+                    <!-- DEMANDE UTILISATRICE (2026-10-24) : « transférer tout
+                         ce qui est en blanc » / « toute la collection » —
+                         rempli par _trChainGroupBanner() quand une Collection/
+                         Catégorie/Couleur est choisie sans Référence précise. -->
+                    <div id="tr-chain-group-banner" style="display:none;"></div>
+
+                    <!-- DEMANDE UTILISATRICE (2026-10-22) : les mêmes
+                         chiffres que la fiche produit, directement ici,
+                         pour décider sans ouvrir un autre popup. -->
+                    <div id="tr-kpis" style="display:flex; flex-wrap:wrap; gap:10px; margin-bottom:14px;">
+                        <div class="tr-kpi"><span class="tr-kpi-label">📥 Qté achetée</span><span class="tr-kpi-value" id="tr-kpi-qty-purchased">—</span></div>
+                        <div class="tr-kpi"><span class="tr-kpi-label">🧾 CA Achat (TTC)</span><span class="tr-kpi-value" id="tr-kpi-ca-achat">—</span></div>
+                        <div class="tr-kpi"><span class="tr-kpi-label">📤 Qté vendue</span><span class="tr-kpi-value" id="tr-kpi-qty-sold">—</span></div>
+                        <div class="tr-kpi"><span class="tr-kpi-label">💰 CA Vendu (TTC)</span><span class="tr-kpi-value" id="tr-kpi-ca">—</span></div>
+                        <!-- DEMANDE UTILISATRICE (2026-10-23) : vitesse de
+                             vente du magasin CIBLE, pour juger si le stock
+                             envoyé va tenir 3 jours ou 30 — visible
+                             seulement une fois une cible choisie. -->
+                        <div class="tr-kpi" id="tr-kpi-vitesse-cible-card" style="display:none;">
+                            <span class="tr-kpi-label">⏱️ Vitesse du magasin cible</span>
+                            <span class="tr-kpi-value" id="tr-kpi-vitesse-cible">—</span>
                         </div>
                     </div>
 
@@ -3853,15 +4128,16 @@
                     <!-- ══ Répartition et Stock dans Tous les Magasins ══ -->
                     <div class="detail-section" id="transfer-all-stores-section" style="margin-top:20px;">
                         <h3 style="color:#0F172A; font-size:1.05rem; font-weight:700; display:flex; align-items:center; gap:8px; margin-bottom:10px;">
-                            <span>🏪</span> Répartition et stock tous les magasins (Dispatché / Vendu / Stock)
+                            <span>🏪</span> Répartition et stock tous les magasins (Entrées / Vendu / Stock)
                         </h3>
                         <table>
                             <thead>
                                 <tr>
                                     <th>Magasin</th>
                                     <th>Ville</th>
-                                    <th style="text-align:center;">Dispatché</th>
+                                    <th style="text-align:center;" title="Tout ce qui est réellement arrivé dans ce magasin : achats reçus + transferts reçus d'un autre magasin (pas seulement les achats).">Entrées</th>
                                     <th style="text-align:center;">Vendu</th>
+                                    <th style="text-align:center;" title="Pièces vendues en caisse sur les 30 derniers jours">Vendu (30j)</th>
                                     <th style="text-align:center;">Stock dispo</th>
                                     <th style="text-align:center;">Action</th>
                                 </tr>
@@ -3882,6 +4158,10 @@
                         <table>
                             <thead>
                                 <tr>
+                                    <!-- Colonne affichée seulement en mode groupe
+                                         (plusieurs références à la fois) — demande
+                                         utilisatrice 2026-10-24. -->
+                                    <th id="transfer-matrix-th-ref" style="display:none;">Référence</th>
                                     <th>Couleur</th>
                                     <th>Taille</th>
                                     <th>Stock dispo</th>
@@ -3914,6 +4194,8 @@
                             </div>
                         </div>
                     </div>
+
+                    <div id="clr-chain" class="nav-widget"></div>
 
                     <div class="detail-kpi-grid">
                         <div class="detail-kpi-card">
@@ -3985,12 +4267,25 @@
             <div id="ac-reassort-overlay">
                 <div class="ruptures-panel" style="max-width:1000px;">
                     <button class="close-detail-btn" id="close-ac-reassort-btn" title="Fermer">✕</button>
-                    <div style="margin-bottom:14px; padding-right:30px;">
-                        <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700;">
-                            Réassort — <span id="ac-ra-ref">—</span>
-                        </h3>
-                        <div id="ac-ra-sub" style="font-size:0.82rem; color:#64748B; margin-top:4px;"></div>
+                    <!-- DEMANDE UTILISATRICE (2026-10-23) : photo + prix de
+                         vente, pour chiffrer l'intérêt du réassort sans
+                         rouvrir la fiche produit à côté. -->
+                    <div style="margin-bottom:14px; padding-right:30px; display:flex; align-items:center; gap:12px;">
+                        <img id="ac-ra-image" src="" alt="Image produit" style="display:none; width:56px; height:56px; object-fit:cover; border-radius:8px; border:1px solid #E2E8F0;"/>
+                        <div>
+                            <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700;">
+                                Réassort — <span id="ac-ra-ref">—</span>
+                                <span id="ac-ra-prix" style="font-size:0.85rem; font-weight:700; color:#7C3AED; margin-left:8px; display:none;"></span>
+                            </h3>
+                            <div id="ac-ra-sub" style="font-size:0.82rem; color:#64748B; margin-top:4px;"></div>
+                        </div>
                     </div>
+                    <div id="ra-nav" class="nav-widget"></div>
+                    <div id="ra-chain" class="nav-widget"></div>
+                    <!-- DEMANDE UTILISATRICE (2026-10-24) : « réassortir tout
+                         ce qui est en blanc » / « toute la collection ». -->
+                    <div id="ra-chain-group-banner" style="display:none;"></div>
+                    <div id="ra-group-view" style="display:none;"></div>
                     <div id="ac-ra-body"></div>
                 </div>
             </div>
@@ -4194,21 +4489,46 @@
                  DÉTAIL D'UNE COULEUR (clic dans Top/Flop Couleurs)
             ═══════════════════════════════════════════════════════ -->
             <div id="couleur-detail-overlay">
-                <div class="ruptures-panel">
+                <div class="ruptures-panel" style="max-width:1100px;">
                     <button class="close-detail-btn" id="close-couleur-detail-btn" title="Fermer">✕</button>
-                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding-right:30px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; padding-right:30px; flex-wrap:wrap; gap:10px;">
                         <h3 style="margin:0; color:#0F172A; font-size:1.2rem; font-weight:700; display:flex; align-items:center; gap:8px;">
                             <span>🎨</span> Couleur — <span id="couleur-detail-name">—</span>
                         </h3>
+                        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                            <button type="button" id="cd-btn-transfer" class="btn-transfer-open" disabled="disabled" title="Sélectionnez d'abord une référence ci-dessous">🔄 Transférer</button>
+                            <button type="button" id="cd-btn-solde" class="btn-transfer-open" disabled="disabled" title="Sélectionnez d'abord une référence ci-dessous">🏷️ Solder</button>
+                            <button type="button" id="cd-btn-reassort" class="btn-transfer-open" disabled="disabled" title="Sélectionnez d'abord une référence ci-dessous">📦 Réassort</button>
+                        </div>
                     </div>
-                    <div id="couleur-detail-summary" style="font-size:0.85rem; color:#64748B; margin-bottom:12px;"></div>
-                    <div style="max-height:55vh; overflow-y:auto;">
+
+                    <div id="cd-action-hint" style="font-size:0.82rem; color:#B45309; background:#FFFBEB; border:1px solid #FEF3C7; border-radius:8px; padding:7px 12px; margin-bottom:10px;">👉 Cliquez une référence dans la liste ci-dessous pour activer Transférer / Solder / Réassort.</div>
+
+                    <div id="cd-chain" class="nav-widget"></div>
+
+                    <div id="couleur-detail-summary" style="font-size:0.85rem; color:#64748B; margin-bottom:10px;"></div>
+
+                    <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px;">
+                        <input type="text" id="cd-filter-ref" placeholder="🔍 Filtrer par référence…" style="flex:1; min-width:180px; padding:7px 10px; border:1px solid #CBD5E1; border-radius:8px; font-size:0.85rem; outline:none; background:#F8FAFC; color:#0F172A;"/>
+                        <select id="cd-filter-magasin" style="flex:0 0 auto; min-width:200px; padding:7px 10px; border:1px solid #CBD5E1; border-radius:8px; font-size:0.85rem; background:#F8FAFC; color:#0F172A;">
+                            <option value="">Tous les magasins — classement global</option>
+                        </select>
+                    </div>
+
+                    <div id="cd-magasins-section" style="margin-bottom:16px;">
+                        <h4 style="margin:0 0 8px; font-size:0.85rem; font-weight:700; color:#334155;">🏪 Magasins — du plus au moins vendeur de cette couleur</h4>
+                        <div id="cd-magasins-list" style="display:flex; flex-wrap:wrap; gap:6px;"></div>
+                    </div>
+
+                    <div style="max-height:45vh; overflow-y:auto;">
                         <table style="width:100%; border-collapse:collapse;">
                             <thead>
                                 <tr style="border-bottom:2px solid #E2E8F0; text-align:left; background:#F1F5F9; position:sticky; top:0; z-index:10;">
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">#</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Référence</th>
-                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase;">Produit</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Qté achetée</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:center;">Qté vendue</th>
+                                    <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">CA Achat (TTC)</th>
                                     <th style="padding:10px; font-size:0.75rem; font-weight:700; color:#475569; text-transform:uppercase; text-align:right;">CA Vendu (TTC)</th>
                                 </tr>
                             </thead>
@@ -4291,6 +4611,38 @@
             </div>
 
             <!-- ══════════════════════════════════════════════════════
+                 DÉTAIL D'UNE SOLDE POSÉE EN LOT (DEMANDE UTILISATRICE
+                 2026-10-26) : une solde groupée (Collection/Catégorie/
+                 Couleur) tient sur une seule ligne dans l'Historique —
+                 ce popup liste chaque référence du lot en cliquant dessus.
+            ═══════════════════════════════════════════════════════ -->
+            <div id="solde-groupe-detail-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-solde-groupe-detail-btn" title="Fermer">✕</button>
+                    <h3 style="margin:0 30px 4px 0; color:#0F172A; font-size:1.2rem; font-weight:700;">
+                        🏷️ Détail de la solde groupée
+                    </h3>
+                    <div id="solde-groupe-detail-header" style="font-size:0.9rem; color:#334155; margin-bottom:14px;"></div>
+                    <div id="solde-groupe-detail-body" style="max-height:65vh; overflow-y:auto;"></div>
+                </div>
+            </div>
+
+            <!-- ══════════════════════════════════════════════════════
+                 DÉTAIL D'UN RÉASSORT POSÉ EN LOT (DEMANDE UTILISATRICE
+                 2026-10-26, même principe que la solde groupée ci-dessus).
+            ═══════════════════════════════════════════════════════ -->
+            <div id="reassort-groupe-detail-overlay">
+                <div class="ruptures-panel">
+                    <button class="close-detail-btn" id="close-reassort-groupe-detail-btn" title="Fermer">✕</button>
+                    <h3 style="margin:0 30px 4px 0; color:#0F172A; font-size:1.2rem; font-weight:700;">
+                        📦 Détail du réassort groupé
+                    </h3>
+                    <div id="reassort-groupe-detail-header" style="font-size:0.9rem; color:#334155; margin-bottom:14px;"></div>
+                    <div id="reassort-groupe-detail-body" style="max-height:65vh; overflow-y:auto;"></div>
+                </div>
+            </div>
+
+            <!-- ══════════════════════════════════════════════════════
                  HISTORIQUE D'UNE RÉFÉRENCE — transferts & soldes
                  Ouvert par le bouton "Historique" de la fiche produit.
                  Contrairement à la section Historique du tableau de bord,
@@ -4306,6 +4658,7 @@
                         </h3>
                         <div style="display:flex; align-items:center; gap:8px; margin-left:auto;">
                             <button type="button" id="product-history-tab-transferts" class="chart-mode-btn active">🔄 Transferts</button>
+                            <button type="button" id="product-history-tab-reassort" class="chart-mode-btn">📦 Réassort</button>
                             <button type="button" id="product-history-tab-soldes" class="chart-mode-btn">🏷️ Soldes</button>
                         </div>
                     </div>

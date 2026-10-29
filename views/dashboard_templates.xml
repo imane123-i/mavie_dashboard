@@ -2632,14 +2632,38 @@
                     </div>
                 </div>
 
-                <!-- DEMANDE UTILISATRICE (2026-10-23) : « je veux que tout soit
-                     lié sans que je sorte d'une partie » — petite barre de liens
-                     rapides vers les 3 sections de la vue unifiée, pour s'y
-                     déplacer sans avoir à faire défiler toute la page. -->
+                <!-- DEMANDE UTILISATRICE (2026-10-23, étendue le 2026-10-29
+                     : « je veux ajouter plus de top/flop et tout ce qui est
+                     dans cette page pour me scroller vite ») — petite barre
+                     de liens rapides vers toutes les sections de la page
+                     Tableau de bord, pour s'y déplacer sans faire défiler
+                     toute la page. Visible sur la page Ventes en permanence
+                     (pas seulement en vue unifiée) ; Stock &amp; Ruptures et
+                     Propositions ne sont ajoutés/retirés que par la vue
+                     unifiée (voir adjustUIForPage), car ces sections
+                     n'existent dans la page que là. -->
+                <!-- Ordre des liens = ordre réel d'apparition des sections
+                     dans la page (KPI, puis Stock s'il est affiché, Top/Flop
+                     Produits, Top/Flop Couleurs, ABC, Achat/Vente par
+                     Arrivage, Propositions s'il est affiché, Historique). -->
                 <div id="vu-nav" style="display:none;">
                     <a href="javascript:void(0)" id="vu-nav-kpi" data-vu-cible="main-kpi-grid">📊 KPI</a>
-                    <a href="javascript:void(0)" id="vu-nav-stock" data-vu-cible="vu-title-stock">📦 Stock &amp; Ruptures</a>
-                    <a href="javascript:void(0)" data-vu-cible="vu-title-propositions">🏷️ Propositions</a>
+                    <a href="javascript:void(0)" id="vu-nav-stock" data-vu-cible="vu-title-stock" style="display:none;">📦 Stock &amp; Ruptures</a>
+                    <!-- Ces 4 liens sont masqués en vue Dépôt (MOD FOR LIFE,
+                         voir _renderModForLifeDashboard) : leurs sections ne
+                         concernent que les magasins, pas le dépôt. -->
+                    <a href="javascript:void(0)" id="vu-nav-topflop" data-vu-cible="section-top-flop">🏆 Top/Flop Produits</a>
+                    <a href="javascript:void(0)" id="vu-nav-topflop-couleurs" data-vu-cible="section-top-flop-couleurs">🎨 Top/Flop Couleurs</a>
+                    <a href="javascript:void(0)" id="vu-nav-abc" data-vu-cible="section-abc">🔬 ABC</a>
+                    <!-- Achat et Vente par Arrivage sont côte à côte sur la
+                         même ligne (voir plus bas) : un seul raccourci
+                         suffit pour les deux. -->
+                    <a href="javascript:void(0)" id="vu-nav-achats-ventes" data-vu-cible="section-achats-chart">📊 Achat/Vente par Arrivage</a>
+                    <a href="javascript:void(0)" id="vu-nav-propositions" data-vu-cible="vu-title-propositions" style="display:none;">🏷️ Propositions</a>
+                    <!-- Masqué en vue Dépôt (MOD FOR LIFE) : pas de vente en
+                         caisse ni de transfert entre magasins là-bas, donc
+                         pas d'historique (voir loadKPIs/_renderModForLifeDashboard). -->
+                    <a href="javascript:void(0)" id="vu-nav-historique" data-vu-cible="history-section">📜 Historique</a>
                 </div>
 
                 <div class="kpi-grid" id="main-kpi-grid">

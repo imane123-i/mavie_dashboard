@@ -7620,6 +7620,64 @@ class MaVieDashboardController(http.Controller):
                                     'sens': 'solde', 'quoi': 'Solde posée', 'qty': 0,
                                     'bon': prog.name, 'avec': 'caisse',
                                     'etat': 'Active — en attente de vente', 'fait': True})
+
+        # BUG CORRIGÉ (2026-10-28, trouvé en vérifiant la cohérence
+        # magasin-par-magasin) : le bloc ci-dessus ne couvre que les
+        # promotions loyalty.program — une solde encore posée via l'ANCIEN
+        # mécanisme (product.pricelist.item, voir _actions_references, qui
+        # lit déjà les deux sources) restait invisible ici. Même source,
+        # même principe : liste de prix active, non expirée, avec une règle
+        # fixe sur cet article ou une de ses variantes.
+        Item = request.env['product.pricelist.item'].sudo()
+        tmpl_ids_pour_item = list({
+            v.product_tmpl_id.id for v in
+            request.env['product.product'].sudo().browse(variant_ids)
+        })
+        items = Item.search([
+            ('pricelist_id.active', '=', True),
+            ('compute_price', '=', 'fixed'),
+            '|', ('date_end', '=', False), ('date_end', '>=', now),
+            '|',
+            '&', ('applied_on', '=', '1_product'), ('product_tmpl_id', 'in', tmpl_ids_pour_item),
+            '&', ('applied_on', '=', '0_product_variant'), ('product_id', 'in', variant_ids),
+        ])
+        if items:
+            listes = items.mapped('pricelist_id')
+            configs = request.env['pos.config'].sudo().search([
+                '|', ('available_pricelist_ids', 'in', listes.ids), ('pricelist_id', 'in', listes.ids)])
+            wh_par_liste = {}
+            for cfg in configs:
+                wh = cfg.picking_type_id.warehouse_id.id
+                if not wh:
+                    continue
+                for pl in (cfg.available_pricelist_ids | cfg.pricelist_id) & listes:
+                    wh_par_liste.setdefault(pl.id, set()).add(wh)
+            for it in items:
+                # Une règle posée sur le template entier couvre toutes ses
+                # variantes ; une règle sur UNE variante ne compte que si
+                # cette variante précise fait partie du groupe demandé.
+                if it.applied_on == '0_product_variant' and it.product_id.id not in variant_set:
+                    continue
+                whs = wh_par_liste.get(it.pricelist_id.id, set())
+                catalogue_ht = (it.product_id.lst_price if it.applied_on == '0_product_variant'
+                                else it.product_tmpl_id.list_price)
+                remise_pct = (round((1 - it.fixed_price / catalogue_ht) * 100, 1)
+                              if catalogue_ht else 0.0)
+                if remise_pct <= 0:
+                    continue
+                for wh in whs:
+                    a = acc(wh)
+                    if a['solde_pose']:
+                        continue
+                    a['solde_pose'] = True
+                    date_pose = it.date_start or it.write_date or it.create_date
+                    a['details'].append('Solde posée le %s : -%s %% (en attente de vente)' % (
+                        fields.Date.to_string(date_pose) if date_pose else '—',
+                        str(round(remise_pct, 1)).replace('.0', '')))
+                    a['lignes'].append({'date': fields.Date.to_string(date_pose) if date_pose else '',
+                                        'sens': 'solde', 'quoi': 'Solde posée', 'qty': 0,
+                                        'bon': it.pricelist_id.name, 'avec': 'caisse',
+                                        'etat': 'Active — en attente de vente', 'fait': True})
         # Infobulle lisible : les 8 mouvements les plus récents suffisent.
         for a in out.values():
             a['lignes'].sort(key=lambda x: x['date'], reverse=True)

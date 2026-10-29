@@ -873,8 +873,17 @@ function adjustUIForPage() {
     });
     var titreInterneProp = el('propositions-inner-title');
     if (titreInterneProp) titreInterneProp.style.display = '';
+    // DEMANDE UTILISATRICE (2026-10-29) : « j'ajoute plus de top/flop et
+    // tout ce qui est dans cette page pour me scroller vite » — la barre de
+    // raccourcis reste visible sur toute la page Ventes (plus seulement en
+    // vue unifiée) ; Stock & Ruptures / Propositions, qui n'existent dans
+    // la page QUE sous la vue unifiée, restent masqués en dehors d'elle.
     var vuNav = el('vu-nav');
-    if (vuNav) vuNav.style.display = 'none';
+    if (vuNav) vuNav.style.display = currentPage === 'ventes' ? '' : 'none';
+    var vuNavStockLink = el('vu-nav-stock');
+    var vuNavPropositionsLink = el('vu-nav-propositions');
+    if (vuNavStockLink) vuNavStockLink.style.display = 'none';
+    if (vuNavPropositionsLink) vuNavPropositionsLink.style.display = 'none';
     // ── Bascule entre l'ancien tableau de bord et le nouveau "Stock & Rupture" ──
     var stockOnlyIds  = ['stock-kpi-grid', 'stock-middle-section', 'stock-30j-section', 'stock-valorisation-section'];
     var legacyOnlyIds = ['main-kpi-grid', 'section-top-flop', 'section-top-flop-couleurs'];
@@ -904,6 +913,8 @@ function adjustUIForPage() {
         if (vuTitrePropositions) vuTitrePropositions.style.display = '';
         if (titreInterneProp) titreInterneProp.style.display = 'none';
         if (vuNav) vuNav.style.display = '';
+        if (vuNavStockLink) vuNavStockLink.style.display = '';
+        if (vuNavPropositionsLink) vuNavPropositionsLink.style.display = '';
         var historySectionU = el('history-section');
         if (historySectionU) historySectionU.style.display = '';
         var sbUni = document.querySelector('.search-bar-wrapper');
@@ -1111,8 +1122,23 @@ async function loadKPIs() {
     // _renderModForLifeDashboard).
     var vuNavKpiNormal = el('vu-nav-kpi');
     if (vuNavKpiNormal) vuNavKpiNormal.setAttribute('data-vu-cible', 'main-kpi-grid');
-    var vuNavStockNormal = el('vu-nav-stock');
-    if (vuNavStockNormal) vuNavStockNormal.style.display = '';
+    // BUG CORRIGÉ (2026-10-29) : ce « retour à la normale » réaffichait
+    // Stock & Ruptures SANS condition — sans effet tant que #vu-nav restait
+    // entièrement masqué hors vue unifiée (son parent caché masquait tout),
+    // mais depuis que #vu-nav reste affiché sur toute la page Ventes, ça
+    // réaffichait Stock & Ruptures même hors vue unifiée, où sa section
+    // n'existe pas. Lui seul (et Propositions, pas touché ici) ne sont
+    // restaurés QUE si la vue unifiée est active ; adjustUIForPage() pose
+    // déjà le bon état sinon. Top/Flop/ABC/Achats-Ventes, eux, existent
+    // dans la page Ventes QUELLE QUE SOIT la vue unifiée — ils se
+    // restaurent donc sans condition.
+    if (state.vueUnifiee) {
+        var vuNavStockNormal = el('vu-nav-stock');
+        if (vuNavStockNormal) vuNavStockNormal.style.display = '';
+    }
+    ['vu-nav-topflop', 'vu-nav-topflop-couleurs', 'vu-nav-abc', 'vu-nav-achats-ventes', 'vu-nav-historique'].forEach(function(id) {
+        var e = el(id); if (e) e.style.display = '';
+    });
 
     // BUG CORRIGÉ (2026-10-23, repéré par l'utilisatrice : « la partie
     // rupture est vide, il ne contient pas les données ») : en vue
@@ -1292,6 +1318,16 @@ function _renderModForLifeDashboard(data) {
     if (vuNavKpi) vuNavKpi.setAttribute('data-vu-cible', 'modforlife-kpi-grid');
     var vuNavStock = el('vu-nav-stock');
     if (vuNavStock) vuNavStock.style.display = 'none';
+    // Les raccourcis Top/Flop Produits, Top/Flop Couleurs, ABC, Achat/Vente
+    // par Arrivage et Historique pointent sur des sections masquées en vue
+    // Dépôt (voir idsToHide ci-dessus, et history-section quelques lignes
+    // plus haut) : les cacher aussi, sinon un clic ne fait rien (demande du
+    // 2026-10-29, même principe que vu-nav-stock — BUG CORRIGÉ le même
+    // jour pour Historique spécifiquement, repéré par l'utilisatrice :
+    // « le bouton ne marche pas » depuis le dépôt STE XD MAX).
+    ['vu-nav-topflop', 'vu-nav-topflop-couleurs', 'vu-nav-abc', 'vu-nav-achats-ventes', 'vu-nav-historique'].forEach(function(id) {
+        var e = el(id); if (e) e.style.display = 'none';
+    });
 
     // Vue en PIÈCES (décision utilisateur du 2026-08-19) : une conversion en
     // cartons avait été ajoutée puis retirée, faute de donnée en base disant
@@ -7583,7 +7619,19 @@ document.addEventListener('DOMContentLoaded', function() {
         vuNavEl.querySelectorAll('a[data-vu-cible]').forEach(function(lien) {
             lien.addEventListener('click', function() {
                 var cible = el(lien.getAttribute('data-vu-cible'));
-                if (cible && cible.scrollIntoView) cible.scrollIntoView({behavior: 'smooth', block: 'start'});
+                if (!cible) return;
+                // BUG CORRIGÉ (2026-10-29, repéré par l'utilisatrice : « ya
+                // décalage il affiche pas les titres exact il affiche le
+                // bas ») : scrollIntoView amène le HAUT de la section tout
+                // en haut de la fenêtre, mais l'en-tête (.app-header) et
+                // cette barre de raccourcis sont tous les deux collants
+                // (position:sticky) — ensemble, ils recouvraient le titre
+                // visé. On calcule la hauteur réelle de ces deux bandeaux
+                // et on la retranche au point d'arrivée.
+                var header = document.querySelector('.app-header');
+                var decalage = (header ? header.offsetHeight : 0) + vuNavEl.offsetHeight + 12;
+                var y = cible.getBoundingClientRect().top + window.pageYOffset - decalage;
+                window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
             });
         });
     }

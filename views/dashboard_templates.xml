@@ -363,6 +363,23 @@
                 @media (max-width: 1500px) {
                     #section-top-flop { grid-template-columns: 1fr; }
                 }
+                /* Indice de défilement horizontal (2026-10-29) : sur mobile le
+                   tableau (8 colonnes) dépasse l'écran et défile déjà très
+                   bien, mais rien ne le signale — un premier utilisateur peut
+                   croire le tableau coupé/cassé. Visible uniquement sous le
+                   seuil où ça arrive vraiment. */
+                .mobile-scroll-hint { display: none; }
+                @media (max-width: 760px) {
+                    .mobile-scroll-hint {
+                        display: block;
+                        font-size: 0.78rem;
+                        color: var(--text-muted);
+                        background: rgba(124,58,237,0.08);
+                        border-radius: var(--radius-sm);
+                        padding: 6px 10px;
+                        margin: 0 0 8px;
+                    }
+                }
 
                 .section-card {
                     background: var(--surface);
@@ -2705,7 +2722,7 @@
                         <div class="kpi-value" id="kpi-stock-total">—</div>
                         <div class="kpi-subtext" id="kpi-stock-negatif"></div>
                     </div>
-                    <div class="kpi-card" id="card-sell-through">
+                    <div class="kpi-card" id="card-sell-through" title="Sell-Through = part de ce qui a été reçu en magasin qui a déjà été vendue (quantité vendue ÷ quantité achetée × 100). Plus c'est élevé, mieux le stock s'écoule.">
                         <span class="kpi-icon">📊</span>
                         <div class="kpi-label">Sell-Through</div>
                         <div class="kpi-value" id="kpi-sell-through">—</div>
@@ -2942,6 +2959,7 @@
                             <button id="btn-export-top" class="btn-transfer-open" title="Exporter le Top Produits affiché en Excel (.xlsx), photos incrustées" style="padding:4px 10px;font-size:0.78rem;">📊 Excel</button>
                             <span class="title-line"></span>
                         </div>
+                        <div class="mobile-scroll-hint">👉 Faites glisser le tableau pour voir toutes les colonnes</div>
                         <table>
                             <thead>
                                 <tr>
@@ -2966,6 +2984,7 @@
                             <button id="btn-export-flop" class="btn-transfer-open" title="Exporter le Flop Produits affiché en Excel (.xlsx), photos incrustées" style="padding:4px 10px;font-size:0.78rem;">📊 Excel</button>
                             <span class="title-line"></span>
                         </div>
+                        <div class="mobile-scroll-hint">👉 Faites glisser le tableau pour voir toutes les colonnes</div>
                         <table>
                             <thead>
                                 <tr>

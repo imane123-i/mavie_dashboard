@@ -5620,7 +5620,7 @@ async function openEcartDetail(anomaly) {
         bodyEl.innerHTML = '<p style="color:#EF4444;">Erreur : ' + ((data && data.error) || 'inconnue') + '</p>';
         return;
     }
-    bodyEl.innerHTML = _negativesHtml(data.lignes_negatives || [], data.stock_positif || 0, data.stock_reel || 0)
+    bodyEl.innerHTML = _negativesHtml(data.lignes_negatives || [], data.stock_positif || 0, data.stock_reel || 0, data.magasin)
         + _buildEcartDetailHtml(data);
 }
 
@@ -5646,18 +5646,30 @@ function _lienTransfert(nom, id) {
 }
 
 // Chaque ligne négative : quand, quoi, où, qui, avec un lien vers chaque mouvement.
-function _negativesHtml(lignes, positif, total) {
+//
+// BUG CORRIGÉ (2026-11-02, repéré par l'utilisatrice sur une référence SAC :
+// « il me donne pas où il est négative ») : le texte parlait toujours de
+// « taille » (6 tailles en stock, etc.), un vocabulaire qui n'a aucun sens
+// pour un sac/une valise (variantes UNIQUEMENT par couleur, vérifié en base
+// sur 24P5949 : 10 couleurs, 0 pointure) — l'explication ne correspondait à
+// rien de ce que l'utilisatrice voyait à l'écran. Remplacé par « variante »,
+// mot neutre qui vaut aussi bien pour une taille que pour une couleur, et
+// le magasin est maintenant rappelé explicitement sur chaque ligne (pas
+// seulement dans l'en-tête du popup) pour répondre sans ambiguïté à « où ».
+function _negativesHtml(lignes, positif, total, magasin) {
     if (!lignes.length) return '';
     var negatif = lignes.reduce(function(a, l) { return a + l.quantite; }, 0);
     var h = '<div style="margin-bottom:12px;padding:10px 12px;border-radius:8px;background:#FFF7ED;'
         + 'border:1px solid #FED7AA;color:#7C2D12;font-size:0.86rem;line-height:1.5;">'
-        + '<b>Pourquoi un négatif apparaît :</b> une sortie a été enregistrée pour une taille sans stock '
-        + 'à ce moment-là. Le total du magasin reste positif grâce aux autres tailles.'
-        + '<br/><b>Calcul :</b> tailles en stock ' + formatNumber(positif) + ' − négatifs '
+        + (magasin ? '<b>📍 Magasin concerné :</b> ' + _escapeHtml(magasin) + '<br/>' : '')
+        + '<b>Pourquoi un négatif apparaît :</b> une sortie a été enregistrée pour une variante sans stock '
+        + 'à ce moment-là. Le total du magasin reste positif grâce aux autres variantes.'
+        + '<br/><b>Calcul :</b> variantes en stock ' + formatNumber(positif) + ' − négatifs '
         + formatNumber(Math.abs(negatif)) + ' = ' + formatNumber(total) + ' pièces.</div>';
     lignes.forEach(function(l) {
         h += '<div style="font-weight:700;color:#0F172A;margin:10px 0 4px;">' + _escapeHtml(l.variante)
-            + ' · ' + _escapeHtml(l.emplacement) + ' · lot ' + _escapeHtml(l.lot)
+            + (magasin ? ' · 📍 <span style="color:#7C3AED;">' + _escapeHtml(magasin) + '</span>' : '')
+            + ' · emplacement <span style="color:#7C3AED;">' + _escapeHtml(l.emplacement) + '</span> · lot ' + _escapeHtml(l.lot)
             + ' · <span style="color:#EF4444;">' + formatNumber(l.quantite) + '</span></div>';
         // BUG CORRIGÉ (2026-10-24, repéré par l'utilisatrice : « comment tu
         // as su que c'est ça qui est arrivé, est-ce exact ? ») : le texte
@@ -5677,14 +5689,63 @@ function _negativesHtml(lignes, positif, total) {
         } else if (l.ventes && l.ventes.length) {
             diagnostic = 'Vente ou sortie faite sans stock disponible à ce moment';
         }
-        h += '<div style="font-size:0.8rem;color:#7C2D12;margin-bottom:4px;"><b>Diagnostic :</b> '
-            + _escapeHtml(diagnostic) + '</div>';
+
+        // DEMANDE UTILISATRICE (2026-11-02) : « le popup contient beaucoup
+        // d'information et il est difficile à comprendre ». Jusqu'ici, ce
+        // bloc affichait TOUTES les sorties retrouvées pour ce lot/
+        // emplacement (table à 8 colonnes) sans jamais utiliser `l.origine`
+        // — déjà calculé côté serveur comme LE mouvement précis qui a fait
+        // passer le solde sous zéro. On met ce mouvement unique en avant,
+        // en une phrase, et on range le reste dans un repli fermé par
+        // défaut.
+        //
+        // BUG CORRIGÉ (2026-11-02, repéré par l'utilisatrice avec une
+        // capture d'écran : « je vois pas où il y a le moins » sur JJ-026
+        // NOIR/38) : avec PLUSIEURS sorties retrouvées (ici 2, totalisant
+        // bien les -2 affichés sur la ligne), cette phrase ne citait QUE
+        // `l.origine` — la toute première, 1 pièce — ce qui contredisait le
+        // "-2" juste au-dessus sans jamais dire où était passée la 2e
+        // pièce (visible seulement en dépliant le détail). On additionne
+        // maintenant TOUJOURS les pièces de `l.ventes`, qui correspond par
+        // construction exactement à la quantité négative affichée.
+        var totalVentes = (l.ventes || []).reduce(function(a, v) { return a + (v.qty || 0); }, 0);
+        if (l.ventes && l.ventes.length > 1) {
+            var premiere = l.ventes[0], derniere = l.ventes[l.ventes.length - 1];
+            h += '<div style="font-size:0.84rem;color:#0F172A;background:#F8FAFC;border-radius:6px;'
+                + 'padding:8px 10px;margin-bottom:8px;">'
+                + '🎯 <b>' + l.ventes.length + ' sorties</b> ont été enregistrées sans stock disponible, '
+                + 'totalisant <b>' + formatNumber(totalVentes) + ' pièce(s)</b> — du '
+                + _escapeHtml(_trQuand(premiere.date) || premiere.date) + ' ('
+                + _lienBon(premiere.document, premiere.picking_id) + ') au '
+                + _escapeHtml(_trQuand(derniere.date) || derniere.date) + ' ('
+                + _lienBon(derniere.document, derniere.picking_id) + ').'
+                + '</div>';
+        } else if (l.origine) {
+            var o = l.origine;
+            h += '<div style="font-size:0.84rem;color:#0F172A;background:#F8FAFC;border-radius:6px;'
+                + 'padding:8px 10px;margin-bottom:8px;">'
+                + '🎯 <b>Mouvement responsable :</b> le ' + _escapeHtml(_trQuand(o.date) || o.date) + ', '
+                + _escapeHtml(o.sens === 'Sortie' ? 'une sortie de ' : 'un mouvement de ')
+                + '<b>' + formatNumber(Math.abs(o.qty)) + ' pièce(s)</b> (' + _escapeHtml(o.nature) + ') '
+                + 'via ' + _lienBon(o.document, o.picking_id) + ', vers/depuis '
+                + _escapeHtml(o.contrepartie) + '.'
+                + '</div>';
+        } else {
+            h += '<div style="font-size:0.8rem;color:#7C2D12;margin-bottom:8px;"><b>Diagnostic :</b> '
+                + _escapeHtml(diagnostic) + '</div>';
+        }
+
         if (!l.ventes || !l.ventes.length) {
-            h += '<div style="font-size:0.8rem;color:#94A3B8;margin-bottom:8px;">Aucun mouvement de sortie '
-                + 'retrouvé : probablement un ajustement d’inventaire.</div>';
+            if (!l.origine) {
+                h += '<div style="font-size:0.8rem;color:#94A3B8;margin-bottom:8px;">Aucun mouvement de sortie '
+                    + 'retrouvé : probablement un ajustement d’inventaire.</div>';
+            }
             return;
         }
-        h += '<table style="width:100%;border-collapse:collapse;font-size:0.78rem;margin-bottom:8px;">'
+        h += '<details style="margin-bottom:10px;"><summary style="cursor:pointer;color:#7C3AED;'
+            + 'font-size:0.8rem;font-weight:600;">Voir tous les mouvements de sortie retrouvés ('
+            + l.ventes.length + ')</summary>'
+            + '<table style="width:100%;border-collapse:collapse;font-size:0.78rem;margin-top:8px;">'
             + '<thead><tr style="background:#F8FAFC;text-align:left;">'
             + '<th style="padding:4px;">Date et heure</th><th style="padding:4px;">Document</th>'
             + '<th style="padding:4px;">Magasin</th><th style="padding:4px;text-align:center;">Qté</th>'
@@ -5705,7 +5766,7 @@ function _negativesHtml(lignes, positif, total) {
                 + '&model=stock.move.line&view_type=form" target="_blank" rel="noopener" '
                 + 'style="color:#1D4ED8;">Mouvement</a></td></tr>';
         });
-        h += '</tbody></table>';
+        h += '</tbody></table></details>';
     });
     return h;
 }
@@ -5750,9 +5811,18 @@ function _ledgerTable(title, buckets, color) {
     return html + '</tbody></table></div>';
 }
 
+// DEMANDE UTILISATRICE (2026-11-02) : « le popup contient beaucoup
+// d'information et il est difficile à comprendre ». Ce bloc (synthèse
+// entrées/sorties, tableaux de ventilation, transferts) est un vrai
+// audit comptable — utile, mais pas ce qu'on lit en premier pour
+// comprendre "où" et "pourquoi" (déjà répondu juste au-dessus par
+// _negativesHtml). Replié par défaut derrière un <details>, toujours
+// accessible en un clic pour qui veut creuser.
 function _buildEcartDetailHtml(data) {
     var manque = data.stock_reel;
-    var html = '';
+    var html = '<details style="margin-top:4px;"><summary style="cursor:pointer;color:#7C3AED;'
+        + 'font-weight:700;font-size:0.88rem;padding:4px 0;">📊 Voir le détail comptable complet '
+        + '(entrées, sorties, transferts)</summary><div style="margin-top:12px;">';
 
     // Synthèse en une phrase : c'est la question posée — d'où vient le
     // produit vendu en trop.
@@ -5808,7 +5878,7 @@ function _buildEcartDetailHtml(data) {
         html += '</tbody></table></div>';
     }
 
-    return html;
+    return html + '</div></details>';
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -5891,61 +5961,82 @@ function _reconRow(label, value, hint, isTotal) {
 // les mouvements. Mélanger les deux dans un seul tableau donnait des lignes
 // qui ressemblaient à des erreurs de calcul alors qu'elles comparaient deux
 // sources différentes.
+// DEMANDE UTILISATRICE (2026-11-02) : « le popup contient beaucoup
+// d'information et il est difficile à comprendre » — repérée d'abord sur
+// le popup "D'où vient le manque ?" (mêmes blocs/tableaux empilés), elle
+// s'applique tout autant ici. Même traitement : la conclusion en langage
+// clair (déjà bien écrite — ✅/⚠️ + quoi faire) passe EN PREMIER, et les
+// deux tableaux détaillés (mouvements, puis documents vs mouvements)
+// passent dans un repli fermé par défaut, pour ne pas noyer la réponse
+// sous le détail comptable.
 function _buildReconTableHtml(r) {
     if (!r) {
         return '<p style="color:#94A3B8;">Réconciliation indisponible pour cette fiche.</p>';
     }
-    var html = '<div style="font-weight:800;color:#0F172A;margin:0 0 6px;">'
+    var detail = '<div style="font-weight:800;color:#0F172A;margin:0 0 6px;">'
         + '1️⃣ Le stock expliqué par les mouvements de stock</div>'
         + '<div class="recon-sub" style="margin-bottom:8px;">'
         + 'Uniquement des mouvements validés dans Odoo. Aucun chiffre déduit.</div>'
         + '<table class="recon-table">';
 
-    html += _reconRow('Réceptions fournisseur', r.recept_fournisseur,
+    detail += _reconRow('Réceptions fournisseur', r.recept_fournisseur,
         'Marchandise entrée dans ces magasins depuis un fournisseur.');
     if (r.retour_fournisseur) {
-        html += _reconRow('Retours au fournisseur', -r.retour_fournisseur,
+        detail += _reconRow('Retours au fournisseur', -r.retour_fournisseur,
             'Marchandise renvoyée au fournisseur (le plus souvent le dépôt).');
     }
     if (r.retour_client) {
-        html += _reconRow('Retours clients', r.retour_client,
+        detail += _reconRow('Retours clients', r.retour_client,
             'Marchandise rendue par un client et remise en stock.');
     }
-    html += _reconRow('Sorties vers les clients', -r.sortie_client,
+    detail += _reconRow('Sorties vers les clients', -r.sortie_client,
         'Ventes en caisse et livraisons : tout ce qui est parti chez un client.');
+    // BUG CORRIGÉ (2026-11-02, l'utilisatrice a demandé « est-ce que tu es
+    // sûr de cette partie ? » sur « Gains d'inventaire / retrouvées lors
+    // d'un comptage ») : vérifié en base sur Elite — les 323 gains et 130
+    // pertes d'inventaire existants n'ont AUCUN bon/document derrière,
+    // 100% créés directement par it.admin@elite-store.ma ou par le système
+    // (import), AUCUN ne vient d'un vrai comptage physique Odoo. Le texte
+    // affirmait une cause (« comptage ») que les données ne confirment
+    // pas : il ne peut que lister les causes possibles, sans trancher.
     if (r.inventaire_gain) {
-        html += _reconRow('Gains d\'inventaire', r.inventaire_gain,
-            'Pièces retrouvées lors d\'un comptage.');
+        detail += _reconRow('Gains d\'inventaire', r.inventaire_gain,
+            'Quantité augmentée directement (comptage, reprise de stock au démarrage, import, ou correction manuelle) — sans bon de commande ni transfert.');
     }
     if (r.inventaire_perte) {
-        html += _reconRow('Pertes d\'inventaire', -r.inventaire_perte,
-            'Pièces manquantes constatées lors d\'un comptage (casse, vol, erreur de saisie).');
+        detail += _reconRow('Pertes d\'inventaire', -r.inventaire_perte,
+            'Quantité diminuée directement (comptage, casse, vol, ou correction manuelle) — sans vente ni transfert.');
     }
     if (r.autres_in) {
-        html += _reconRow('Autres entrées', r.autres_in,
+        detail += _reconRow('Autres entrées', r.autres_in,
             'Transit inter-sociétés, production, entrepôt hors périmètre affiché.');
     }
     if (r.autres_out) {
-        html += _reconRow('Autres sorties', -r.autres_out,
+        detail += _reconRow('Autres sorties', -r.autres_out,
             'Transferts vers un entrepôt qui n\'est pas dans le périmètre affiché.');
     }
-    html += _reconRow('= Stock attendu', r.stock_attendu, null, true);
-    html += '<tr><td>Stock comptable Odoo'
+    detail += _reconRow('= Stock attendu', r.stock_attendu, null, true);
+    detail += '<tr><td>Stock comptable Odoo'
         + '<div class="recon-sub">Somme de tous les emplacements, stocks négatifs compris.</div></td>'
         + '<td class="num">' + formatNumber(r.stock_reel) + '</td></tr>';
 
     var ecart = r.ecart || 0;
-    html += '<tr class="recon-total"><td>Écart inexpliqué</td>'
+    detail += '<tr class="recon-total"><td>Écart inexpliqué</td>'
         + '<td class="num" style="color:' + (ecart ? '#DC2626' : '#059669') + ';">'
         + (ecart ? formatNumber(ecart) : '0 ✅') + '</td></tr>';
 
-    html += '</table>';
+    detail += '</table>';
 
+    // La conclusion (✅/⚠️ + quoi faire) est CE QU'ON LIT EN PREMIER : déjà
+    // écrite sans jargon, c'est elle qui répond à la question posée par la
+    // fiche. Elle reste donc hors du repli, contrairement aux deux
+    // tableaux de détail ci-dessus et ci-dessous.
+    var conclusion = '';
     if (ecart) {
         // Message volontairement écrit sans jargon : le lecteur n'a pas à
         // savoir ce qu'est un quant ni un stock.move.line. On dit ce qui
         // cloche, avec les deux chiffres, puis quoi faire.
-        html += '<div style="background:#FFFBEB;border:1px solid #FEF3C7;border-radius:8px;padding:12px;margin:14px 0;font-size:0.85rem;color:#92400E;line-height:1.7;">'
+        conclusion += '<div style="background:#FFFBEB;border:1px solid #FEF3C7;border-radius:8px;padding:12px;margin-bottom:14px;font-size:0.85rem;color:#92400E;line-height:1.7;">'
             + '<strong>⚠️ ' + formatNumber(Math.abs(ecart)) + ' pièce(s) ne s\'expliquent pas.</strong><br/>'
             + 'En additionnant toutes les entrées et toutes les sorties enregistrées, on devrait avoir '
             + '<strong>' + formatNumber(r.stock_attendu) + '</strong> en stock. Odoo en affiche '
@@ -5965,7 +6056,7 @@ function _buildReconTableHtml(r) {
         // magasins fait dans la réalité mais jamais enregistré dans Odoo :
         // le magasin qui a reçu la marchandise vend un stock qu'il n'a
         // jamais reçu, et passe en négatif.
-        html += '<div style="background:#FFFBEB;border:1px solid #FEF3C7;border-radius:8px;padding:12px;margin:14px 0;font-size:0.85rem;color:#92400E;line-height:1.7;">'
+        conclusion += '<div style="background:#FFFBEB;border:1px solid #FEF3C7;border-radius:8px;padding:12px;margin-bottom:14px;font-size:0.85rem;color:#92400E;line-height:1.7;">'
             + '<strong>⚠️ Stock négatif : ' + formatNumber(r.stock_reel) + '.</strong><br/>'
             + 'Tous les mouvements se recoupent (aucune pièce inexpliquée), mais le résultat est '
             + 'impossible : il est sorti plus de marchandise de ces magasins qu\'il n\'y en est jamais entré. '
@@ -5975,7 +6066,7 @@ function _buildReconTableHtml(r) {
             + 'puis soit enregistrer le transfert manquant, soit lancer un inventaire pour remettre les compteurs à plat.'
             + '</div>';
     } else {
-        html += '<div style="background:#F0FDF4;border:1px solid #BBF7D0;border-radius:8px;padding:12px;margin:14px 0;font-size:0.85rem;color:#166534;line-height:1.6;">'
+        conclusion += '<div style="background:#F0FDF4;border:1px solid #BBF7D0;border-radius:8px;padding:12px;margin-bottom:14px;font-size:0.85rem;color:#166534;line-height:1.6;">'
             + '✅ Aucun écart : chaque pièce du stock réel est justifiée par un mouvement enregistré.'
             + '</div>';
     }
@@ -5984,9 +6075,11 @@ function _buildReconTableHtml(r) {
     // auparavant deux lignes ajoutées SOUS le total du tableau : on les
     // lisait comme la suite de la soustraction, alors que ce sont les deux
     // morceaux du total. Une phrase avec le calcul explicite lève
-    // l'ambiguïté sans rajouter de chiffres à additionner.
+    // l'ambiguïté sans rajouter de chiffres à additionner. Courte et utile
+    // pour comprendre le chiffre déjà affiché sur la carte : reste visible
+    // par défaut, avec la conclusion.
     if (r.nb_magasins_negatifs) {
-        html += '<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;padding:12px;margin:14px 0;font-size:0.85rem;color:#334155;line-height:1.7;">'
+        conclusion += '<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;padding:12px;margin-bottom:14px;font-size:0.85rem;color:#334155;line-height:1.7;">'
             + '📦 Ces <strong>' + formatNumber(r.stock_reel) + '</strong> pièces comptables se répartissent en '
             + '<strong>' + formatNumber(r.stock_present) + '</strong> réellement en rayon et '
             + '<strong>' + formatNumber(r.stock_negatif) + '</strong> dans '
@@ -5998,19 +6091,21 @@ function _buildReconTableHtml(r) {
             + '</div>';
     }
 
-    // ── Bloc 2 : documents vs mouvements ──
-    html += '<div style="font-weight:800;color:#0F172A;margin:18px 0 6px;">'
+    // ── Bloc 2 : documents vs mouvements ── dans le même repli que le
+    // bloc 1 (tableau des mouvements) : les deux sont le « comment on
+    // arrive à ce chiffre », la conclusion ci-dessus est déjà la réponse.
+    detail += '<div style="font-weight:800;color:#0F172A;margin:18px 0 6px;">'
         + '2️⃣ Pourquoi les cartes du haut affichent d\'autres chiffres</div>'
         + '<div class="recon-sub" style="margin-bottom:8px;">'
         + 'Les cartes comptent des DOCUMENTS (bons de commande, tickets de caisse). Le bloc 1 compte '
         + 'des MOUVEMENTS de marchandise. Voici l\'écart entre les deux — il ne change pas le stock.</div>'
         + '<table class="recon-table">';
 
-    html += '<tr><td>Qté achetée affichée <span class="recon-sub">(bons de commande, quantité reçue)</span></td>'
+    detail += '<tr><td>Qté achetée affichée <span class="recon-sub">(bons de commande, quantité reçue)</span></td>'
         + '<td class="num">' + formatNumber(r.qty_purchased_doc) + '</td></tr>';
-    html += '<tr><td>Réceptions réellement entrées ici <span class="recon-sub">(nettes des retours fournisseur)</span></td>'
+    detail += '<tr><td>Réceptions réellement entrées ici <span class="recon-sub">(nettes des retours fournisseur)</span></td>'
         + '<td class="num">' + formatNumber(r.recu_mouvements) + '</td></tr>';
-    html += '<tr><td><em>' + (r.reception_hors_bon < 0
+    detail += '<tr><td><em>' + (r.reception_hors_bon < 0
             ? 'Différence : reçu ailleurs qu\'ici'
             : 'Différence : entré ici sans bon de commande') + '</em>'
         + '<div class="recon-sub">' + (r.reception_hors_bon < 0
@@ -6018,20 +6113,22 @@ function _buildReconTableHtml(r) {
             : 'Marchandise entrée en stock sans ligne de bon de commande rattachée (reprise d\'historique, saisie manuelle).') + '</div></td>'
         + '<td class="num" style="color:#B45309;">' + formatNumber(Math.abs(r.reception_hors_bon)) + '</td></tr>';
 
-    html += '<tr><td style="padding-top:16px;">Qté vendue affichée <span class="recon-sub">(caisse + bons de vente livrés)</span></td>'
+    detail += '<tr><td style="padding-top:16px;">Qté vendue affichée <span class="recon-sub">(caisse + bons de vente livrés)</span></td>'
         + '<td class="num" style="padding-top:16px;">' + formatNumber(r.qty_sold_doc) + '</td></tr>';
-    html += '<tr><td>Sorties clients réellement constatées ici <span class="recon-sub">(nettes des retours clients)</span></td>'
+    detail += '<tr><td>Sorties clients réellement constatées ici <span class="recon-sub">(nettes des retours clients)</span></td>'
         + '<td class="num">' + formatNumber(r.sorties_client_mvt) + '</td></tr>';
-    html += '<tr><td><em>' + (r.sortie_hors_vente < 0
+    detail += '<tr><td><em>' + (r.sortie_hors_vente < 0
             ? 'Différence : vendu depuis un autre entrepôt'
             : 'Différence : sorti sans ligne de vente') + '</em>'
         + '<div class="recon-sub">' + (r.sortie_hors_vente < 0
             ? 'Ventes comptées dans la carte mais sorties d\'un entrepôt hors périmètre, ou sur une couleur aujourd\'hui désactivée.'
             : 'Marchandise partie chez un client sans ticket de caisse ni bon de vente en face : bon de livraison, transfert vers un autre magasin, ou quantité livrée différente de la quantité vendue.') + '</div></td>'
         + '<td class="num" style="color:#B45309;">' + formatNumber(Math.abs(r.sortie_hors_vente)) + '</td></tr>';
-    html += '</table>';
+    detail += '</table>';
 
-    return html;
+    return conclusion + '<details><summary style="cursor:pointer;color:#7C3AED;font-weight:700;'
+        + 'font-size:0.88rem;padding:4px 0;">📊 Voir le détail des mouvements (comment on arrive à ce chiffre)'
+        + '</summary><div style="margin-top:12px;">' + detail + '</div></details>';
 }
 
 function _reconSection(title, columns, rows, cellFn, emptyMsg) {
@@ -6061,6 +6158,9 @@ function _td(value, opts) {
         + '">' + _escapeHtml(value === null || value === undefined ? '—' : value) + '</td>';
 }
 
+// Replié par défaut, comme le détail des mouvements ci-dessus : la liste
+// document par document (bons d'achat, retours, ventes) sert à vérifier
+// une ligne précise, pas à comprendre "est-ce que tout va bien".
 function _buildReconDocsHtml(data) {
     var html = '';
 
@@ -6118,7 +6218,9 @@ function _buildReconDocsHtml(data) {
     // gains restent affichés en haut, dans le bloc 1 — le détail mensuel
     // n'apportait rien de plus et alourdissait la lecture.
 
-    return html;
+    return '<details style="margin-top:4px;"><summary style="cursor:pointer;color:#7C3AED;'
+        + 'font-weight:700;font-size:0.88rem;padding:4px 0;">📄 Voir tous les documents (bons d\'achat, '
+        + 'retours, ventes)</summary><div style="margin-top:12px;">' + html + '</div></details>';
 }
 
 // ═══════════════════════════════════════════════════════════
